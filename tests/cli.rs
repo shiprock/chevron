@@ -361,6 +361,61 @@ fn health_help_exits_zero() {
     cmd().args(["health", "--help"]).assert().code(0);
 }
 
+#[test]
+fn health_check_single_load_succeeds() {
+    cmd()
+        .args(["health", "--check", "load", "--no-color"])
+        .assert()
+        .stdout(predicate::str::contains("System Load"));
+}
+
+#[test]
+fn health_check_value_only_prints_just_value() {
+    let output = cmd()
+        .args(["health", "--check", "load", "--value"])
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8_lossy(&output);
+    // Should be a single line: "<load> (<per-core> per core)\n"
+    assert!(text.contains("per core"), "unexpected: {text:?}");
+    assert!(!text.contains("System Load"), "label leaked: {text:?}");
+    assert!(!text.contains('\x1b'), "ANSI leaked: {text:?}");
+}
+
+#[test]
+fn health_check_unknown_name_exits_two() {
+    cmd()
+        .args(["health", "--check", "nosuch"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn health_value_without_check_errors() {
+    cmd().args(["health", "--value"]).assert().code(2);
+}
+
+#[test]
+fn health_json_full_has_checks_wrapper() {
+    cmd()
+        .args(["health", "--fast", "--json"])
+        .assert()
+        .stdout(predicate::str::starts_with("{\"checks\":["))
+        .stdout(predicate::str::contains("\"name\":\"load\""))
+        .stdout(predicate::str::contains("\"severity\":"));
+}
+
+#[test]
+fn health_check_json_emits_bare_object() {
+    cmd()
+        .args(["health", "--check", "load", "--json"])
+        .assert()
+        .stdout(predicate::str::starts_with("{\"name\":\"load\""))
+        .stdout(predicate::str::contains("\"severity\":"));
+}
+
 // ── weather ──────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "weather")]

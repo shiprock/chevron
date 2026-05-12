@@ -10,28 +10,95 @@ use crate::sysinfo::SystemInfo;
 use check::Check;
 
 pub fn run(args: &[String]) -> i32 {
-    let mut fast = false;
-    let mut color = supports_color();
-    for arg in args {
+    let opts = match parse_args(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("plx health: {e}");
+            print_usage();
+            return 2;
+        }
+    };
+
+    if opts.help {
+        print_usage();
+        return 0;
+    }
+
+    // Single-check mode
+    if let Some(name) = &opts.check {
+        let info = SystemInfo::gather();
+        let Some(check) = run_named(name, &info) else {
+            eprintln!(
+                "plx health: unknown check '{name}'. Available: {}",
+                available_names().join(", ")
+            );
+            return 2;
+        };
+        let single = std::slice::from_ref(&check);
+        match opts.output {
+            Output::Json => print!("{}", render::render_json(single, true)),
+            Output::Value => print!("{}", render::render_value(&check)),
+            Output::Text => println!("{}", render::render_line(&check, opts.color)),
+        }
+        return exit_code(single);
+    }
+
+    // Full-report mode
+    let info = SystemInfo::gather();
+    let collected = collect(&info, opts.fast);
+    match opts.output {
+        Output::Json => print!("{}", render::render_json(&collected, false)),
+        Output::Text | Output::Value => print!("{}", render::render(&collected, opts.color)),
+    }
+    exit_code(&collected)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Output {
+    Text,
+    Json,
+    Value,
+}
+
+#[derive(Debug)]
+struct Opts {
+    fast: bool,
+    color: bool,
+    output: Output,
+    check: Option<String>,
+    help: bool,
+}
+
+fn parse_args(args: &[String]) -> Result<Opts, String> {
+    let mut opts = Opts {
+        fast: false,
+        color: supports_color(),
+        output: Output::Text,
+        check: None,
+        help: false,
+    };
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--fast" => fast = true,
-            "--no-color" => color = false,
-            "-h" | "--help" => {
-                print_usage();
-                return 0;
+            "--fast" => opts.fast = true,
+            "--no-color" => opts.color = false,
+            "--json" => opts.output = Output::Json,
+            "--value" => opts.output = Output::Value,
+            "--check" => {
+                let name = iter
+                    .next()
+                    .ok_or_else(|| "--check requires a check name".to_string())?;
+                opts.check = Some(name.clone());
             }
-            other => {
-                eprintln!("plx health: unknown argument '{other}'");
-                print_usage();
-                return 2;
-            }
+            "-h" | "--help" => opts.help = true,
+            other => return Err(format!("unknown argument '{other}'")),
         }
     }
 
-    let info = SystemInfo::gather();
-    let collected = collect(&info, fast);
-    print!("{}", render::render(&collected, color));
-    exit_code(&collected)
+    if opts.output == Output::Value && opts.check.is_none() {
+        return Err("--value requires --check <name>".to_string());
+    }
+    Ok(opts)
 }
 
 fn collect(info: &SystemInfo, fast: bool) -> Vec<Check> {
@@ -49,6 +116,34 @@ fn collect(info: &SystemInfo, fast: bool) -> Vec<Check> {
         }
     }
     out
+}
+
+/// Look up and run a single check by machine-readable name.
+fn run_named(name: &str, info: &SystemInfo) -> Option<Check> {
+    match name {
+        "load" => Some(checks::load(info)),
+        "memory" => Some(checks::memory(info)),
+        "disk" => Some(checks::disk(info)),
+        "uptime" => Some(checks::uptime(info)),
+        "ip" => Some(checks::ip_address(info)),
+        "network" => Some(checks::network()),
+        #[cfg(target_os = "macos")]
+        "cpu_temp" => Some(macos::cpu_temp()),
+        #[cfg(target_os = "macos")]
+        "disk_health" => Some(macos::disk_health()),
+        #[cfg(target_os = "macos")]
+        "software_updates" => Some(macos::software_updates()),
+        #[cfg(target_os = "macos")]
+        "firewall" => Some(macos::firewall()),
+        _ => None,
+    }
+}
+
+fn available_names() -> Vec<&'static str> {
+    let mut names = vec!["load", "memory", "disk", "uptime", "ip", "network"];
+    #[cfg(target_os = "macos")]
+    names.extend(&["cpu_temp", "disk_health", "software_updates", "firewall"]);
+    names
 }
 
 fn exit_code(checks: &[Check]) -> i32 {
@@ -72,16 +167,22 @@ fn supports_color() -> bool {
 }
 
 fn print_usage() {
-    eprintln!("Usage: plx health [--fast] [--no-color]");
+    eprintln!("Usage: plx health [OPTIONS]");
     eprintln!();
-    eprintln!("  --fast       Skip slower checks (uptime, network)");
-    eprintln!("  --no-color   Disable ANSI color output");
+    eprintln!("  --fast              Skip slower checks (uptime, network, macOS extras)");
+    eprintln!("  --no-color          Disable ANSI color output");
+    eprintln!("  --json              Emit machine-readable JSON");
+    eprintln!("  --check <name>      Run only the named check");
+    eprintln!("  --value             Print only the value (requires --check)");
+    eprintln!("  -h, --help          Show this help");
+    eprintln!();
+    eprintln!("Available checks: {}", available_names().join(", "));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::check::Check;
-    use super::exit_code;
+    use super::check::{Check, Severity};
+    use super::{available_names, exit_code, parse_args};
 
     #[test]
     fn exit_code_zero_when_all_ok() {
@@ -102,5 +203,73 @@ mod tests {
             Check::critical("b", "B", "y", "hint"),
         ];
         assert_eq!(exit_code(&checks), 2);
+    }
+
+    #[test]
+    fn _severity_used_in_tests() {
+        // touch Severity so the import isn't flagged as unused
+        let _ = Severity::Ok;
+    }
+
+    // ── flag parsing ────────────────────────────────────────────────────────
+
+    fn args(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_defaults() {
+        let o = parse_args(&[]).unwrap();
+        assert!(!o.fast);
+        assert_eq!(o.output, super::Output::Text);
+        assert!(o.check.is_none());
+    }
+
+    #[test]
+    fn parse_check_requires_argument() {
+        let err = parse_args(&args(&["--check"])).unwrap_err();
+        assert!(err.contains("requires"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_check_takes_name() {
+        let o = parse_args(&args(&["--check", "load"])).unwrap();
+        assert_eq!(o.check.as_deref(), Some("load"));
+    }
+
+    #[test]
+    fn parse_value_requires_check() {
+        let err = parse_args(&args(&["--value"])).unwrap_err();
+        assert!(err.contains("requires --check"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_value_then_json_lets_json_win() {
+        // Output is an enum, so last-wins is fine — no error
+        let o = parse_args(&args(&["--check", "load", "--value", "--json"])).unwrap();
+        assert_eq!(o.output, super::Output::Json);
+    }
+
+    #[test]
+    fn parse_unknown_flag_errors() {
+        let err = parse_args(&args(&["--bogus"])).unwrap_err();
+        assert!(err.contains("unknown"), "got: {err}");
+    }
+
+    #[test]
+    fn available_names_includes_core_six() {
+        let n = available_names();
+        for name in ["load", "memory", "disk", "uptime", "ip", "network"] {
+            assert!(n.contains(&name), "missing {name} in {n:?}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn available_names_includes_macos_four_on_macos() {
+        let n = available_names();
+        for name in ["cpu_temp", "disk_health", "software_updates", "firewall"] {
+            assert!(n.contains(&name), "missing {name} in {n:?}");
+        }
     }
 }

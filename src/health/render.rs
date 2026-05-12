@@ -12,6 +12,72 @@ pub fn render(checks: &[Check], color: bool) -> String {
     out
 }
 
+/// Render a single check as one human-readable line (no trailing newline).
+pub fn render_line(check: &Check, color: bool) -> String {
+    let mut out = String::with_capacity(128);
+    write_line(&mut out, check, check.label.len(), color);
+    out
+}
+
+/// Just the value field, plain text, with trailing newline.
+pub fn render_value(check: &Check) -> String {
+    format!("{}\n", check.value)
+}
+
+/// JSON for a list of checks. If `single_object` and `checks.len() == 1`,
+/// emit the check directly (no wrapper). Otherwise wrap as `{"checks":[...]}`.
+pub fn render_json(checks: &[Check], single_object: bool) -> String {
+    if single_object && checks.len() == 1 {
+        let mut out = check_to_json(&checks[0]);
+        out.push('\n');
+        return out;
+    }
+    let body: Vec<String> = checks.iter().map(check_to_json).collect();
+    format!("{{\"checks\":[{}]}}\n", body.join(","))
+}
+
+fn check_to_json(c: &Check) -> String {
+    let hint = match &c.hint {
+        Some(h) => format!("\"{}\"", json_escape(h)),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"name\":\"{}\",\"label\":\"{}\",\"value\":\"{}\",\"severity\":\"{}\",\"hint\":{}}}",
+        json_escape(c.name),
+        json_escape(c.label),
+        json_escape(&c.value),
+        severity_str(c.severity),
+        hint,
+    )
+}
+
+fn severity_str(sev: Severity) -> &'static str {
+    match sev {
+        Severity::Ok => "ok",
+        Severity::Warn => "warn",
+        Severity::Critical => "critical",
+        Severity::Unknown => "unknown",
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn render_header(out: &mut String, color: bool) {
     let bold_on = if color { "\x1b[1m" } else { "" };
     let bold_off = if color { "\x1b[0m" } else { "" };
@@ -34,24 +100,27 @@ fn render_header(out: &mut String, color: bool) {
 fn render_checks(out: &mut String, checks: &[Check], color: bool) {
     let label_width = checks.iter().map(|c| c.label.len()).max().unwrap_or(0);
     for check in checks {
-        let (yel, red, rst) = ansi(color);
-        let pad = " ".repeat(label_width.saturating_sub(check.label.len()));
-        let _ = write!(
-            out,
-            "  {yel}{label}:{rst}{pad} {value}",
-            label = check.label,
-            value = check.value,
-        );
-        if let (Some(hint), Some(note_color)) =
-            (check.hint.as_deref(), severity_color(check.severity, color))
-        {
-            let _ = write!(out, " {note_color}({hint}){rst}");
-        }
-        // Mark Critical even without hint
-        if check.severity == Severity::Critical && check.hint.is_none() && color {
-            let _ = write!(out, " {red}(critical){rst}");
-        }
-        let _ = writeln!(out);
+        write_line(out, check, label_width, color);
+        out.push('\n');
+    }
+}
+
+fn write_line(out: &mut String, check: &Check, label_width: usize, color: bool) {
+    let (yel, red, rst) = ansi(color);
+    let pad = " ".repeat(label_width.saturating_sub(check.label.len()));
+    let _ = write!(
+        out,
+        "  {yel}{label}:{rst}{pad} {value}",
+        label = check.label,
+        value = check.value,
+    );
+    if let (Some(hint), Some(note_color)) =
+        (check.hint.as_deref(), severity_color(check.severity, color))
+    {
+        let _ = write!(out, " {note_color}({hint}){rst}");
+    }
+    if check.severity == Severity::Critical && check.hint.is_none() && color {
+        let _ = write!(out, " {red}(critical){rst}");
     }
 }
 
@@ -106,7 +175,7 @@ fn severity_color(sev: Severity, color: bool) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::super::check::Check;
-    use super::render;
+    use super::{json_escape, render, render_json, render_line, render_value};
 
     #[test]
     fn no_color_strips_escapes() {
@@ -144,5 +213,73 @@ mod tests {
         let checks = vec![Check::unknown("foo", "Foo", "unknown")];
         let out = render(&checks, false);
         assert!(!out.contains("RECOMMENDATIONS"));
+    }
+
+    // ── new phase 3 surfaces ────────────────────────────────────────────────
+
+    #[test]
+    fn render_line_includes_label_and_value() {
+        let c = Check::ok("load", "System Load", "0.42");
+        let out = render_line(&c, false);
+        assert!(out.contains("System Load:"));
+        assert!(out.contains("0.42"));
+        assert!(!out.ends_with('\n'));
+    }
+
+    #[test]
+    fn render_value_is_just_the_value() {
+        let c = Check::ok("load", "System Load", "0.42");
+        assert_eq!(render_value(&c), "0.42\n");
+    }
+
+    #[test]
+    fn json_single_object_has_no_wrapper() {
+        let c = Check::ok("load", "System Load", "0.42");
+        let out = render_json(std::slice::from_ref(&c), true);
+        assert!(out.starts_with('{'));
+        assert!(!out.contains("\"checks\""));
+        assert!(out.contains("\"name\":\"load\""));
+        assert!(out.contains("\"severity\":\"ok\""));
+        assert!(out.contains("\"hint\":null"));
+    }
+
+    #[test]
+    fn json_multi_uses_checks_wrapper() {
+        let checks = vec![
+            Check::ok("load", "Load", "0.1"),
+            Check::warn("mem", "Memory", "91%", "free memory"),
+        ];
+        let out = render_json(&checks, false);
+        assert!(out.starts_with("{\"checks\":["));
+        assert!(out.contains("\"severity\":\"warn\""));
+        assert!(out.contains("\"hint\":\"free memory\""));
+    }
+
+    #[test]
+    fn json_escapes_quotes_and_backslashes() {
+        assert_eq!(json_escape(r#"a"b\c"#), r#"a\"b\\c"#);
+    }
+
+    #[test]
+    fn json_escapes_control_chars() {
+        assert_eq!(json_escape("a\nb"), "a\\nb");
+        assert_eq!(json_escape("a\x01b"), "a\\u0001b");
+    }
+
+    #[test]
+    fn json_severity_strings() {
+        let cases = [
+            (Check::ok("a", "A", "x"), "\"severity\":\"ok\""),
+            (Check::warn("a", "A", "x", "h"), "\"severity\":\"warn\""),
+            (
+                Check::critical("a", "A", "x", "h"),
+                "\"severity\":\"critical\"",
+            ),
+            (Check::unknown("a", "A", "x"), "\"severity\":\"unknown\""),
+        ];
+        for (check, expected) in cases {
+            let out = render_json(std::slice::from_ref(&check), true);
+            assert!(out.contains(expected), "missing {expected} in {out}");
+        }
     }
 }
