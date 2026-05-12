@@ -2,7 +2,7 @@ use image::{ImageBuffer, ImageEncoder, Rgba, RgbaImage};
 use std::io::{self, Write};
 
 use super::font;
-use super::sysinfo::SystemInfo;
+use crate::sysinfo::SystemInfo;
 
 const COLS: u32 = 80;
 const ROWS: u32 = 25;

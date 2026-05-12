@@ -2,9 +2,11 @@
 mod banner;
 mod color;
 mod config;
+mod health;
 mod repo_status;
 mod segments;
 mod shell;
+mod sysinfo;
 #[cfg(feature = "weather")]
 mod weather;
 
@@ -63,6 +65,7 @@ fn main() {
             }
         },
         Some("status") => repo_status::run(),
+        Some("health") => std::process::exit(health::run(&args[2..])),
         Some("version" | "--version" | "-V") => {
             println!("plx {}", env!("CARGO_PKG_VERSION"));
         }
@@ -86,6 +89,7 @@ fn main() {
                 "tmux-title",
                 "init",
                 "status",
+                "health",
                 "version",
                 #[cfg(feature = "banner")]
                 "banner",

@@ -337,6 +337,30 @@ fn status_not_in_repo_exits_failure() {
         .failure();
 }
 
+// ── health ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn health_fast_no_color_emits_core_checks() {
+    cmd()
+        .args(["health", "--fast", "--no-color"])
+        .assert()
+        // exit can be 0/1/2 depending on machine state; just confirm it ran
+        .stdout(predicate::str::contains("System Health Report"))
+        .stdout(predicate::str::contains("System Load"))
+        .stdout(predicate::str::contains("Memory Usage"))
+        .stdout(predicate::str::contains("Disk Usage"));
+}
+
+#[test]
+fn health_unknown_flag_exits_two() {
+    cmd().args(["health", "--bogus"]).assert().code(2);
+}
+
+#[test]
+fn health_help_exits_zero() {
+    cmd().args(["health", "--help"]).assert().code(0);
+}
+
 // ── weather ──────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "weather")]
