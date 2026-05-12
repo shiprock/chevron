@@ -63,6 +63,14 @@ pub fn disk(info: &SystemInfo) -> Check {
     }
 }
 
+pub fn ip_address(info: &SystemInfo) -> Check {
+    if info.ip_addr.is_empty() {
+        Check::unknown("ip", "IP Address", "unknown")
+    } else {
+        Check::ok("ip", "IP Address", info.ip_addr.clone())
+    }
+}
+
 pub fn uptime(info: &SystemInfo) -> Check {
     if info.uptime_secs == 0 {
         return Check::unknown("uptime", "System Uptime", "unknown");
@@ -174,6 +182,22 @@ mod tests {
         let info = fake(0, 1, 96, 100);
         let c = disk(&info);
         assert_eq!(c.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn ip_unknown_when_empty() {
+        let info = fake(0, 1, 0, 1);
+        let c = ip_address(&info);
+        assert_eq!(c.severity, Severity::Unknown);
+    }
+
+    #[test]
+    fn ip_ok_when_present() {
+        let mut info = fake(0, 1, 0, 1);
+        info.ip_addr = "192.168.1.10".to_string();
+        let c = ip_address(&info);
+        assert_eq!(c.severity, Severity::Ok);
+        assert_eq!(c.value, "192.168.1.10");
     }
 
     #[test]

@@ -1,5 +1,8 @@
+mod cache;
 mod check;
 mod checks;
+#[cfg(target_os = "macos")]
+mod macos;
 mod render;
 
 use crate::sysinfo::SystemInfo;
@@ -35,7 +38,15 @@ fn collect(info: &SystemInfo, fast: bool) -> Vec<Check> {
     let mut out = vec![checks::load(info), checks::memory(info), checks::disk(info)];
     if !fast {
         out.push(checks::uptime(info));
+        out.push(checks::ip_address(info));
         out.push(checks::network());
+        #[cfg(target_os = "macos")]
+        {
+            out.push(macos::cpu_temp());
+            out.push(macos::disk_health());
+            out.push(macos::software_updates());
+            out.push(macos::firewall());
+        }
     }
     out
 }
