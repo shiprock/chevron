@@ -3,6 +3,8 @@
 use std::process::Command;
 use std::time::Duration;
 
+use crate::config::Thresholds;
+
 use super::cache;
 use super::check::Check;
 
@@ -21,7 +23,7 @@ fn parse_cpu_temp(raw: &str) -> Option<f64> {
     num.parse().ok()
 }
 
-pub fn cpu_temp() -> Check {
+pub fn cpu_temp(thresh: &Thresholds) -> Check {
     let Ok(output) = Command::new("osx-cpu-temp").output() else {
         return Check::unknown("cpu_temp", "CPU Temperature", "N/A (install osx-cpu-temp)");
     };
@@ -33,14 +35,14 @@ pub fn cpu_temp() -> Check {
         return Check::unknown("cpu_temp", "CPU Temperature", raw.trim().to_string());
     };
     let value = format!("{temp:.1}°C");
-    if temp > 90.0 {
+    if temp > thresh.cpu_temp_critical {
         Check::critical(
             "cpu_temp",
             "CPU Temperature",
             value,
             "check cooling: CPU is critically hot",
         )
-    } else if temp > 80.0 {
+    } else if temp > thresh.cpu_temp_warn {
         Check::warn(
             "cpu_temp",
             "CPU Temperature",

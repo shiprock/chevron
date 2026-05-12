@@ -1,15 +1,16 @@
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+use crate::config::{NetworkConfig, Thresholds};
 use crate::sysinfo::SystemInfo;
 
 use super::check::Check;
 
-pub fn load(info: &SystemInfo) -> Check {
+pub fn load(info: &SystemInfo, thresh: &Thresholds) -> Check {
     let cores = f64::from(info.ncores.max(1));
     let per_core = info.load_1 / cores;
     let value = format!("{:.2} ({:.2} per core)", info.load_1, per_core);
-    if per_core > 1.0 {
+    if per_core > thresh.load {
         Check::warn(
             "load",
             "System Load",
@@ -21,42 +22,42 @@ pub fn load(info: &SystemInfo) -> Check {
     }
 }
 
-pub fn memory(info: &SystemInfo) -> Check {
+pub fn memory(info: &SystemInfo, thresh: &Thresholds) -> Check {
     if info.mem_total == 0 {
         return Check::unknown("memory", "Memory Usage", "unknown");
     }
     #[allow(clippy::cast_precision_loss)]
     let pct = (info.mem_used as f64 / info.mem_total as f64) * 100.0;
     let value = format!("{pct:.1}%");
-    if pct > 95.0 {
+    if pct > thresh.memory_critical {
         Check::critical(
             "memory",
             "Memory Usage",
             value,
             "free memory: close apps or restart heavy processes",
         )
-    } else if pct > 90.0 {
+    } else if pct > thresh.memory_warn {
         Check::warn("memory", "Memory Usage", value, "memory pressure rising")
     } else {
         Check::ok("memory", "Memory Usage", value)
     }
 }
 
-pub fn disk(info: &SystemInfo) -> Check {
+pub fn disk(info: &SystemInfo, thresh: &Thresholds) -> Check {
     if info.disk_total == 0 {
         return Check::unknown("disk", "Disk Usage", "unknown");
     }
     #[allow(clippy::cast_precision_loss)]
     let pct = (info.disk_used as f64 / info.disk_total as f64) * 100.0;
     let value = format!("{pct:.1}%");
-    if pct > 95.0 {
+    if pct > thresh.disk_critical {
         Check::critical(
             "disk",
             "Disk Usage",
             value,
             "free disk space: clean caches or move data",
         )
-    } else if pct > 90.0 {
+    } else if pct > thresh.disk_warn {
         Check::warn("disk", "Disk Usage", value, "disk space getting low")
     } else {
         Check::ok("disk", "Disk Usage", value)
@@ -82,15 +83,14 @@ pub fn uptime(info: &SystemInfo) -> Check {
     Check::ok("uptime", "System Uptime", value)
 }
 
-const NETWORK_HOST: &str = "1.1.1.1:53";
-const NETWORK_TIMEOUT: Duration = Duration::from_millis(500);
-
-pub fn network() -> Check {
-    match try_connect(NETWORK_HOST, NETWORK_TIMEOUT) {
+pub fn network(cfg: &NetworkConfig) -> Check {
+    let host = format!("{}:{}", cfg.host, cfg.port);
+    let timeout = Duration::from_millis(cfg.timeout_ms);
+    match try_connect(&host, timeout) {
         Ok(latency_ms) => Check::ok(
             "network",
             "Network Status",
-            format!("Connected ({latency_ms}ms to {NETWORK_HOST})"),
+            format!("Connected ({latency_ms}ms to {host})"),
         ),
         Err(reason) => Check::critical(
             "network",
@@ -140,47 +140,72 @@ mod tests {
         }
     }
 
+    fn defaults() -> Thresholds {
+        Thresholds::default()
+    }
+
     #[test]
-    fn load_ok_when_per_core_below_one() {
+    fn load_ok_when_per_core_below_threshold() {
         let info = fake(0, 1, 0, 1);
-        let c = load(&info);
+        let c = load(&info, &defaults());
         assert_eq!(c.severity, Severity::Ok);
     }
 
     #[test]
-    fn load_warns_when_per_core_over_one() {
+    fn load_warns_when_per_core_over_threshold() {
         let mut info = fake(0, 1, 0, 1);
         info.ncores = 2;
         info.load_1 = 3.0;
-        let c = load(&info);
+        let c = load(&info, &defaults());
+        assert_eq!(c.severity, Severity::Warn);
+    }
+
+    #[test]
+    fn load_uses_custom_threshold() {
+        let mut info = fake(0, 1, 0, 1);
+        info.ncores = 4;
+        info.load_1 = 2.0; // per-core = 0.5
+        let mut t = defaults();
+        t.load = 0.25; // tighten threshold
+        let c = load(&info, &t);
         assert_eq!(c.severity, Severity::Warn);
     }
 
     #[test]
     fn memory_unknown_when_total_zero() {
         let info = fake(0, 0, 0, 1);
-        let c = memory(&info);
+        let c = memory(&info, &defaults());
         assert_eq!(c.severity, Severity::Unknown);
     }
 
     #[test]
     fn memory_warn_at_91_pct() {
         let info = fake(91, 100, 0, 1);
-        let c = memory(&info);
+        let c = memory(&info, &defaults());
         assert_eq!(c.severity, Severity::Warn);
     }
 
     #[test]
     fn memory_critical_at_96_pct() {
         let info = fake(96, 100, 0, 1);
-        let c = memory(&info);
+        let c = memory(&info, &defaults());
+        assert_eq!(c.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn memory_critical_at_lower_pct_with_tighter_thresholds() {
+        let info = fake(50, 100, 0, 1); // 50% — normally ok
+        let mut t = defaults();
+        t.memory_warn = 25.0;
+        t.memory_critical = 40.0;
+        let c = memory(&info, &t);
         assert_eq!(c.severity, Severity::Critical);
     }
 
     #[test]
     fn disk_critical_at_96_pct() {
         let info = fake(0, 1, 96, 100);
-        let c = disk(&info);
+        let c = disk(&info, &defaults());
         assert_eq!(c.severity, Severity::Critical);
     }
 

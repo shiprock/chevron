@@ -386,10 +386,7 @@ fn health_check_value_only_prints_just_value() {
 
 #[test]
 fn health_check_unknown_name_exits_two() {
-    cmd()
-        .args(["health", "--check", "nosuch"])
-        .assert()
-        .code(2);
+    cmd().args(["health", "--check", "nosuch"]).assert().code(2);
 }
 
 #[test]
@@ -414,6 +411,49 @@ fn health_check_json_emits_bare_object() {
         .assert()
         .stdout(predicate::str::starts_with("{\"name\":\"load\""))
         .stdout(predicate::str::contains("\"severity\":"));
+}
+
+#[test]
+fn health_config_tight_memory_threshold_triggers_critical() {
+    // Memory is normally well under 95%; with a 1%/2% threshold any real
+    // machine will land at critical.
+    let tmp = TempDir::new().unwrap();
+    let cfg_path = tmp.path().join("plx.toml");
+    std::fs::write(
+        &cfg_path,
+        "[health.thresholds]\nmemory_warn = 1\nmemory_critical = 2\n",
+    )
+    .unwrap();
+    cmd()
+        .args(["health", "--check", "memory", "--json"])
+        .env("PLX_CONFIG", &cfg_path)
+        .assert()
+        .stdout(predicate::str::contains("\"severity\":\"critical\""));
+}
+
+#[test]
+fn health_config_disabled_check_omitted_from_report() {
+    let tmp = TempDir::new().unwrap();
+    let cfg_path = tmp.path().join("plx.toml");
+    std::fs::write(&cfg_path, "[health]\ndisabled = [\"memory\"]\n").unwrap();
+    cmd()
+        .args(["health", "--fast", "--json"])
+        .env("PLX_CONFIG", &cfg_path)
+        .assert()
+        .stdout(predicate::str::contains("\"name\":\"memory\"").not())
+        .stdout(predicate::str::contains("\"name\":\"load\""));
+}
+
+#[test]
+fn health_config_disabled_check_still_runs_in_single_check_mode() {
+    let tmp = TempDir::new().unwrap();
+    let cfg_path = tmp.path().join("plx.toml");
+    std::fs::write(&cfg_path, "[health]\ndisabled = [\"memory\"]\n").unwrap();
+    cmd()
+        .args(["health", "--check", "memory", "--json"])
+        .env("PLX_CONFIG", &cfg_path)
+        .assert()
+        .stdout(predicate::str::contains("\"name\":\"memory\""));
 }
 
 // ── weather ──────────────────────────────────────────────────────────────────

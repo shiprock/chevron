@@ -5,6 +5,7 @@ mod checks;
 mod macos;
 mod render;
 
+use crate::config::HealthConfig;
 use crate::sysinfo::SystemInfo;
 
 use check::Check;
@@ -24,10 +25,12 @@ pub fn run(args: &[String]) -> i32 {
         return 0;
     }
 
-    // Single-check mode
+    let cfg = crate::config::Config::load().health;
+
+    // Single-check mode — runs even if disabled in config; the user asked for it.
     if let Some(name) = &opts.check {
         let info = SystemInfo::gather();
-        let Some(check) = run_named(name, &info) else {
+        let Some(check) = run_named(name, &info, &cfg) else {
             eprintln!(
                 "plx health: unknown check '{name}'. Available: {}",
                 available_names().join(", ")
@@ -45,7 +48,7 @@ pub fn run(args: &[String]) -> i32 {
 
     // Full-report mode
     let info = SystemInfo::gather();
-    let collected = collect(&info, opts.fast);
+    let collected = collect(&info, opts.fast, &cfg);
     match opts.output {
         Output::Json => print!("{}", render::render_json(&collected, false)),
         Output::Text | Output::Value => print!("{}", render::render(&collected, opts.color)),
@@ -101,34 +104,59 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
     Ok(opts)
 }
 
-fn collect(info: &SystemInfo, fast: bool) -> Vec<Check> {
-    let mut out = vec![checks::load(info), checks::memory(info), checks::disk(info)];
+fn collect(info: &SystemInfo, fast: bool, cfg: &HealthConfig) -> Vec<Check> {
+    let enabled = |name: &str| !cfg.disabled.iter().any(|d| d == name);
+    let mut out = Vec::with_capacity(10);
+
+    if enabled("load") {
+        out.push(checks::load(info, &cfg.thresholds));
+    }
+    if enabled("memory") {
+        out.push(checks::memory(info, &cfg.thresholds));
+    }
+    if enabled("disk") {
+        out.push(checks::disk(info, &cfg.thresholds));
+    }
     if !fast {
-        out.push(checks::uptime(info));
-        out.push(checks::ip_address(info));
-        out.push(checks::network());
+        if enabled("uptime") {
+            out.push(checks::uptime(info));
+        }
+        if enabled("ip") {
+            out.push(checks::ip_address(info));
+        }
+        if enabled("network") {
+            out.push(checks::network(&cfg.network));
+        }
         #[cfg(target_os = "macos")]
         {
-            out.push(macos::cpu_temp());
-            out.push(macos::disk_health());
-            out.push(macos::software_updates());
-            out.push(macos::firewall());
+            if enabled("cpu_temp") {
+                out.push(macos::cpu_temp(&cfg.thresholds));
+            }
+            if enabled("disk_health") {
+                out.push(macos::disk_health());
+            }
+            if enabled("software_updates") {
+                out.push(macos::software_updates());
+            }
+            if enabled("firewall") {
+                out.push(macos::firewall());
+            }
         }
     }
     out
 }
 
 /// Look up and run a single check by machine-readable name.
-fn run_named(name: &str, info: &SystemInfo) -> Option<Check> {
+fn run_named(name: &str, info: &SystemInfo, cfg: &HealthConfig) -> Option<Check> {
     match name {
-        "load" => Some(checks::load(info)),
-        "memory" => Some(checks::memory(info)),
-        "disk" => Some(checks::disk(info)),
+        "load" => Some(checks::load(info, &cfg.thresholds)),
+        "memory" => Some(checks::memory(info, &cfg.thresholds)),
+        "disk" => Some(checks::disk(info, &cfg.thresholds)),
         "uptime" => Some(checks::uptime(info)),
         "ip" => Some(checks::ip_address(info)),
-        "network" => Some(checks::network()),
+        "network" => Some(checks::network(&cfg.network)),
         #[cfg(target_os = "macos")]
-        "cpu_temp" => Some(macos::cpu_temp()),
+        "cpu_temp" => Some(macos::cpu_temp(&cfg.thresholds)),
         #[cfg(target_os = "macos")]
         "disk_health" => Some(macos::disk_health()),
         #[cfg(target_os = "macos")]

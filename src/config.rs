@@ -15,6 +15,9 @@ pub struct Config {
     #[serde(default)]
     #[cfg_attr(not(feature = "weather"), allow(dead_code))]
     pub weather: WeatherConfig,
+    /// `[health]` TOML section (optional). All fields individually optional.
+    #[serde(default)]
+    pub health: HealthConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -66,6 +69,69 @@ pub struct WeatherConfig {
     pub lon: Option<f64>,
     /// Shell command that prints `"lat|lon"` on stdout.
     pub location_cmd: Option<String>,
+}
+
+/// `[health]` TOML section. All fields optional; missing fields use compiled defaults.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct HealthConfig {
+    /// Threshold overrides per check.
+    pub thresholds: Thresholds,
+    /// Network reachability check target.
+    pub network: NetworkConfig,
+    /// Checks to skip in the full report (single-check mode still runs them).
+    pub disabled: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct Thresholds {
+    /// Per-core load average warn threshold.
+    pub load: f64,
+    /// Memory usage % warn threshold.
+    pub memory_warn: f64,
+    /// Memory usage % critical threshold.
+    pub memory_critical: f64,
+    /// Disk usage % warn threshold.
+    pub disk_warn: f64,
+    /// Disk usage % critical threshold.
+    pub disk_critical: f64,
+    /// CPU temperature (°C) warn threshold.
+    pub cpu_temp_warn: f64,
+    /// CPU temperature (°C) critical threshold.
+    pub cpu_temp_critical: f64,
+}
+
+impl Default for Thresholds {
+    fn default() -> Self {
+        Self {
+            load: 1.0,
+            memory_warn: 90.0,
+            memory_critical: 95.0,
+            disk_warn: 90.0,
+            disk_critical: 95.0,
+            cpu_temp_warn: 80.0,
+            cpu_temp_critical: 90.0,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct NetworkConfig {
+    pub host: String,
+    pub port: u16,
+    pub timeout_ms: u64,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            host: "1.1.1.1".to_string(),
+            port: 53,
+            timeout_ms: 500,
+        }
+    }
 }
 
 impl Config {
@@ -169,6 +235,56 @@ fg = 200
 ";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.segment_enabled("path"));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // exact comparison of Default values
+    fn health_defaults_are_sane() {
+        let cfg = Config::default();
+        assert_eq!(cfg.health.thresholds.load, 1.0);
+        assert_eq!(cfg.health.thresholds.memory_warn, 90.0);
+        assert_eq!(cfg.health.thresholds.memory_critical, 95.0);
+        assert_eq!(cfg.health.thresholds.cpu_temp_warn, 80.0);
+        assert_eq!(cfg.health.network.host, "1.1.1.1");
+        assert_eq!(cfg.health.network.port, 53);
+        assert_eq!(cfg.health.network.timeout_ms, 500);
+        assert!(cfg.health.disabled.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // exact comparison of parsed-then-checked literals
+    fn health_thresholds_can_be_partially_overridden() {
+        let toml = r"
+[health.thresholds]
+memory_warn = 75
+";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.health.thresholds.memory_warn, 75.0);
+        // Unset fields keep their defaults
+        assert_eq!(cfg.health.thresholds.memory_critical, 95.0);
+        assert_eq!(cfg.health.thresholds.load, 1.0);
+    }
+
+    #[test]
+    fn health_disabled_list_parses() {
+        let toml = r#"
+[health]
+disabled = ["network", "software_updates"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.health.disabled, vec!["network", "software_updates"]);
+    }
+
+    #[test]
+    fn health_network_override_partial() {
+        let toml = r#"
+[health.network]
+host = "8.8.8.8"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.health.network.host, "8.8.8.8");
+        assert_eq!(cfg.health.network.port, 53); // default
+        assert_eq!(cfg.health.network.timeout_ms, 500); // default
     }
 
     #[test]
