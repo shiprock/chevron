@@ -81,9 +81,12 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    #[serial]
     fn no_package_json_returns_none() {
         let tmp = TempDir::new().unwrap();
         let pwd = tmp.path().to_string_lossy().to_string();
+        // Serial: races with reads_node_version_env, which sets NODE_VERSION.
+        unsafe { std::env::remove_var("NODE_VERSION") };
         assert!(read_node_version(&pwd).is_none());
     }
 
