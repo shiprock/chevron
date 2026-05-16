@@ -12,9 +12,16 @@ env:
 
 jobs:
   # Fast gate: formatting and lint before spending time on compilation.
+  # Matrix on both OSes so macOS-only code (e.g. src/health/macos.rs,
+  # cfg-gated under target_os = "macos") gets linted too — ubuntu clippy
+  # silently skips that code.
   check:
-    name: Format & Lint
-    runs-on: ubuntu-latest
+    name: Format & Lint / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
