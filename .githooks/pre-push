@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+# Chains beads' JSONL freshness check with lefthook's test stress + nix build.
+# beads reads push refs from stdin; lefthook runs with --force since stdin is
+# consumed and its commands should run regardless of changed-file scoping.
+#
+# beads is non-fatal: if `bd` is mis-installed locally it still warns but won't
+# block pushes. lefthook failures DO block — those are the test/build gates.
+if [ -x .beads/hooks/pre-push ]; then
+    .beads/hooks/pre-push "$@" || echo "WARN: beads pre-push failed (continuing)" >&2
+fi
+if command -v lefthook >/dev/null 2>&1; then
+    exec lefthook run pre-push --force --no-tty
+fi

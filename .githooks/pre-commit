@@ -1,0 +1,12 @@
+#!/usr/bin/env sh
+# Chains beads' JSONL flush with lefthook's fmt + clippy checks.
+# Set repo to use this dir: git config --local core.hooksPath .githooks
+#
+# beads is non-fatal: if `bd` is mis-installed locally it still warns but won't
+# block commits. lefthook failures DO block — those are the code-quality gates.
+if [ -x .beads/hooks/pre-commit ]; then
+    .beads/hooks/pre-commit "$@" || echo "WARN: beads pre-commit failed (continuing)" >&2
+fi
+if command -v lefthook >/dev/null 2>&1; then
+    exec lefthook run pre-commit --force --no-tty
+fi

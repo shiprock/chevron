@@ -1,0 +1,2 @@
+#!/usr/bin/env sh
+exec .beads/hooks/prepare-commit-msg "$@"

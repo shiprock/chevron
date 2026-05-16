@@ -10,5 +10,19 @@ pre-commit:
 pre-push:
   commands:
     test:
-      run: cargo test
-      fail_text: "Tests must pass before pushing"
+      # Run cargo test multiple times to surface parallel-test-isolation flakes.
+      # Past incident (2026-05): a NODE_VERSION env-var race in segments::node
+      # tests slipped past CI because a single run only fails ~20% of the time.
+      run: |
+        set -e
+        for i in 1 2 3 4 5; do
+          echo "=== run $i/5 ==="
+          cargo test --quiet
+        done
+      fail_text: "Tests must pass before pushing (5x stress run for flake detection)"
+    nix-build:
+      # Build in the Nix sandbox to catch environment-specific issues that
+      # cargo test on the host might miss (different parallelism scheduling,
+      # sandboxed paths, missing system deps, etc).
+      run: nix build --no-link
+      fail_text: "Nix build failed; reproduce with: nix build"
