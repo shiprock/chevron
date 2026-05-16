@@ -184,8 +184,7 @@ fn merge_options(cli: &Options, toml_cfg: &WeatherConfig) -> Options {
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn debug(msg: &str) {

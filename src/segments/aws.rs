@@ -10,7 +10,7 @@ pub fn render_with(from_bg: Option<u8>) -> (String, Option<u8>) {
     }
 
     let mut out = String::with_capacity(128);
-    let _ = write!(out, "{} {} {profile} ", arrow(from_bg, 208), fg(0),);
+    let _ = write!(out, "{} {} {profile} ", arrow(from_bg, 208), fg(0));
     (out, Some(208))
 }
 

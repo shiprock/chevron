@@ -1,3 +1,6 @@
+// `cache` is only used by the macOS-specific check module today; gating it
+// avoids dead_code warnings on Linux.
+#[cfg(target_os = "macos")]
 mod cache;
 mod check;
 mod checks;
@@ -168,6 +171,7 @@ fn run_named(name: &str, info: &SystemInfo, cfg: &HealthConfig) -> Option<Check>
 }
 
 fn available_names() -> Vec<&'static str> {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut names = vec!["load", "memory", "disk", "uptime", "ip", "network"];
     #[cfg(target_os = "macos")]
     names.extend(&["cpu_temp", "disk_health", "software_updates", "firewall"]);

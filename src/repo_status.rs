@@ -278,13 +278,12 @@ fn ahead_behind(repo: &Repository) -> (u32, u32) {
         return (0, 0);
     };
     repo.graph_ahead_behind(local_oid, upstream_oid)
-        .map(|(a, b)| {
+        .map_or((0, 0), |(a, b)| {
             (
                 u32::try_from(a).unwrap_or(u32::MAX),
                 u32::try_from(b).unwrap_or(u32::MAX),
             )
         })
-        .unwrap_or((0, 0))
 }
 
 fn find_main_branch(repo: &Repository) -> String {
@@ -299,8 +298,7 @@ fn find_main_branch(repo: &Repository) -> String {
 fn format_age(epoch_secs: i64) -> String {
     let now: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     let epoch_u64 = u64::try_from(epoch_secs).unwrap_or(0);
     let delta = now.saturating_sub(epoch_u64);
@@ -351,8 +349,7 @@ mod tests {
     fn now_secs() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs().cast_signed())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_secs().cast_signed())
     }
 
     #[test]

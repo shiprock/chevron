@@ -132,7 +132,7 @@ pub fn render_with(
 
         // Git state
         if let Some(st) = state {
-            let _ = write!(out, "{}{}{ARROW} {}{st} ", fg(prev), bg(220), fg(0),);
+            let _ = write!(out, "{}{}{ARROW} {}{st} ", fg(prev), bg(220), fg(0));
             prev = 220;
         }
 
@@ -249,13 +249,12 @@ fn ahead_behind(repo: &Repository) -> (u32, u32) {
     };
 
     repo.graph_ahead_behind(local_oid, upstream_oid)
-        .map(|(a, b)| {
+        .map_or((0, 0), |(a, b)| {
             (
                 u32::try_from(a).unwrap_or(u32::MAX),
                 u32::try_from(b).unwrap_or(u32::MAX),
             )
         })
-        .unwrap_or((0, 0))
 }
 
 #[cfg(test)]

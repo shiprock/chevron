@@ -59,7 +59,7 @@ mod tests {
     fn write_then_read_roundtrip() {
         with_cache(|| {
             write("foo", "bar");
-            let got = read("foo", Duration::from_secs(60));
+            let got = read("foo", Duration::from_mins(1));
             assert_eq!(got.as_deref(), Some("bar"));
         });
     }
@@ -68,7 +68,7 @@ mod tests {
     #[serial]
     fn read_missing_returns_none() {
         with_cache(|| {
-            let got = read("nope", Duration::from_secs(60));
+            let got = read("nope", Duration::from_mins(1));
             assert!(got.is_none());
         });
     }

@@ -75,8 +75,7 @@ pub fn render(home: &str, pwd: &str) -> String {
 
     let dirty = repo
         .statuses(Some(&mut opts))
-        .map(|statuses| !statuses.is_empty())
-        .unwrap_or(false);
+        .is_ok_and(|statuses| !statuses.is_empty());
 
     if dirty {
         format!(
