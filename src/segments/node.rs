@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn no_package_json_returns_none() {
+    fn no_version_sources_returns_none() {
         let tmp = TempDir::new().unwrap();
         let pwd = tmp.path().to_string_lossy().to_string();
         // Serial: races with reads_node_version_env, which sets NODE_VERSION.
