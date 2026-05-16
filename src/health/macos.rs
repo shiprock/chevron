@@ -68,7 +68,7 @@ fn parse_smart_status(raw: &str) -> Option<String> {
 
 pub fn disk_health() -> Check {
     const KEY: &str = "disk_health";
-    const TTL: Duration = Duration::from_secs(3_600); // 1h
+    const TTL: Duration = Duration::from_hours(1);
 
     let status = if let Some(cached) = cache::read(KEY, TTL) {
         cached
@@ -167,7 +167,7 @@ fn parse_updates(raw: &str) -> UpdateState {
 
 pub fn software_updates() -> Check {
     const KEY: &str = "software_updates";
-    const TTL: Duration = Duration::from_secs(86_400); // 24h
+    const TTL: Duration = Duration::from_hours(24);
 
     let combined = if let Some(cached) = cache::read(KEY, TTL) {
         cached
