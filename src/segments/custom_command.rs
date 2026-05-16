@@ -166,7 +166,10 @@ mod tests {
 
     #[test]
     fn run_empty_output_returns_none() {
-        let output = run_with_timeout("echo -n ''", Duration::from_secs(5));
+        // `true` is portable; `echo -n ''` was flaky on GitHub's macOS runner
+        // (some shells print "-n" as a literal when the -n flag is followed by
+        // an empty argument). `true` always succeeds and writes nothing.
+        let output = run_with_timeout("true", Duration::from_secs(5));
         assert!(output.is_none());
     }
 
