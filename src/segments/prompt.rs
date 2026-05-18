@@ -13,7 +13,7 @@ pub struct PromptContext {
     pub job_count: u32,
     pub in_tmux: bool,
     /// Set by the git segment during rendering, read by tmux title.
-    pub git_info: Option<git::GitInfo>,
+    pub repo_status: Option<git::RepoStatus>,
     pub config: Config,
 }
 
@@ -40,7 +40,7 @@ impl PromptContext {
             duration_ms,
             job_count,
             in_tmux,
-            git_info: None,
+            repo_status: None,
             config: Config::load(),
         }
     }
@@ -74,7 +74,7 @@ pub fn render(ctx: &mut PromptContext) -> String {
     out.push_str(&reset::render_final(from_bg));
 
     if ctx.in_tmux {
-        let title = tmux_title::render_from_info(&ctx.home, &ctx.pwd, ctx.git_info.as_ref());
+        let title = tmux_title::render_from_status(&ctx.home, &ctx.pwd, ctx.repo_status.as_ref());
         out.push('\n');
         out.push_str(&title);
     }
@@ -109,7 +109,7 @@ mod tests {
             duration_ms: 0,
             job_count: 0,
             in_tmux: false,
-            git_info: None,
+            repo_status: None,
             config: Config::default(),
         };
 
@@ -133,7 +133,7 @@ mod tests {
             duration_ms: 0,
             job_count: 0,
             in_tmux: false,
-            git_info: None,
+            repo_status: None,
             config: Config::default(),
         };
 
@@ -160,7 +160,7 @@ mod tests {
             duration_ms: 0,
             job_count: 0,
             in_tmux: true,
-            git_info: None,
+            repo_status: None,
             config: Config::default(),
         };
 
@@ -193,7 +193,7 @@ mod tests {
             duration_ms: 0,
             job_count: 0,
             in_tmux: false,
-            git_info: None,
+            repo_status: None,
             config: Config::default(),
         };
 
@@ -216,7 +216,7 @@ mod tests {
             duration_ms: 0,
             job_count: 0,
             in_tmux: false,
-            git_info: None,
+            repo_status: None,
             config: Config::default(),
         };
 

@@ -93,9 +93,9 @@ fn bench_git(c: &mut Criterion) {
         b.iter(|| git::render(black_box(&clean_path)));
     });
 
-    let clean_repo = Repository::open(clean.path()).unwrap();
-    group.bench_function("gather_clean", |b| {
-        b.iter(|| git::GitInfo::gather(black_box(&clean_repo)));
+    let mut clean_repo = Repository::open(clean.path()).unwrap();
+    group.bench_function("compute_clean", |b| {
+        b.iter(|| git::RepoStatus::compute(black_box(&mut clean_repo)));
     });
 
     // Dirty repo with 20 untracked files — exercises the per-entry loop.
@@ -109,17 +109,17 @@ fn bench_git(c: &mut Criterion) {
         b.iter(|| git::render(black_box(&dirty_path)));
     });
 
-    let dirty_repo = Repository::open(dirty.path()).unwrap();
-    group.bench_function("gather_20_untracked", |b| {
-        b.iter(|| git::GitInfo::gather(black_box(&dirty_repo)));
+    let mut dirty_repo = Repository::open(dirty.path()).unwrap();
+    group.bench_function("compute_20_untracked", |b| {
+        b.iter(|| git::RepoStatus::compute(black_box(&mut dirty_repo)));
     });
 
     // Real-world: bench against the plx working tree itself if we happen to be
     // in a checkout of it. Gives a representative number for a moderately-sized
     // repo with realistic .gitignore patterns, sub-trees, etc.
-    if let Ok(repo) = Repository::discover(".") {
-        group.bench_function("gather_cwd", |b| {
-            b.iter(|| git::GitInfo::gather(black_box(&repo)));
+    if let Ok(mut repo) = Repository::discover(".") {
+        group.bench_function("compute_cwd", |b| {
+            b.iter(|| git::RepoStatus::compute(black_box(&mut repo)));
         });
     }
 
@@ -130,22 +130,30 @@ fn bench_tmux_title(c: &mut Criterion) {
     let mut group = c.benchmark_group("tmux_title");
 
     // Pure render — no repo discovery, no libgit2 calls.
-    let info = git::GitInfo {
+    let status = git::RepoStatus {
         repo_name: "plx".to_string(),
         branch: "master".to_string(),
-        dirty: false,
+        detached: false,
+        state: None,
+        staged: 0,
+        modified: 0,
+        untracked: 0,
+        conflicted: 0,
+        ahead: 0,
+        behind: 0,
+        stashed: 0,
     };
-    group.bench_function("from_info_clean", |b| {
+    group.bench_function("from_status_clean", |b| {
         b.iter(|| {
-            tmux_title::render_from_info(
+            tmux_title::render_from_status(
                 black_box("/home/user"),
                 black_box("/home/user/src/plx"),
-                Some(black_box(&info)),
+                Some(black_box(&status)),
             )
         });
     });
 
-    // Full render() including Repository::discover + GitInfo::gather.
+    // Full render() including Repository::discover + RepoStatus::compute.
     let tmp = TempDir::new().unwrap();
     init_repo(tmp.path());
     let pwd = tmp.path().to_string_lossy().to_string();
@@ -177,7 +185,7 @@ fn bench_prompt(c: &mut Criterion) {
                 duration_ms: 0,
                 job_count: 0,
                 in_tmux: false,
-                git_info: None,
+                repo_status: None,
                 config: Config::default(),
             },
             |mut ctx| prompt::render(black_box(&mut ctx)),
@@ -199,7 +207,7 @@ fn bench_prompt(c: &mut Criterion) {
                 duration_ms: 0,
                 job_count: 0,
                 in_tmux: false,
-                git_info: None,
+                repo_status: None,
                 config: Config::default(),
             },
             |mut ctx| prompt::render(black_box(&mut ctx)),

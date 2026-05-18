@@ -115,8 +115,9 @@ impl Segment for GitSegment {
     }
 
     fn render(&self, ctx: &mut PromptContext, from_bg: Option<u8>) -> SegmentOutput {
-        let (text, end_bg, info) = git::render_with(ctx.repo.as_mut(), from_bg);
-        ctx.git_info = info;
+        let status = ctx.repo.as_mut().map(git::RepoStatus::compute);
+        let (text, end_bg) = git::render_segment(status.as_ref(), from_bg);
+        ctx.repo_status = status;
         SegmentOutput { text, end_bg }
     }
 }

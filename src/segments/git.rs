@@ -4,95 +4,105 @@ use git2::{AttrCheckFlags, Repository, StatusOptions, StatusShow};
 
 use crate::color::{ARROW, BRANCH_ICON, RST, arrow, bg, fg};
 
-/// Pre-computed git metadata for reuse by other segments (e.g. tmux title).
-pub struct GitInfo {
-    pub repo_name: String,
-    pub branch: String,
-    pub dirty: bool,
+/// In-flight repository state (rebase, merge, cherry-pick, bisect).
+/// Rendered as a yellow chip immediately after the branch when dirty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpState {
+    Rebasing,
+    Merging,
+    CherryPick,
+    Bisect,
 }
 
-impl GitInfo {
-    /// Gather the basic repo summary (branch, repo name, dirty). Shared between
-    /// the prompt git segment and the standalone `plx tmux-title` subcommand
-    /// so both apply the same `.gitattributes filter=` filter to "modified"
-    /// detection (libgit2 marks filtered files as modified even when their
-    /// decrypted content matches HEAD).
+impl OpState {
     #[must_use]
-    pub fn gather(repo: &Repository) -> Self {
-        Self {
-            repo_name: repo_short_name(repo),
-            branch: branch_name(repo),
-            dirty: is_dirty(repo),
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rebasing => "REBASING",
+            Self::Merging => "MERGING",
+            Self::CherryPick => "CHERRY",
+            Self::Bisect => "BISECT",
         }
+    }
+}
+
+/// Complete snapshot of the data the git segment renders: repo identity,
+/// current branch (named or detached SHA), in-flight git operation, and
+/// staged / modified / untracked / conflicted / ahead / behind / stashed
+/// counts. Produced in a single libgit2 pass by [`RepoStatus::compute`].
+///
+/// The renderer [`render_segment`] is pure over this struct — no I/O at
+/// render time. This is the data type the plxd daemon caches and serves
+/// in later phases; the inline-fallback path and daemon path both
+/// produce `RepoStatus` from identical code, so they cannot drift.
+#[derive(Debug, Clone)]
+pub struct RepoStatus {
+    pub repo_name: String,
+    /// Either the branch shorthand ("master", "feature/foo"), the 7-char
+    /// detached HEAD SHA, or the literal "HEAD" if neither is resolvable.
+    pub branch: String,
+    pub detached: bool,
+    pub state: Option<OpState>,
+    pub staged: u32,
+    pub modified: u32,
+    pub untracked: u32,
+    pub conflicted: u32,
+    pub ahead: u32,
+    pub behind: u32,
+    pub stashed: u32,
+}
+
+impl RepoStatus {
+    /// Single libgit2 pass collecting everything the git segment needs.
+    /// `&mut` is required because `stash_foreach` does.
+    #[must_use]
+    pub fn compute(repo: &mut Repository) -> Self {
+        let repo_name = repo_short_name(repo);
+        let (branch, detached) = branch_info(repo);
+        let state = op_state(repo);
+        let (staged, modified, untracked, conflicted) = status_counts(repo);
+        let (ahead, behind) = ahead_behind(repo);
+        let stashed = stash_count(repo);
+        Self {
+            repo_name,
+            branch,
+            detached,
+            state,
+            staged,
+            modified,
+            untracked,
+            conflicted,
+            ahead,
+            behind,
+            stashed,
+        }
+    }
+
+    /// True iff the segment should render in dirty (pink) mode. Stashes alone
+    /// don't flip dirty — a clean repo with stashes shows green with a stash
+    /// indicator chip.
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        self.staged
+            + self.modified
+            + self.untracked
+            + self.conflicted
+            + self.ahead
+            + self.behind
+            > 0
+            || self.state.is_some()
     }
 }
 
 fn repo_short_name(repo: &Repository) -> String {
     repo.workdir()
         .and_then(|p| p.file_name())
-        .map_or_else(String::new, |n| n.to_string_lossy().to_string())
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
 }
 
-fn branch_name(repo: &Repository) -> String {
-    if repo.head_detached().unwrap_or(false) {
-        return repo
-            .head()
-            .ok()
-            .and_then(|h| h.peel_to_commit().ok())
-            .map_or_else(
-                || "HEAD".to_string(),
-                |c| c.id().to_string()[..7].to_string(),
-            );
-    }
-    repo.head()
-        .ok()
-        .and_then(|h| h.shorthand().map(str::to_string))
-        .unwrap_or_else(|| "HEAD".to_string())
-}
-
-/// Returns true if the working tree has any non-ignored changes, with
-/// `.gitattributes filter=` files excluded the same way `git_segment` does.
-fn is_dirty(repo: &Repository) -> bool {
-    let mut opts = StatusOptions::new();
-    opts.show(StatusShow::IndexAndWorkdir);
-    opts.include_untracked(true);
-    let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
-        return false;
-    };
-    let check_filter_attrs = repo_has_attrs(repo);
-    statuses.iter().any(|entry| {
-        let s = entry.status();
-        if s.is_conflicted() || s.is_wt_new() {
-            return true;
-        }
-        let staged = s.is_index_new()
-            || s.is_index_modified()
-            || s.is_index_deleted()
-            || s.is_index_renamed()
-            || s.is_index_typechange();
-        if staged {
-            return true;
-        }
-        if s.is_wt_modified() || s.is_wt_deleted() || s.is_wt_typechange() {
-            return !(check_filter_attrs && has_filter_attr(repo, entry.path()));
-        }
-        false
-    })
-}
-
-#[allow(clippy::too_many_lines)]
-#[must_use]
-pub fn render_with(
-    repo: Option<&mut Repository>,
-    from_bg: Option<u8>,
-) -> (String, Option<u8>, Option<GitInfo>) {
-    let Some(repo) = repo else {
-        // Not in a git repo — just output the closing arrow (dir_end)
-        return (arrow(from_bg, 236), Some(236), None);
-    };
-
-    // Get branch name
-    let branch = if repo.head_detached().unwrap_or(false) {
+fn branch_info(repo: &Repository) -> (String, bool) {
+    let detached = repo.head_detached().unwrap_or(false);
+    let branch = if detached {
         repo.head()
             .ok()
             .and_then(|h| h.peel_to_commit().ok())
@@ -106,8 +116,24 @@ pub fn render_with(
             .and_then(|h| h.shorthand().map(str::to_string))
             .unwrap_or_else(|| "HEAD".to_string())
     };
+    (branch, detached)
+}
 
-    // Get file status counts
+fn op_state(repo: &Repository) -> Option<OpState> {
+    match repo.state() {
+        git2::RepositoryState::Rebase
+        | git2::RepositoryState::RebaseInteractive
+        | git2::RepositoryState::RebaseMerge => Some(OpState::Rebasing),
+        git2::RepositoryState::Merge => Some(OpState::Merging),
+        git2::RepositoryState::CherryPick | git2::RepositoryState::CherryPickSequence => {
+            Some(OpState::CherryPick)
+        }
+        git2::RepositoryState::Bisect => Some(OpState::Bisect),
+        _ => None,
+    }
+}
+
+fn status_counts(repo: &Repository) -> (u32, u32, u32, u32) {
     let mut staged = 0u32;
     let mut modified = 0u32;
     let mut untracked = 0u32;
@@ -118,169 +144,82 @@ pub fn render_with(
     opts.include_untracked(true);
 
     // Hoisting: only invoke libgit2's per-path attribute lookup if the repo
-    // actually has a .gitattributes file. Skips one get_attr() call per modified
-    // file in the common case (no filter drivers).
+    // actually has a .gitattributes file. Skips one get_attr() call per
+    // modified file in the common case (no filter drivers).
     let check_filter_attrs = repo_has_attrs(repo);
 
-    if let Ok(statuses) = repo.statuses(Some(&mut opts)) {
-        for entry in statuses.iter() {
-            let s = entry.status();
-            if s.is_conflicted() {
-                conflicted += 1;
-            } else if s.is_index_new()
-                || s.is_index_modified()
-                || s.is_index_deleted()
-                || s.is_index_renamed()
-                || s.is_index_typechange()
-            {
-                staged += 1;
-                if (s.is_wt_modified() || s.is_wt_deleted() || s.is_wt_typechange())
-                    && !(check_filter_attrs && has_filter_attr(repo, entry.path()))
-                {
-                    modified += 1;
-                }
-                if s.is_wt_new() {
-                    untracked += 1;
-                }
-            } else {
-                if (s.is_wt_modified() || s.is_wt_deleted() || s.is_wt_typechange())
-                    && !(check_filter_attrs && has_filter_attr(repo, entry.path()))
-                {
-                    modified += 1;
-                }
-                if s.is_wt_new() {
-                    untracked += 1;
-                }
-            }
+    let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
+        return (0, 0, 0, 0);
+    };
+
+    for entry in statuses.iter() {
+        let s = entry.status();
+        if s.is_conflicted() {
+            conflicted += 1;
+            continue;
+        }
+        let is_staged = s.is_index_new()
+            || s.is_index_modified()
+            || s.is_index_deleted()
+            || s.is_index_renamed()
+            || s.is_index_typechange();
+        if is_staged {
+            staged += 1;
+        }
+        if (s.is_wt_modified() || s.is_wt_deleted() || s.is_wt_typechange())
+            && !(check_filter_attrs && has_filter_attr(repo, entry.path()))
+        {
+            modified += 1;
+        }
+        if s.is_wt_new() {
+            untracked += 1;
         }
     }
 
-    // Ahead/behind
-    let (ahead, behind) = ahead_behind(repo);
+    (staged, modified, untracked, conflicted)
+}
 
-    // Stash count
+fn ahead_behind(repo: &Repository) -> (u32, u32) {
+    let Ok(head) = repo.head() else {
+        return (0, 0);
+    };
+
+    let Some(local_oid) = head.target() else {
+        return (0, 0);
+    };
+
+    let Some(branch_name) = head.shorthand() else {
+        return (0, 0);
+    };
+
+    let Ok(branch) = repo.find_branch(branch_name, git2::BranchType::Local) else {
+        return (0, 0);
+    };
+
+    let Ok(upstream) = branch.upstream() else {
+        return (0, 0);
+    };
+
+    let Some(upstream_oid) = upstream.get().target() else {
+        return (0, 0);
+    };
+
+    repo.graph_ahead_behind(local_oid, upstream_oid)
+        .map_or((0, 0), |(a, b)| {
+            (
+                u32::try_from(a).unwrap_or(u32::MAX),
+                u32::try_from(b).unwrap_or(u32::MAX),
+            )
+        })
+}
+
+fn stash_count(repo: &mut Repository) -> u32 {
     let mut stashed = 0u32;
     let _ = repo.stash_foreach(|_, _, _| {
         stashed += 1;
         true
     });
-
-    // Git state
-    let state = match repo.state() {
-        git2::RepositoryState::Rebase
-        | git2::RepositoryState::RebaseInteractive
-        | git2::RepositoryState::RebaseMerge => Some("REBASING"),
-        git2::RepositoryState::Merge => Some("MERGING"),
-        git2::RepositoryState::CherryPick | git2::RepositoryState::CherryPickSequence => {
-            Some("CHERRY")
-        }
-        git2::RepositoryState::Bisect => Some("BISECT"),
-        _ => None,
-    };
-
-    // Determine if dirty — stashes are shown as an indicator but don't flip the bar pink
-    let dirty = staged + modified + untracked + conflicted + ahead + behind > 0 || state.is_some();
-
-    let repo_name = repo
-        .workdir()
-        .and_then(|p| p.file_name())
-        .map_or_else(String::new, |n| n.to_string_lossy().to_string());
-
-    let git_info = GitInfo {
-        repo_name,
-        branch: branch.clone(),
-        dirty,
-    };
-
-    let mut out = String::with_capacity(512);
-
-    if dirty {
-        // Pink branch: arrow from path(237) to 161
-        let _ = write!(
-            out,
-            "{} {}{BRANCH_ICON} {branch} ",
-            arrow(from_bg, 161),
-            fg(15),
-        );
-        let mut prev: u8 = 161;
-
-        // Git state
-        if let Some(st) = state {
-            let _ = write!(out, "{}{}{ARROW} {}{st} ", fg(prev), bg(220), fg(0));
-            prev = 220;
-        }
-
-        // Status segments: (bg_color, text)
-        let mut segs: Vec<(u8, String)> = Vec::new();
-        if ahead > 0 {
-            segs.push((240, format!("{ahead}⬆")));
-        }
-        if behind > 0 {
-            segs.push((240, format!("{behind}⬇")));
-        }
-        if staged > 0 {
-            segs.push((22, format!("{staged}✔")));
-        }
-        if modified > 0 {
-            segs.push((130, format!("{modified}✎")));
-        }
-        if untracked > 0 {
-            segs.push((52, format!("{untracked}+")));
-        }
-        if conflicted > 0 {
-            segs.push((9, format!("{conflicted}✼")));
-        }
-        if stashed > 0 {
-            segs.push((20, format!("{stashed}⚑")));
-        }
-
-        for (seg_bg, seg_text) in &segs {
-            let _ = write!(
-                out,
-                "{}{}{ARROW} {}{seg_text} ",
-                fg(prev),
-                bg(*seg_bg),
-                fg(15),
-            );
-            prev = *seg_bg;
-        }
-
-        // Final arrow to terminal bg (236)
-        let _ = write!(out, "{}{}{ARROW}", fg(prev), bg(236));
-    } else {
-        // Green branch (clean): arrow from path(237) to 148
-        if stashed > 0 {
-            let _ = write!(
-                out,
-                "{} {}{BRANCH_ICON} {branch} {}{}{ARROW} {}{stashed}⚑ {}{}{ARROW}",
-                arrow(from_bg, 148),
-                fg(0),
-                fg(148),
-                bg(20),
-                fg(15),
-                fg(20),
-                bg(236),
-            );
-        } else {
-            let _ = write!(
-                out,
-                "{} {}{BRANCH_ICON} {branch} {}{}{ARROW}",
-                arrow(from_bg, 148),
-                fg(0),
-                fg(148),
-                bg(236),
-            );
-        }
-    }
-
-    (out, Some(236), Some(git_info))
-}
-
-#[must_use]
-pub fn render(discover_from: &std::path::Path) -> String {
-    let mut repo = Repository::discover(discover_from).ok();
-    let (out, _, _) = render_with(repo.as_mut(), Some(237));
-    format!("{out}{RST}")
+    stashed
 }
 
 /// Cheap check: does this repo plausibly have any `.gitattributes` rules?
@@ -307,48 +246,153 @@ fn has_filter_attr(repo: &Repository, path: Option<&str>) -> bool {
     .is_ok_and(|v| v.is_some())
 }
 
-fn ahead_behind(repo: &Repository) -> (u32, u32) {
-    let Ok(head) = repo.head() else {
-        return (0, 0);
+/// Pure renderer over a pre-computed `RepoStatus`. No I/O. `None` produces
+/// the closing arrow appropriate for "not a repo" so the previous segment
+/// terminates cleanly.
+#[must_use]
+pub fn render_segment(
+    status: Option<&RepoStatus>,
+    from_bg: Option<u8>,
+) -> (String, Option<u8>) {
+    let Some(s) = status else {
+        return (arrow(from_bg, 236), Some(236));
     };
 
-    let Some(local_oid) = head.target() else {
-        return (0, 0);
-    };
+    let mut out = String::with_capacity(512);
 
-    // Get upstream
-    let Some(branch_name) = head.shorthand() else {
-        return (0, 0);
-    };
+    if s.is_dirty() {
+        // Pink bar: arrow from previous(usually path 237) to 161
+        let _ = write!(
+            out,
+            "{} {}{BRANCH_ICON} {} ",
+            arrow(from_bg, 161),
+            fg(15),
+            s.branch,
+        );
+        let mut prev: u8 = 161;
 
-    let Ok(branch) = repo.find_branch(branch_name, git2::BranchType::Local) else {
-        return (0, 0);
-    };
+        // In-flight op state (rebase/merge/cherry/bisect) — yellow chip
+        if let Some(state) = s.state {
+            let _ = write!(
+                out,
+                "{}{}{ARROW} {}{} ",
+                fg(prev),
+                bg(220),
+                fg(0),
+                state.label(),
+            );
+            prev = 220;
+        }
 
-    let Ok(upstream) = branch.upstream() else {
-        return (0, 0);
-    };
+        // Status indicator chips (kept in the existing visual order)
+        let mut segs: Vec<(u8, String)> = Vec::new();
+        if s.ahead > 0 {
+            segs.push((240, format!("{}\u{2B06}", s.ahead)));
+        }
+        if s.behind > 0 {
+            segs.push((240, format!("{}\u{2B07}", s.behind)));
+        }
+        if s.staged > 0 {
+            segs.push((22, format!("{}\u{2714}", s.staged)));
+        }
+        if s.modified > 0 {
+            segs.push((130, format!("{}\u{270E}", s.modified)));
+        }
+        if s.untracked > 0 {
+            segs.push((52, format!("{}+", s.untracked)));
+        }
+        if s.conflicted > 0 {
+            segs.push((9, format!("{}\u{273C}", s.conflicted)));
+        }
+        if s.stashed > 0 {
+            segs.push((20, format!("{}\u{2691}", s.stashed)));
+        }
 
-    let Some(upstream_oid) = upstream.get().target() else {
-        return (0, 0);
-    };
+        for (seg_bg, seg_text) in &segs {
+            let _ = write!(
+                out,
+                "{}{}{ARROW} {}{seg_text} ",
+                fg(prev),
+                bg(*seg_bg),
+                fg(15),
+            );
+            prev = *seg_bg;
+        }
 
-    repo.graph_ahead_behind(local_oid, upstream_oid)
-        .map_or((0, 0), |(a, b)| {
-            (
-                u32::try_from(a).unwrap_or(u32::MAX),
-                u32::try_from(b).unwrap_or(u32::MAX),
-            )
-        })
+        // Final arrow to terminal bg (236)
+        let _ = write!(out, "{}{}{ARROW}", fg(prev), bg(236));
+    } else {
+        // Green bar (clean). Stash indicator shown as a chip but doesn't flip
+        // the bar to dirty.
+        if s.stashed > 0 {
+            let _ = write!(
+                out,
+                "{} {}{BRANCH_ICON} {} {}{}{ARROW} {}{}\u{2691} {}{}{ARROW}",
+                arrow(from_bg, 148),
+                fg(0),
+                s.branch,
+                fg(148),
+                bg(20),
+                fg(15),
+                s.stashed,
+                fg(20),
+                bg(236),
+            );
+        } else {
+            let _ = write!(
+                out,
+                "{} {}{BRANCH_ICON} {} {}{}{ARROW}",
+                arrow(from_bg, 148),
+                fg(0),
+                s.branch,
+                fg(148),
+                bg(236),
+            );
+        }
+    }
+
+    (out, Some(236))
+}
+
+/// Top-level entry for the `plx git` subcommand: discovers a repo from
+/// `discover_from`, computes status if found, renders the segment, and
+/// appends the terminal reset. This is also the inline fallback path that
+/// `plx prompt` uses when the daemon (phase 1+) is unavailable.
+#[must_use]
+pub fn render(discover_from: &std::path::Path) -> String {
+    let mut repo = Repository::discover(discover_from).ok();
+    let status = repo.as_mut().map(RepoStatus::compute);
+    let (out, _) = render_segment(status.as_ref(), Some(237));
+    format!("{out}{RST}")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{render, render_with};
+    use super::{OpState, RepoStatus, render, render_segment};
     use crate::color::{ARROW, BRANCH_ICON, RST, bg, fg};
     use crate::segments::testutil::init_repo;
     use std::fs;
     use tempfile::TempDir;
+
+    // ── Helpers ─────────────────────────────────────────────────────────
+
+    fn clean_status() -> RepoStatus {
+        RepoStatus {
+            repo_name: "plx".to_string(),
+            branch: "master".to_string(),
+            detached: false,
+            state: None,
+            staged: 0,
+            modified: 0,
+            untracked: 0,
+            conflicted: 0,
+            ahead: 0,
+            behind: 0,
+            stashed: 0,
+        }
+    }
+
+    // ── Behavior tests (using top-level render() against real repos) ────
 
     #[test]
     fn not_a_repo() {
@@ -390,7 +434,7 @@ mod tests {
 
         let out = render(tmp.path());
         assert!(out.contains(bg(161)), "expected pink bg(161) in: {out}");
-        assert!(out.contains('✎'), "expected pencil icon in: {out}");
+        assert!(out.contains('\u{270E}'), "expected pencil icon in: {out}");
     }
 
     #[test]
@@ -398,7 +442,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let repo = init_repo(tmp.path());
 
-        // Commit a file and a .gitattributes that assigns a filter to it
         fs::write(
             tmp.path().join(".gitattributes"),
             "secret.md filter=crypt diff=crypt\n",
@@ -425,12 +468,11 @@ mod tests {
         )
         .unwrap();
 
-        // Modify the filtered file on disk (simulates smudge/clean mismatch)
         fs::write(tmp.path().join("secret.md"), "decrypted plaintext").unwrap();
 
         let out = render(tmp.path());
         assert!(
-            !out.contains('✎'),
+            !out.contains('\u{270E}'),
             "filtered file should not show as modified: {out}"
         );
         assert!(
@@ -451,7 +493,7 @@ mod tests {
         index.write().unwrap();
 
         let out = render(tmp.path());
-        assert!(out.contains('✔'), "expected checkmark in: {out}");
+        assert!(out.contains('\u{2714}'), "expected checkmark in: {out}");
     }
 
     #[test]
@@ -470,7 +512,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut repo = init_repo(tmp.path());
 
-        // Commit a file so we have something to stash
         let file_path = tmp.path().join("file.txt");
         fs::write(&file_path, "hello").unwrap();
         let sig = {
@@ -486,37 +527,13 @@ mod tests {
             sig
         };
 
-        // Modify and stash — working tree is clean after this
         fs::write(&file_path, "modified").unwrap();
         repo.stash_save(&sig, "wip", None).unwrap();
 
         let out = render(tmp.path());
         assert!(out.contains(bg(148)), "expected green bg(148) in: {out}");
-        assert!(out.contains('⚑'), "expected stash icon in: {out}");
+        assert!(out.contains('\u{2691}'), "expected stash icon in: {out}");
         assert!(!out.contains(bg(161)), "should not be pink: {out}");
-    }
-
-    #[test]
-    fn render_with_pre_discovered_repo() {
-        let tmp = TempDir::new().unwrap();
-        let mut repo = init_repo(tmp.path());
-
-        let (out, end_bg, git_info) = render_with(Some(&mut repo), Some(237));
-        assert!(out.contains(bg(148)), "expected green bg(148) in: {out}");
-        assert!(out.contains(BRANCH_ICON));
-        assert_eq!(end_bg, Some(236));
-        let info = git_info.expect("should have GitInfo for a repo");
-        assert!(!info.dirty, "clean repo should not be dirty");
-        assert!(!info.repo_name.is_empty(), "repo_name should be set");
-    }
-
-    #[test]
-    fn render_with_no_repo() {
-        let (out, end_bg, git_info) = render_with(None, Some(240));
-        assert!(out.contains(fg(240)), "expected fg(240) in: {out}");
-        assert!(out.contains(ARROW));
-        assert_eq!(end_bg, Some(236));
-        assert!(git_info.is_none(), "no repo should yield None");
     }
 
     #[test]
@@ -537,5 +554,163 @@ mod tests {
             out.contains(BRANCH_ICON),
             "expected branch icon in detached state: {out}"
         );
+    }
+
+    // ── RepoStatus::compute tests ───────────────────────────────────────
+
+    #[test]
+    fn compute_clean_repo() {
+        let tmp = TempDir::new().unwrap();
+        let mut repo = init_repo(tmp.path());
+
+        let s = RepoStatus::compute(&mut repo);
+        assert!(!s.repo_name.is_empty());
+        assert!(!s.detached);
+        assert_eq!(s.state, None);
+        assert_eq!(
+            (
+                s.staged,
+                s.modified,
+                s.untracked,
+                s.conflicted,
+                s.ahead,
+                s.behind,
+                s.stashed
+            ),
+            (0, 0, 0, 0, 0, 0, 0)
+        );
+        assert!(!s.is_dirty());
+    }
+
+    #[test]
+    fn compute_detached_sets_flag_and_sha_branch() {
+        let tmp = TempDir::new().unwrap();
+        let mut repo = init_repo(tmp.path());
+
+        let head_oid = repo.head().unwrap().target().unwrap();
+        repo.set_head_detached(head_oid).unwrap();
+
+        let s = RepoStatus::compute(&mut repo);
+        assert!(s.detached, "detached flag should be set");
+        assert_eq!(s.branch.len(), 7, "branch should be 7-char SHA: {}", s.branch);
+        assert!(s.branch.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn compute_counts_untracked() {
+        let tmp = TempDir::new().unwrap();
+        let mut repo = init_repo(tmp.path());
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        fs::write(tmp.path().join("b.txt"), "b").unwrap();
+
+        let s = RepoStatus::compute(&mut repo);
+        assert_eq!(s.untracked, 2);
+        assert_eq!(s.staged, 0);
+        assert_eq!(s.modified, 0);
+        assert!(s.is_dirty());
+    }
+
+    #[test]
+    fn is_dirty_excludes_stashes() {
+        let s = RepoStatus {
+            stashed: 3,
+            ..clean_status()
+        };
+        assert!(!s.is_dirty(), "stashes alone should not flip dirty");
+    }
+
+    #[test]
+    fn is_dirty_set_by_op_state() {
+        let s = RepoStatus {
+            state: Some(OpState::Rebasing),
+            ..clean_status()
+        };
+        assert!(s.is_dirty(), "in-flight rebase should flip dirty");
+    }
+
+    // ── render_segment tests (pure, no libgit2) ─────────────────────────
+
+    #[test]
+    fn render_segment_no_status_emits_closing_arrow() {
+        let (out, end_bg) = render_segment(None, Some(240));
+        assert!(out.contains(fg(240)), "expected fg(240) in: {out}");
+        assert!(out.contains(ARROW));
+        assert_eq!(end_bg, Some(236));
+    }
+
+    // ── Snapshot tests over hand-crafted RepoStatus values ──────────────
+    // These lock down the exact ANSI byte sequence rendered for canonical
+    // scenarios. Regenerate with `cargo insta accept` after intentional
+    // format changes.
+
+    #[test]
+    fn snap_segment_clean_no_stash() {
+        let (out, _) = render_segment(Some(&clean_status()), Some(237));
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn snap_segment_clean_with_stash() {
+        let s = RepoStatus {
+            stashed: 2,
+            ..clean_status()
+        };
+        let (out, _) = render_segment(Some(&s), Some(237));
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn snap_segment_dirty_just_modified() {
+        let s = RepoStatus {
+            modified: 3,
+            ..clean_status()
+        };
+        let (out, _) = render_segment(Some(&s), Some(237));
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn snap_segment_dirty_all_chips() {
+        let s = RepoStatus {
+            branch: "feature/foo".to_string(),
+            staged: 1,
+            modified: 2,
+            untracked: 3,
+            conflicted: 1,
+            ahead: 4,
+            behind: 5,
+            stashed: 6,
+            ..clean_status()
+        };
+        let (out, _) = render_segment(Some(&s), Some(237));
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn snap_segment_rebasing() {
+        let s = RepoStatus {
+            state: Some(OpState::Rebasing),
+            modified: 1,
+            ..clean_status()
+        };
+        let (out, _) = render_segment(Some(&s), Some(237));
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn snap_segment_detached_head() {
+        let s = RepoStatus {
+            branch: "abc1234".to_string(),
+            detached: true,
+            ..clean_status()
+        };
+        let (out, _) = render_segment(Some(&s), Some(237));
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn snap_segment_no_repo() {
+        let (out, _) = render_segment(None, Some(237));
+        insta::assert_snapshot!(out);
     }
 }
