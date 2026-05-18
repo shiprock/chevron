@@ -52,12 +52,17 @@
           src =
             let
               binFilter = path: _type: builtins.match ".*\\.bin$" path != null;
+              # insta snapshot files end in .snap; the cargo source filter
+              # rejects them by default and tests fail in the sandbox.
+              snapFilter = path: _type: builtins.match ".*\\.snap$" path != null;
             in
             pkgs.lib.cleanSourceWith {
               src = ./.;
               filter =
                 path: type:
-                (binFilter path type) || (craneLib.filterCargoSources path type);
+                (binFilter path type)
+                || (snapFilter path type)
+                || (craneLib.filterCargoSources path type);
             };
           strictDeps = true;
           nativeBuildInputs = [
