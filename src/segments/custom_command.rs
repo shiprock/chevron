@@ -12,7 +12,15 @@ use crate::segments::registry::{Segment, SegmentOutput};
 const DEFAULT_BG: u8 = 240;
 const DEFAULT_FG: u8 = 15;
 const DEFAULT_CACHE_SECS: u64 = 30;
-const DEFAULT_TIMEOUT_MS: u64 = 500;
+// Default timeout: 100ms. On cache miss, this segment blocks the prompt render
+// synchronously for up to `timeout_ms`. Keep the default tight so a poorly
+// behaved user command can't jank the prompt by more than ~100ms. Users with
+// known-slow commands should explicitly raise `timeout_ms` in their config and
+// also bump `cache_secs` so the slow path is taken less often.
+const DEFAULT_TIMEOUT_MS: u64 = 100;
+// Polling cadence inside run_with_timeout. Lower = snappier return for fast
+// commands, at the cost of slightly more scheduler wakeups.
+const POLL_SLEEP_MS: u64 = 5;
 
 pub struct CustomCommandSegment;
 
@@ -127,7 +135,7 @@ fn run_with_timeout(command: &str, timeout: Duration) -> Option<String> {
                     let _ = child.wait();
                     return None;
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(POLL_SLEEP_MS));
             }
             Err(_) => return None,
         }

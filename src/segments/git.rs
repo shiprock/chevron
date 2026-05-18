@@ -48,6 +48,11 @@ pub fn render_with(
     opts.show(StatusShow::IndexAndWorkdir);
     opts.include_untracked(true);
 
+    // Hoisting: only invoke libgit2's per-path attribute lookup if the repo
+    // actually has a .gitattributes file. Skips one get_attr() call per modified
+    // file in the common case (no filter drivers).
+    let check_filter_attrs = repo_has_attrs(repo);
+
     if let Ok(statuses) = repo.statuses(Some(&mut opts)) {
         for entry in statuses.iter() {
             let s = entry.status();
@@ -61,7 +66,7 @@ pub fn render_with(
             {
                 staged += 1;
                 if (s.is_wt_modified() || s.is_wt_deleted() || s.is_wt_typechange())
-                    && !has_filter_attr(repo, entry.path())
+                    && !(check_filter_attrs && has_filter_attr(repo, entry.path()))
                 {
                     modified += 1;
                 }
@@ -70,7 +75,7 @@ pub fn render_with(
                 }
             } else {
                 if (s.is_wt_modified() || s.is_wt_deleted() || s.is_wt_typechange())
-                    && !has_filter_attr(repo, entry.path())
+                    && !(check_filter_attrs && has_filter_attr(repo, entry.path()))
                 {
                     modified += 1;
                 }
@@ -207,6 +212,17 @@ pub fn render(discover_from: &std::path::Path) -> String {
     let mut repo = Repository::discover(discover_from).ok();
     let (out, _, _) = render_with(repo.as_mut(), Some(237));
     format!("{out}{RST}")
+}
+
+/// Cheap check: does this repo plausibly have any `.gitattributes` rules?
+/// Used to short-circuit per-file `has_filter_attr` calls in the common case
+/// where no filter drivers are configured.
+fn repo_has_attrs(repo: &Repository) -> bool {
+    let workdir_attrs = repo
+        .workdir()
+        .is_some_and(|w| w.join(".gitattributes").exists());
+    let info_attrs = repo.path().join("info").join("attributes").exists();
+    workdir_attrs || info_attrs
 }
 
 /// Returns true if the file has a `filter` gitattribute set (e.g. `filter=crypt`).

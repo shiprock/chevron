@@ -115,6 +115,7 @@ pub fn write(path: &Path, entry: &Entry) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     #[test]
@@ -198,7 +199,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn default_path_prefers_xdg() {
+        // Serial: XDG_CACHE_HOME is also read by health::cache::cache_dir;
+        // racing across modules could yield false negatives in either.
         // SAFETY: test-only
         unsafe {
             std::env::set_var("XDG_CACHE_HOME", "/tmp/xdg-cache-test-plx");

@@ -180,6 +180,7 @@ fn config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn default_config_has_empty_order() {
@@ -288,8 +289,10 @@ host = "8.8.8.8"
     }
 
     #[test]
+    #[serial]
     fn load_missing_file_returns_default() {
-        // Point to a file that does not exist
+        // Serial: Config::load() reads PLX_CONFIG, racing with any test that
+        // sets it. Same pattern as the NODE_VERSION incident.
         unsafe { std::env::set_var("PLX_CONFIG", "/tmp/plx-nonexistent-test.toml") };
         let cfg = Config::load();
         assert!(cfg.segments.order.is_empty());

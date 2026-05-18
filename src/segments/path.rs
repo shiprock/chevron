@@ -17,7 +17,12 @@ pub fn render_with(
     max_dir_size: Option<usize>,
     from_bg: Option<u8>,
 ) -> (String, Option<u8>) {
-    let path = if !home.is_empty() && pwd.starts_with(home) {
+    // Require an exact match or a `/` immediately after `home` so HOME=/home/user
+    // does not match /home/user2/foo (which would render as "~2/foo").
+    let path = if !home.is_empty()
+        && pwd.starts_with(home)
+        && (pwd.len() == home.len() || pwd.as_bytes().get(home.len()) == Some(&b'/'))
+    {
         format!("~{}", &pwd[home.len()..])
     } else {
         pwd.to_string()
@@ -144,6 +149,17 @@ mod tests {
         let out = render("/home/user", "/home/user/projects/plx", None);
         assert!(out.contains('~'), "expected ~ for home subdir");
         assert!(out.contains("plx"));
+    }
+
+    #[test]
+    fn similar_prefix_does_not_collapse_to_tilde() {
+        // /home/user is a prefix of /home/user2/foo but they're different users.
+        let out = render("/home/user", "/home/user2/foo", None);
+        assert!(
+            !out.contains('~'),
+            "should not show ~ when home is only a string prefix: {out}"
+        );
+        assert!(out.contains("user2"), "expected raw user2 in: {out}");
     }
 
     #[test]
