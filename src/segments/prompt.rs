@@ -61,13 +61,12 @@ pub fn render(ctx: &mut PromptContext) -> String {
         // state after a panic (the next segment gets the same ctx, and any
         // partial mutation a panicking segment performed is bounded to fields
         // a well-behaved segment would touch).
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            seg.render(ctx, from_bg)
-        }))
-        .unwrap_or_else(|_| registry::SegmentOutput {
-            text: String::new(),
-            end_bg: from_bg,
-        });
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| seg.render(ctx, from_bg)))
+                .unwrap_or_else(|_| registry::SegmentOutput {
+                    text: String::new(),
+                    end_bg: from_bg,
+                });
         out.push_str(&result.text);
         from_bg = result.end_bg;
     }

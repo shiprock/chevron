@@ -242,11 +242,7 @@ mod tests {
 
     #[test]
     fn snap_max_dir_size_truncates() {
-        insta::assert_snapshot!(render(
-            "",
-            "/home/very-long-directory-name/src",
-            Some(10)
-        ));
+        insta::assert_snapshot!(render("", "/home/very-long-directory-name/src", Some(10)));
     }
 
     // ── Property tests ──────────────────────────────────────────────────

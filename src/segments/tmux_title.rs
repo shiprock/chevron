@@ -135,11 +135,7 @@ mod tests {
 
     #[test]
     fn snap_non_repo_directory() {
-        insta::assert_snapshot!(render_from_info(
-            "/home/user",
-            "/tmp/scratch",
-            None
-        ));
+        insta::assert_snapshot!(render_from_info("/home/user", "/tmp/scratch", None));
     }
 
     #[test]
