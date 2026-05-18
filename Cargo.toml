@@ -39,6 +39,16 @@ pedantic = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
 # Don't allow SAFETY comments on safe code — keeps the safety story honest.
 unnecessary_safety_comment = "warn"
+# Forbid implicit panic sites in production code. The prompt renders on every
+# keystroke; a panic anywhere would drop the user's prompt. All of these are
+# allowed inside #[cfg(test)] blocks via the cfg_attr in src/main.rs so tests
+# can still use unwrap/expect freely.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
 
 [profile.release]
 opt-level = 3

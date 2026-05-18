@@ -1,3 +1,13 @@
+// Integration tests are a separate crate from the main binary; the bin's
+// crate-root cfg_attr(test, allow(...)) doesn't reach here. Allow the same
+// set explicitly so unwrap/expect can be used freely for fixtures.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc
+)]
+
 use assert_cmd::prelude::*;
 use git2::Repository;
 use predicates::prelude::*;

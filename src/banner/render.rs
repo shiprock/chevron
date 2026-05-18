@@ -1316,6 +1316,8 @@ fn base64_encode(data: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Write PNG data as Kitty graphics protocol escape sequences.
+/// Write failures (broken pipe to terminal, etc.) are swallowed since the
+/// banner is non-essential — better a partial banner than a panicked shell.
 fn write_kitty_graphics(png_data: &[u8], out: &mut impl Write) {
     const CHUNK_SIZE: usize = 4096;
 
@@ -1326,16 +1328,17 @@ fn write_kitty_graphics(png_data: &[u8], out: &mut impl Write) {
 
     for (i, chunk) in chunks.iter().enumerate() {
         let m = u8::from(i < last);
-        if i == 0 {
-            write!(out, "\x1b_Gf=100,a=T,q=2,m={m};").expect("write failed");
+        let header_ok = if i == 0 {
+            write!(out, "\x1b_Gf=100,a=T,q=2,m={m};").is_ok()
         } else {
-            write!(out, "\x1b_Gm={m};").expect("write failed");
+            write!(out, "\x1b_Gm={m};").is_ok()
+        };
+        if !header_ok || out.write_all(chunk).is_err() || out.write_all(b"\x1b\\").is_err() {
+            return;
         }
-        out.write_all(chunk).expect("write failed");
-        out.write_all(b"\x1b\\").expect("write failed");
     }
     // Newline after image so the shell prompt starts on a fresh line
-    out.write_all(b"\n").expect("write failed");
+    let _ = out.write_all(b"\n");
 }
 
 /// Pipe PNG through chafa for tmux or terminals without Kitty support.
@@ -1394,22 +1397,28 @@ pub fn generate(scale: u32, palette_name: &str, banner_type: Option<&str>, title
     let height = (rows_used * GLYPH_H * scale).min(max_height);
     let cropped = image::imageops::crop_imm(&img, 0, 0, width, height).to_image();
 
-    // Encode to PNG in memory
+    // Encode to PNG in memory. Encoding failures are silently dropped — better
+    // a missing banner than a panicked shell startup.
     let mut png_buf: Vec<u8> = Vec::new();
     let encoder = image::codecs::png::PngEncoder::new(&mut png_buf);
-    encoder
+    if encoder
         .write_image(
             cropped.as_raw(),
             width,
             height,
             image::ExtendedColorType::Rgba8,
         )
-        .expect("failed to encode PNG");
+        .is_err()
+    {
+        return;
+    }
 
     if raw_png {
         let mut out = io::BufWriter::new(io::stdout().lock());
-        out.write_all(&png_buf).expect("failed to write PNG");
-        out.flush().expect("failed to flush stdout");
+        if out.write_all(&png_buf).is_err() {
+            return;
+        }
+        let _ = out.flush();
     } else {
         let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
         if in_tmux {
@@ -1417,7 +1426,7 @@ pub fn generate(scale: u32, palette_name: &str, banner_type: Option<&str>, title
         } else {
             let mut out = io::BufWriter::new(io::stdout().lock());
             write_kitty_graphics(&png_buf, &mut out);
-            out.flush().expect("failed to flush stdout");
+            let _ = out.flush();
         }
     }
 }

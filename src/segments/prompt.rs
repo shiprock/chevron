@@ -53,7 +53,21 @@ pub fn render(ctx: &mut PromptContext) -> String {
     let mut from_bg: Option<u8> = None;
 
     for seg in &segments {
-        let result = seg.render(ctx, from_bg);
+        // Catch panics per-segment so a bug in one segment doesn't drop the
+        // entire prompt. The panicked segment renders as empty (pass-through
+        // `from_bg`) and the rest of the chain continues. PromptContext
+        // contains a libgit2 Repository that isn't UnwindSafe by default;
+        // AssertUnwindSafe is acceptable here because we don't observe ctx
+        // state after a panic (the next segment gets the same ctx, and any
+        // partial mutation a panicking segment performed is bounded to fields
+        // a well-behaved segment would touch).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            seg.render(ctx, from_bg)
+        }))
+        .unwrap_or_else(|_| registry::SegmentOutput {
+            text: String::new(),
+            end_bg: from_bg,
+        });
         out.push_str(&result.text);
         from_bg = result.end_bg;
     }
