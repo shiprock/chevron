@@ -12,6 +12,18 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Scan Cargo.lock against the RustSec advisory database. Fails on any
+  # known CVE in a transitive dependency. Dependabot opens PRs to upgrade;
+  # this guard makes sure we don't merge new deps that already ship a CVE.
+  audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   # Fast gate: formatting and lint before spending time on compilation.
   # Matrix on both OSes so macOS-only code (e.g. src/health/macos.rs,
   # cfg-gated under target_os = "macos") gets linted too — ubuntu clippy
