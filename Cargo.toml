@@ -28,8 +28,17 @@ predicates = "3"
 serial_test = "3"
 tempfile = "3"
 
+[lints.rust]
+# Forbid implicit unsafe inside `unsafe fn` bodies — every unsafe op
+# still needs an explicit `unsafe { ... }` block with a SAFETY comment.
+unsafe_op_in_unsafe_fn = "deny"
+
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+# Every `unsafe { ... }` block must carry a `// SAFETY:` comment.
+undocumented_unsafe_blocks = "warn"
+# Don't allow SAFETY comments on safe code — keeps the safety story honest.
+unnecessary_safety_comment = "warn"
 
 [profile.release]
 opt-level = 3

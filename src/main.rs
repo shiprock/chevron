@@ -1,3 +1,9 @@
+// Test modules contain many `unsafe { std::env::set_var / remove_var }` blocks
+// (mandatory unsafe in Rust 2024 edition). Per-block SAFETY comments would be
+// noise; the mutations are made race-free by `#[serial]` annotations on the
+// env-var-touching tests. Production code is still subject to the lint.
+#![cfg_attr(test, allow(clippy::undocumented_unsafe_blocks))]
+
 #[cfg(feature = "banner")]
 mod banner;
 mod color;

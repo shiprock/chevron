@@ -394,12 +394,16 @@ fn make_box_bot(label: &str, width: usize) -> Vec<u8> {
 
 fn day_of_year() -> u32 {
     let mut t: libc::time_t = 0;
+    // SAFETY: `t` is a writable time_t.
     unsafe { libc::time(&raw mut t) };
+    // SAFETY: `t` is initialized; localtime takes a const pointer.
     let tm = unsafe { libc::localtime(&raw const t) };
     if tm.is_null() {
         return 0;
     }
     #[allow(clippy::cast_sign_loss)]
+    // SAFETY: tm is non-null (just checked); points to thread-local static
+    // storage valid until the next localtime call on this thread.
     unsafe {
         (*tm).tm_yday as u32
     }

@@ -66,6 +66,8 @@ impl SystemInfo {
 
 fn get_hostname() -> String {
     let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a writable 256-byte stack array; gethostname will write at
+    // most `buf.len()` bytes and we only read `buf` after checking ret == 0.
     let ret = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
     if ret == 0 {
         let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
@@ -81,11 +83,15 @@ fn get_hostname() -> String {
 
 fn get_date() -> String {
     let mut t: libc::time_t = 0;
+    // SAFETY: `t` is a valid time_t writable through `&raw mut`.
     unsafe { libc::time(&raw mut t) };
+    // SAFETY: `t` is a valid initialized time_t; localtime accepts a const pointer.
     let tm = unsafe { libc::localtime(&raw const t) };
     if tm.is_null() {
         return "????-??-??".to_string();
     }
+    // SAFETY: tm is non-null (just checked); localtime returns a pointer to thread-
+    // local static storage valid until the next localtime/gmtime call on this thread.
     let tm = unsafe { &*tm };
     format!(
         "{:04}-{:02}-{:02}",
@@ -103,6 +109,9 @@ fn get_date() -> String {
 fn sysctl_u32(name: &std::ffi::CStr) -> Option<u32> {
     let mut val: u32 = 0;
     let mut len = std::mem::size_of::<u32>();
+    // SAFETY: `name` is a valid C string. `val` is a writable u32 and `len` matches
+    // its size; sysctlbyname writes at most `len` bytes into the destination. We
+    // only consume `val` when ret == 0 (success).
     let ret = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -119,6 +128,7 @@ fn sysctl_u32(name: &std::ffi::CStr) -> Option<u32> {
 fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
     let mut val: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
+    // SAFETY: same invariants as sysctl_u32 above, with a u64 destination.
     let ret = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -146,6 +156,9 @@ fn get_load_avg(index: usize) -> f64 {
     }
     let mut avg = std::mem::MaybeUninit::<LoadAvg>::uninit();
     let mut len = std::mem::size_of::<LoadAvg>();
+    // SAFETY: vm.loadavg returns a `struct loadavg`; LoadAvg above mirrors its
+    // layout (#[repr(C)] + matching fields). `len` is the exact byte size so
+    // sysctlbyname fully initializes `avg` on success.
     let ret = unsafe {
         libc::sysctlbyname(
             c"vm.loadavg".as_ptr(),
@@ -156,6 +169,7 @@ fn get_load_avg(index: usize) -> f64 {
         )
     };
     if ret == 0 && index < 3 {
+        // SAFETY: ret == 0 above means sysctlbyname wrote a complete LoadAvg.
         let avg = unsafe { avg.assume_init() };
         #[allow(clippy::cast_precision_loss)]
         let fscale = (avg.fscale.max(1)) as f64;
@@ -233,6 +247,9 @@ mod mach_vm {
 fn get_vm_stats() -> Option<mach_vm::VmStatistics64> {
     let mut stats = mach_vm::VmStatistics64::default();
     let mut count = mach_vm::HOST_VM_INFO64_COUNT;
+    // SAFETY: VmStatistics64 mirrors the Mach `vm_statistics64` C struct layout.
+    // `count` is initialized to HOST_VM_INFO64_COUNT (u32 count of u32 fields)
+    // which matches what host_statistics64 expects.
     let ret = unsafe {
         mach_vm::host_statistics64(
             mach_vm::mach_host_self(),
@@ -269,8 +286,11 @@ fn get_mem_compressed() -> u64 {
 fn get_disk_info() -> (u64, u64) {
     let path = c"/";
     let mut stat: std::mem::MaybeUninit<libc::statvfs> = std::mem::MaybeUninit::uninit();
+    // SAFETY: `path` is a valid C string. statvfs writes a complete statvfs
+    // struct into `stat` on success (ret == 0).
     let ret = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
     if ret == 0 {
+        // SAFETY: ret == 0 means statvfs initialized the destination.
         let s = unsafe { stat.assume_init() };
         #[allow(clippy::unnecessary_cast)]
         let total = s.f_frsize as u64 * u64::from(s.f_blocks);
@@ -301,6 +321,8 @@ fn get_uptime_secs() -> u64 {
     }
     let mut tv = std::mem::MaybeUninit::<Timeval>::uninit();
     let mut len = std::mem::size_of::<Timeval>();
+    // SAFETY: kern.boottime returns a `struct timeval`; the local Timeval mirrors
+    // its #[repr(C)] layout. `len` is the destination size in bytes.
     let ret = unsafe {
         libc::sysctlbyname(
             c"kern.boottime".as_ptr(),
@@ -311,8 +333,10 @@ fn get_uptime_secs() -> u64 {
         )
     };
     if ret == 0 {
+        // SAFETY: ret == 0 means sysctlbyname initialized `tv`.
         let tv = unsafe { tv.assume_init() };
         let mut now: libc::time_t = 0;
+        // SAFETY: `now` is a writable time_t.
         unsafe { libc::time(&raw mut now) };
         #[allow(clippy::cast_sign_loss)]
         let up = (now - tv.tv_sec).max(0) as u64;
@@ -327,6 +351,8 @@ fn get_proc_count() -> u32 {
     unsafe extern "C" {
         fn proc_listallpids(buffer: *mut libc::c_void, buffersize: libc::c_int) -> libc::c_int;
     }
+    // SAFETY: proc_listallpids with (NULL, 0) is documented to return the count
+    // of process IDs without writing anywhere — no destination buffer required.
     let count = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
     #[allow(clippy::cast_sign_loss)]
     if count > 0 { count as u32 } else { 0 }
@@ -400,8 +426,11 @@ fn parse_meminfo_kb(key: &str) -> u64 {
 fn get_disk_info() -> (u64, u64) {
     let path = c"/";
     let mut stat: std::mem::MaybeUninit<libc::statvfs> = std::mem::MaybeUninit::uninit();
+    // SAFETY: `path` is a valid C string. statvfs writes a complete statvfs
+    // struct into `stat` on success (ret == 0).
     let ret = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
     if ret == 0 {
+        // SAFETY: ret == 0 means statvfs initialized the destination.
         let s = unsafe { stat.assume_init() };
         let total = s.f_frsize * s.f_blocks;
         let free = s.f_frsize * s.f_bavail;
@@ -465,6 +494,8 @@ fn get_ip_addr() -> String {
 
 fn get_ip_addr_common() -> String {
     let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `addrs` is a writable *mut *mut ifaddrs out-parameter; getifaddrs
+    // writes a linked-list head pointer there. We pair this with freeifaddrs below.
     let ret = unsafe { libc::getifaddrs(&raw mut addrs) };
     if ret != 0 || addrs.is_null() {
         return String::new();
@@ -472,13 +503,19 @@ fn get_ip_addr_common() -> String {
     let mut result = String::new();
     let mut cur = addrs;
     while !cur.is_null() {
+        // SAFETY: while-loop guard ensures cur is non-null; getifaddrs returns
+        // a valid linked list whose nodes live until freeifaddrs.
         let ifa = unsafe { &*cur };
         let sa = ifa.ifa_addr;
         if !sa.is_null() {
+            // SAFETY: sa is non-null; sa_family is always valid on a returned
+            // ifaddrs node.
             let family = unsafe { (*sa).sa_family };
             #[allow(clippy::cast_lossless)]
             if family as i32 == libc::AF_INET {
                 // Check it's not loopback
+                // SAFETY: ifa_name is a valid NUL-terminated C string owned by
+                // the linked list (alive until freeifaddrs).
                 let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) };
                 if let Ok(n) = name.to_str()
                     && n != "lo"
@@ -486,6 +523,9 @@ fn get_ip_addr_common() -> String {
                 {
                     #[allow(clippy::cast_ptr_alignment)]
                     let sin = sa.cast::<libc::sockaddr_in>();
+                    // SAFETY: AF_INET above guarantees `sa` points to a
+                    // sockaddr_in; the cast is alignment-asserted via the
+                    // allow above (sockaddr/sockaddr_in share alignment).
                     let ip = unsafe { (*sin).sin_addr.s_addr };
                     let bytes = ip.to_ne_bytes();
                     result = format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
@@ -495,6 +535,8 @@ fn get_ip_addr_common() -> String {
         }
         cur = ifa.ifa_next;
     }
+    // SAFETY: `addrs` was returned successfully by getifaddrs above and we have
+    // not freed it. Pair with the getifaddrs call.
     unsafe { libc::freeifaddrs(addrs) };
     result
 }

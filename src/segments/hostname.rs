@@ -8,6 +8,8 @@ const SSH_ICON: &str = "\u{F817}";
 
 fn get_hostname() -> String {
     let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a writable 256-byte stack array; gethostname writes at
+    // most `buf.len()` bytes and we only read `buf` after checking ret == 0.
     let ret = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
     if ret != 0 {
         return String::new();

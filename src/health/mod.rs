@@ -194,7 +194,9 @@ fn supports_color() -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
     }
-    // libc::isatty(1) — stdout is fd 1
+    // SAFETY: isatty is always safe to call with any int fd; it returns 0/1
+    // and sets errno on failure. Stdout (fd 1) is always a valid file descriptor
+    // in a running process.
     unsafe { libc::isatty(1) != 0 }
 }
 
