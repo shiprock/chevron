@@ -1,4 +1,4 @@
-use git2::{Repository, StatusOptions, StatusShow};
+use git2::Repository;
 
 use crate::color::{BRANCH_ICON, PENCIL_ICON};
 use crate::segments::git::GitInfo;
@@ -37,53 +37,17 @@ pub fn render(home: &str, pwd: &str) -> String {
         return "\u{1F3E0} ~".to_string();
     }
 
-    let dir_name = std::path::Path::new(pwd)
-        .file_name()
-        .map_or_else(|| pwd.to_string(), |n| n.to_string_lossy().to_string());
-
-    // Try to open git repo
     let Ok(repo) = Repository::discover(pwd) else {
+        let dir_name = std::path::Path::new(pwd)
+            .file_name()
+            .map_or_else(|| pwd.to_string(), |n| n.to_string_lossy().to_string());
         return format!("\u{1F4C1} {dir_name}");
     };
 
-    // Get branch name
-    let branch = if repo.head_detached().unwrap_or(false) {
-        repo.head()
-            .ok()
-            .and_then(|h| h.peel_to_commit().ok())
-            .map_or_else(
-                || "HEAD".to_string(),
-                |c| c.id().to_string()[..7].to_string(),
-            )
-    } else {
-        repo.head()
-            .ok()
-            .and_then(|h| h.shorthand().map(str::to_string))
-            .unwrap_or_else(|| "HEAD".to_string())
-    };
-
-    // Get repo name from workdir
-    let repo_name = repo
-        .workdir()
-        .and_then(|p| p.file_name())
-        .map_or(dir_name, |n| n.to_string_lossy().to_string());
-
-    // Check if dirty (any status entries = dirty)
-    let mut opts = StatusOptions::new();
-    opts.show(StatusShow::IndexAndWorkdir);
-    opts.include_untracked(true);
-
-    let dirty = repo
-        .statuses(Some(&mut opts))
-        .is_ok_and(|statuses| !statuses.is_empty());
-
-    if dirty {
-        format!(
-            "#[fg=colour174]{BRANCH_ICON}#[default] {repo_name} {branch} #[fg=colour245]{PENCIL_ICON}#[default]"
-        )
-    } else {
-        format!("#[fg=colour117]{BRANCH_ICON}#[default] {repo_name} {branch}")
-    }
+    // Delegate to the shared GitInfo gatherer so this code path stays in sync
+    // with the git prompt segment (including the .gitattributes filter check).
+    let info = GitInfo::gather(&repo);
+    render_from_info(home, pwd, Some(&info))
 }
 
 #[cfg(test)]

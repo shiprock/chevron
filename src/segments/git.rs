@@ -11,6 +11,75 @@ pub struct GitInfo {
     pub dirty: bool,
 }
 
+impl GitInfo {
+    /// Gather the basic repo summary (branch, repo name, dirty). Shared between
+    /// the prompt git segment and the standalone `plx tmux-title` subcommand
+    /// so both apply the same `.gitattributes filter=` filter to "modified"
+    /// detection (libgit2 marks filtered files as modified even when their
+    /// decrypted content matches HEAD).
+    #[must_use]
+    pub fn gather(repo: &Repository) -> Self {
+        Self {
+            repo_name: repo_short_name(repo),
+            branch: branch_name(repo),
+            dirty: is_dirty(repo),
+        }
+    }
+}
+
+fn repo_short_name(repo: &Repository) -> String {
+    repo.workdir()
+        .and_then(|p| p.file_name())
+        .map_or_else(String::new, |n| n.to_string_lossy().to_string())
+}
+
+fn branch_name(repo: &Repository) -> String {
+    if repo.head_detached().unwrap_or(false) {
+        return repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_commit().ok())
+            .map_or_else(
+                || "HEAD".to_string(),
+                |c| c.id().to_string()[..7].to_string(),
+            );
+    }
+    repo.head()
+        .ok()
+        .and_then(|h| h.shorthand().map(str::to_string))
+        .unwrap_or_else(|| "HEAD".to_string())
+}
+
+/// Returns true if the working tree has any non-ignored changes, with
+/// `.gitattributes filter=` files excluded the same way `git_segment` does.
+fn is_dirty(repo: &Repository) -> bool {
+    let mut opts = StatusOptions::new();
+    opts.show(StatusShow::IndexAndWorkdir);
+    opts.include_untracked(true);
+    let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
+        return false;
+    };
+    let check_filter_attrs = repo_has_attrs(repo);
+    statuses.iter().any(|entry| {
+        let s = entry.status();
+        if s.is_conflicted() || s.is_wt_new() {
+            return true;
+        }
+        let staged = s.is_index_new()
+            || s.is_index_modified()
+            || s.is_index_deleted()
+            || s.is_index_renamed()
+            || s.is_index_typechange();
+        if staged {
+            return true;
+        }
+        if s.is_wt_modified() || s.is_wt_deleted() || s.is_wt_typechange() {
+            return !(check_filter_attrs && has_filter_attr(repo, entry.path()));
+        }
+        false
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn render_with(
@@ -296,7 +365,7 @@ mod tests {
         init_repo(tmp.path());
 
         let out = render(tmp.path());
-        assert!(out.contains(&bg(148)), "expected green bg(148) in: {out}");
+        assert!(out.contains(bg(148)), "expected green bg(148) in: {out}");
         assert!(out.contains(BRANCH_ICON));
     }
 
@@ -320,7 +389,7 @@ mod tests {
         fs::write(&file_path, "modified").unwrap();
 
         let out = render(tmp.path());
-        assert!(out.contains(&bg(161)), "expected pink bg(161) in: {out}");
+        assert!(out.contains(bg(161)), "expected pink bg(161) in: {out}");
         assert!(out.contains('✎'), "expected pencil icon in: {out}");
     }
 
@@ -365,7 +434,7 @@ mod tests {
             "filtered file should not show as modified: {out}"
         );
         assert!(
-            out.contains(&bg(148)),
+            out.contains(bg(148)),
             "repo should appear clean (green): {out}"
         );
     }
@@ -422,9 +491,9 @@ mod tests {
         repo.stash_save(&sig, "wip", None).unwrap();
 
         let out = render(tmp.path());
-        assert!(out.contains(&bg(148)), "expected green bg(148) in: {out}");
+        assert!(out.contains(bg(148)), "expected green bg(148) in: {out}");
         assert!(out.contains('⚑'), "expected stash icon in: {out}");
-        assert!(!out.contains(&bg(161)), "should not be pink: {out}");
+        assert!(!out.contains(bg(161)), "should not be pink: {out}");
     }
 
     #[test]
@@ -433,7 +502,7 @@ mod tests {
         let mut repo = init_repo(tmp.path());
 
         let (out, end_bg, git_info) = render_with(Some(&mut repo), Some(237));
-        assert!(out.contains(&bg(148)), "expected green bg(148) in: {out}");
+        assert!(out.contains(bg(148)), "expected green bg(148) in: {out}");
         assert!(out.contains(BRANCH_ICON));
         assert_eq!(end_bg, Some(236));
         let info = git_info.expect("should have GitInfo for a repo");
@@ -444,7 +513,7 @@ mod tests {
     #[test]
     fn render_with_no_repo() {
         let (out, end_bg, git_info) = render_with(None, Some(240));
-        assert!(out.contains(&fg(240)), "expected fg(240) in: {out}");
+        assert!(out.contains(fg(240)), "expected fg(240) in: {out}");
         assert!(out.contains(ARROW));
         assert_eq!(end_bg, Some(236));
         assert!(git_info.is_none(), "no repo should yield None");

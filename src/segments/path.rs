@@ -203,7 +203,7 @@ mod tests {
     fn render_with_uses_from_bg() {
         let (out, end_bg) = render_with("/home/user", "/home/user/src", None, Some(240));
         assert!(
-            out.contains(&crate::color::fg(240)),
+            out.contains(crate::color::fg(240)),
             "expected fg(240) in: {out}"
         );
         assert_eq!(end_bg, Some(237));

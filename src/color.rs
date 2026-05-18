@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 pub const ARROW: &str = "\u{E0B0}";
 pub const THIN: &str = "\u{E0B1}";
 pub const BRANCH_ICON: &str = "\u{E0A0}";
@@ -6,24 +8,36 @@ pub const RST: &str = "\x1b[0m";
 pub const BOLD: &str = "\x1b[1m";
 pub const UNBOLD: &str = "\x1b[22m";
 
+// Pre-built ANSI color tables. The 256-color palette is bounded, so we build
+// every fg/bg escape once at first use and return borrowed slices thereafter.
+// Per-render this eliminates dozens of `format!` allocations on the hot path.
+static FG_CODES: LazyLock<[String; 256]> =
+    LazyLock::new(|| std::array::from_fn(|i| format!("\x1b[38;5;{i}m")));
+static BG_CODES: LazyLock<[String; 256]> =
+    LazyLock::new(|| std::array::from_fn(|i| format!("\x1b[48;5;{i}m")));
+
 /// Powerline arrow transition. `None` means first segment (no arrow glyph).
 #[must_use]
 pub fn arrow(from_bg: Option<u8>, to_bg: u8) -> String {
+    let mut out = String::with_capacity(24);
     if let Some(prev) = from_bg {
-        format!("{}{}{ARROW}", fg(prev), bg(to_bg))
+        out.push_str(fg(prev));
+        out.push_str(bg(to_bg));
+        out.push_str(ARROW);
     } else {
-        bg(to_bg)
+        out.push_str(bg(to_bg));
     }
+    out
 }
 
 #[must_use]
-pub fn fg(color: u8) -> String {
-    format!("\x1b[38;5;{color}m")
+pub fn fg(color: u8) -> &'static str {
+    &FG_CODES[color as usize]
 }
 
 #[must_use]
-pub fn bg(color: u8) -> String {
-    format!("\x1b[48;5;{color}m")
+pub fn bg(color: u8) -> &'static str {
+    &BG_CODES[color as usize]
 }
 
 /// Wrap ANSI escape sequences in `%{...%}` so zsh can calculate visible prompt width.
@@ -135,8 +149,8 @@ mod tests {
     #[test]
     fn arrow_with_from_bg_includes_glyph() {
         let out = arrow(Some(237), 148);
-        assert!(out.contains(&fg(237)));
-        assert!(out.contains(&bg(148)));
+        assert!(out.contains(fg(237)));
+        assert!(out.contains(bg(148)));
         assert!(out.contains(ARROW));
     }
 

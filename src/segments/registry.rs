@@ -173,44 +173,65 @@ impl Segment for CharacterSegment {
     }
 }
 
+// All segment types are unit structs (ZSTs), so we can hand out shared
+// `&'static dyn Segment` references instead of allocating a `Box<dyn Segment>`
+// per render. `Box::new(ZST)` was 11+ heap allocations per prompt redraw; the
+// constants here promote those into static references via const promotion.
+const VENV: VenvSegment = VenvSegment;
+const USERNAME: UsernameSegment = UsernameSegment;
+const HOSTNAME: HostnameSegment = HostnameSegment;
+const NIX_SHELL: NixShellSegment = NixShellSegment;
+const AWS: AwsSegment = AwsSegment;
+const K8S: K8sSegment = K8sSegment;
+const PATH: PathSegment = PathSegment;
+const GIT: GitSegment = GitSegment;
+const NODE: NodeSegment = NodeSegment;
+const PYTHON: PythonSegment = PythonSegment;
+const RUST_TOOLCHAIN: RustToolchainSegment = RustToolchainSegment;
+const STATUS: StatusSegment = StatusSegment;
+const CMD_DURATION: CmdDurationSegment = CmdDurationSegment;
+const JOBS: JobsSegment = JobsSegment;
+const CHARACTER: CharacterSegment = CharacterSegment;
+const CUSTOM_COMMAND: CustomCommandSegment = CustomCommandSegment;
+
 /// Map a segment name from config to its implementation.
-fn segment_by_name(name: &str) -> Option<Box<dyn Segment>> {
+fn segment_by_name(name: &str) -> Option<&'static dyn Segment> {
     match name {
-        "venv" => Some(Box::new(VenvSegment)),
-        "username" => Some(Box::new(UsernameSegment)),
-        "hostname" => Some(Box::new(HostnameSegment)),
-        "nix_shell" => Some(Box::new(NixShellSegment)),
-        "aws" => Some(Box::new(AwsSegment)),
-        "k8s" => Some(Box::new(K8sSegment)),
-        "path" => Some(Box::new(PathSegment)),
-        "git" => Some(Box::new(GitSegment)),
-        "node" => Some(Box::new(NodeSegment)),
-        "python" => Some(Box::new(PythonSegment)),
-        "rust_toolchain" => Some(Box::new(RustToolchainSegment)),
-        "status" => Some(Box::new(StatusSegment)),
-        "cmd_duration" => Some(Box::new(CmdDurationSegment)),
-        "jobs" => Some(Box::new(JobsSegment)),
-        "character" => Some(Box::new(CharacterSegment)),
-        "custom_command" => Some(Box::new(CustomCommandSegment)),
+        "venv" => Some(&VENV),
+        "username" => Some(&USERNAME),
+        "hostname" => Some(&HOSTNAME),
+        "nix_shell" => Some(&NIX_SHELL),
+        "aws" => Some(&AWS),
+        "k8s" => Some(&K8S),
+        "path" => Some(&PATH),
+        "git" => Some(&GIT),
+        "node" => Some(&NODE),
+        "python" => Some(&PYTHON),
+        "rust_toolchain" => Some(&RUST_TOOLCHAIN),
+        "status" => Some(&STATUS),
+        "cmd_duration" => Some(&CMD_DURATION),
+        "jobs" => Some(&JOBS),
+        "character" => Some(&CHARACTER),
+        "custom_command" => Some(&CUSTOM_COMMAND),
         _ => None,
     }
 }
 
 /// Returns the default ordered list of segments matching the original hardcoded chain.
 #[must_use]
-pub fn default_segments() -> Vec<Box<dyn Segment>> {
+pub fn default_segments() -> Vec<&'static dyn Segment> {
     vec![
-        Box::new(VenvSegment),
-        Box::new(UsernameSegment),
-        Box::new(HostnameSegment),
-        Box::new(NixShellSegment),
-        Box::new(AwsSegment),
-        Box::new(PathSegment),
-        Box::new(GitSegment),
-        Box::new(StatusSegment),
-        Box::new(CmdDurationSegment),
-        Box::new(JobsSegment),
-        Box::new(CharacterSegment),
+        &VENV,
+        &USERNAME,
+        &HOSTNAME,
+        &NIX_SHELL,
+        &AWS,
+        &PATH,
+        &GIT,
+        &STATUS,
+        &CMD_DURATION,
+        &JOBS,
+        &CHARACTER,
     ]
 }
 
@@ -218,7 +239,7 @@ pub fn default_segments() -> Vec<Box<dyn Segment>> {
 /// If no custom order is specified, uses the default order.
 /// Segments explicitly disabled via `enabled = false` are excluded.
 #[must_use]
-pub fn build_segments(config: &Config) -> Vec<Box<dyn Segment>> {
+pub fn build_segments(config: &Config) -> Vec<&'static dyn Segment> {
     if config.segments.order.is_empty() {
         return default_segments()
             .into_iter()

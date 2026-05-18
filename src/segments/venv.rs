@@ -39,7 +39,7 @@ mod tests {
         unsafe { std::env::set_var("VIRTUAL_ENV", "/home/user/.venvs/myenv") };
         let out = render_prefix();
         assert!(out.contains("(myenv)"), "expected (myenv) in: {out}");
-        assert!(out.contains(&fg(2)), "expected green fg(2) in: {out}");
+        assert!(out.contains(fg(2)), "expected green fg(2) in: {out}");
         assert!(out.contains(RST), "expected reset in: {out}");
         unsafe { std::env::remove_var("VIRTUAL_ENV") };
     }

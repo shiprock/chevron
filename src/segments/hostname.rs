@@ -66,8 +66,8 @@ mod tests {
         // SAFETY: test-only
         unsafe { std::env::remove_var("SSH_CONNECTION") };
         let (out, end_bg) = render_with(Some(240));
-        assert!(out.contains(&bg(238)), "expected bg(238) in: {out}");
-        assert!(out.contains(&fg(240)), "expected arrow fg(240) in: {out}");
+        assert!(out.contains(bg(238)), "expected bg(238) in: {out}");
+        assert!(out.contains(fg(240)), "expected arrow fg(240) in: {out}");
         assert!(out.contains(ARROW), "expected arrow in: {out}");
         assert_eq!(end_bg, Some(238));
     }
@@ -101,7 +101,7 @@ mod tests {
             !out.contains(ARROW),
             "should not have arrow when first segment"
         );
-        assert!(out.contains(&bg(238)), "expected bg(238) in: {out}");
+        assert!(out.contains(bg(238)), "expected bg(238) in: {out}");
         assert_eq!(end_bg, Some(238));
     }
 }

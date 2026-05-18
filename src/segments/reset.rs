@@ -18,7 +18,7 @@ mod tests {
     fn with_bg() {
         let out = render_final(Some(236));
         assert!(out.starts_with(RST));
-        assert!(out.contains(&fg(236)));
+        assert!(out.contains(fg(236)));
         assert!(out.contains(ARROW));
         assert!(out.ends_with(RST));
     }

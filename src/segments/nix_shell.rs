@@ -66,7 +66,7 @@ mod tests {
         // SAFETY: test-only
         unsafe { std::env::set_var("IN_NIX_SHELL", "impure") };
         let (out, end_bg) = render_with(Some(238));
-        assert!(out.contains(&fg(238)), "expected fg(238) in: {out}");
+        assert!(out.contains(fg(238)), "expected fg(238) in: {out}");
         assert_eq!(end_bg, Some(237));
         unsafe { std::env::remove_var("IN_NIX_SHELL") };
     }

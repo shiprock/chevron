@@ -54,8 +54,8 @@ mod tests {
         unsafe { std::env::set_var("USER", "alice") };
         let (out, end_bg) = render_with(None);
         assert!(out.contains("alice"), "expected username in: {out}");
-        assert!(out.contains(&bg(240)), "expected bg(240) in: {out}");
-        assert!(out.contains(&fg(250)), "expected fg(250) in: {out}");
+        assert!(out.contains(bg(240)), "expected bg(240) in: {out}");
+        assert!(out.contains(fg(250)), "expected fg(250) in: {out}");
         assert_eq!(end_bg, Some(240));
         assert!(
             !out.contains(ARROW),
@@ -71,7 +71,7 @@ mod tests {
         let (out, _) = render_with(Some(238));
         assert!(out.contains(ARROW), "expected arrow in: {out}");
         assert!(
-            out.contains(&fg(238)),
+            out.contains(fg(238)),
             "expected fg(238) for arrow in: {out}"
         );
     }
@@ -83,7 +83,7 @@ mod tests {
         unsafe { std::env::set_var("USER", "root") };
         let (out, end_bg) = render_with(None);
         assert!(out.contains("root"), "expected root in: {out}");
-        assert!(out.contains(&fg(9)), "expected red fg(9) in: {out}");
+        assert!(out.contains(fg(9)), "expected red fg(9) in: {out}");
         assert!(out.contains("\x1b[1m"), "expected bold in: {out}");
         assert!(out.contains("\x1b[22m"), "expected unbold in: {out}");
         assert_eq!(end_bg, Some(240));
