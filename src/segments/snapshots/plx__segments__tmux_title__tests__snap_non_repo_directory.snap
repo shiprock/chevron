@@ -1,0 +1,6 @@
+---
+source: src/segments/tmux_title.rs
+assertion_line: 138
+expression: "render_from_info(\"/home/user\", \"/tmp/scratch\", None)"
+---
+📁 scratch

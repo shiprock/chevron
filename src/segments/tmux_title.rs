@@ -95,6 +95,53 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    // ── Snapshot tests ──────────────────────────────────────────────────
+    // Lock down the tmux title format for representative scenarios. Snapshots
+    // live in src/segments/snapshots/. Regenerate with `cargo insta accept`
+    // after intentional format changes.
+
+    #[test]
+    fn snap_clean_repo() {
+        let info = GitInfo {
+            repo_name: "plx".to_string(),
+            branch: "master".to_string(),
+            dirty: false,
+        };
+        insta::assert_snapshot!(render_from_info(
+            "/home/user",
+            "/home/user/src/plx",
+            Some(&info)
+        ));
+    }
+
+    #[test]
+    fn snap_dirty_repo() {
+        let info = GitInfo {
+            repo_name: "plx".to_string(),
+            branch: "feature/refactor".to_string(),
+            dirty: true,
+        };
+        insta::assert_snapshot!(render_from_info(
+            "/home/user",
+            "/home/user/src/plx",
+            Some(&info)
+        ));
+    }
+
+    #[test]
+    fn snap_home_no_repo() {
+        insta::assert_snapshot!(render_from_info("/home/user", "/home/user", None));
+    }
+
+    #[test]
+    fn snap_non_repo_directory() {
+        insta::assert_snapshot!(render_from_info(
+            "/home/user",
+            "/tmp/scratch",
+            None
+        ));
+    }
+
     #[test]
     fn home_directory() {
         let tmp = TempDir::new().unwrap();

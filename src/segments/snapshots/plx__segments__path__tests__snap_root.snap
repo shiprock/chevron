@@ -1,0 +1,6 @@
+---
+source: src/segments/path.rs
+assertion_line: 240
+expression: "render(\"/home/user\", \"/\", None)"
+---
+[38;5;238m[48;5;31m [38;5;15m/ [38;5;31m[48;5;237m

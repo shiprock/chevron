@@ -1,0 +1,6 @@
+---
+source: src/segments/path.rs
+assertion_line: 230
+expression: "render(\"\", \"/a/b/c/d/e/f/g/h/i\", None)"
+---
+[38;5;238m[48;5;31m [38;5;15m… [38;5;31m[48;5;237m [38;5;250mf [38;5;244m [38;5;250mg [38;5;244m [38;5;250mh [38;5;244m [38;5;254mi

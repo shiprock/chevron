@@ -209,6 +209,46 @@ mod tests {
         assert_eq!(end_bg, Some(237));
     }
 
+    // ── Snapshot tests ──────────────────────────────────────────────────
+    //
+    // Lock down the visible ANSI output for representative inputs. Snapshots
+    // live in src/segments/snapshots/. Regenerate with `cargo insta accept`
+    // after intentional format changes.
+
+    #[test]
+    fn snap_home_dir() {
+        insta::assert_snapshot!(render("/home/user", "/home/user", None));
+    }
+
+    #[test]
+    fn snap_home_subdir() {
+        insta::assert_snapshot!(render("/home/user", "/home/user/src/plx", None));
+    }
+
+    #[test]
+    fn snap_deep_path_truncated() {
+        insta::assert_snapshot!(render("", "/a/b/c/d/e/f/g/h/i", None));
+    }
+
+    #[test]
+    fn snap_non_home() {
+        insta::assert_snapshot!(render("/home/user", "/var/log/system.log", None));
+    }
+
+    #[test]
+    fn snap_root() {
+        insta::assert_snapshot!(render("/home/user", "/", None));
+    }
+
+    #[test]
+    fn snap_max_dir_size_truncates() {
+        insta::assert_snapshot!(render(
+            "",
+            "/home/very-long-directory-name/src",
+            Some(10)
+        ));
+    }
+
     // ── Property tests ──────────────────────────────────────────────────
     use proptest::prelude::*;
 

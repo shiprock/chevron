@@ -1,0 +1,6 @@
+---
+source: src/segments/path.rs
+assertion_line: 235
+expression: "render(\"/home/user\", \"/var/log/system.log\", None)"
+---
+[38;5;238m[48;5;31m [38;5;15mvar [38;5;31m[48;5;237m [38;5;250mlog [38;5;244m [38;5;254msystem.log
