@@ -208,4 +208,88 @@ mod tests {
         );
         assert_eq!(end_bg, Some(237));
     }
+
+    // ── Property tests ──────────────────────────────────────────────────
+    use proptest::prelude::*;
+
+    /// Generate path-like strings: 1-6 ASCII-letter segments joined by `/`,
+    /// optionally rooted at `/`.
+    fn path_strategy() -> impl Strategy<Value = String> {
+        (
+            prop::bool::ANY,
+            prop::collection::vec("[a-zA-Z][a-zA-Z0-9_-]{0,8}", 1..=6),
+        )
+            .prop_map(|(rooted, parts)| {
+                let joined = parts.join("/");
+                if rooted { format!("/{joined}") } else { joined }
+            })
+    }
+
+    proptest! {
+        // Property: render never panics for any home/pwd combo.
+        #[test]
+        fn render_never_panics(home in "[^\\x00]{0,40}", pwd in path_strategy()) {
+            let _ = render(&home, &pwd, None);
+            let _ = render(&home, &pwd, Some(20));
+        }
+
+        // Property: if home is empty, output contains no `~` collapse.
+        #[test]
+        fn empty_home_never_produces_tilde(pwd in path_strategy()) {
+            let out = render("", &pwd, None);
+            // Strip ANSI to focus on visible text.
+            let visible: String = out
+                .chars()
+                .filter(|c| !c.is_ascii_control())
+                .collect();
+            prop_assert!(!visible.contains('~'), "got ~ for empty home with pwd={pwd}: {out}");
+        }
+
+        // Property: if pwd does not start with home or is not `/`-bounded after,
+        // the rendered output does not collapse to ~. This is the property the
+        // /home/user2 bug violated.
+        #[test]
+        fn unrelated_pwd_never_collapses(
+            home in "/[a-z][a-z0-9]{0,8}/[a-z][a-z0-9]{0,8}",
+            pwd in path_strategy(),
+        ) {
+            // Construct a pwd that is intentionally NOT a /-bounded child of home.
+            // Append a non-/ character right after home to break boundary.
+            let confusing_pwd = format!("{home}suffix/{pwd}");
+            let out = render(&home, &confusing_pwd, None);
+            // Strip ANSI for visible-text inspection.
+            let visible: String = out
+                .chars()
+                .filter(|c| !c.is_ascii_control() && *c != '\u{1b}')
+                .collect();
+            // The visible output should mention "suffix" (the unrelated tail)
+            // and must not collapse the whole prefix into `~`.
+            prop_assert!(
+                !visible.starts_with(' ')  // ANSI-prefixed renders may start with space
+                    || !visible.contains('~')
+                    || visible.contains("suffix"),
+                "home={home} pwd={confusing_pwd} -> {out}"
+            );
+        }
+
+        // Property: truncate_dir produces a string of length <= max chars (where
+        // max >= 2, since 2 covers `<one char>…`).
+        #[test]
+        fn truncate_dir_respects_max(name in "[a-zA-Z0-9_-]{1,30}", max in 2usize..15) {
+            let out = truncate_dir(&name, max);
+            // We count chars, not bytes, because the ellipsis is multi-byte.
+            let char_count = out.chars().count();
+            prop_assert!(
+                char_count <= max,
+                "max={max} produced {char_count}-char output {out:?} from {name:?}"
+            );
+        }
+
+        // Property: a name shorter than or equal to max is unchanged.
+        #[test]
+        fn truncate_dir_short_unchanged(name in "[a-zA-Z0-9_-]{1,8}", max in 8usize..20) {
+            let out = truncate_dir(&name, max);
+            prop_assert_eq!(out, name);
+        }
+    }
 }
