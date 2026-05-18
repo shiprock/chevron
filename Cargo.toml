@@ -24,11 +24,16 @@ ureq = { version = "3", optional = true, default-features = false, features = ["
 
 [dev-dependencies]
 assert_cmd = "2"
+criterion = { version = "0.5", default-features = false }
 insta = "1"
 predicates = "3"
 proptest = "1"
 serial_test = "3"
 tempfile = "3"
+
+[[bench]]
+name = "segments"
+harness = false
 
 [lints.rust]
 # Forbid implicit unsafe inside `unsafe fn` bodies — every unsafe op
@@ -43,7 +48,7 @@ undocumented_unsafe_blocks = "warn"
 unnecessary_safety_comment = "warn"
 # Forbid implicit panic sites in production code. The prompt renders on every
 # keystroke; a panic anywhere would drop the user's prompt. All of these are
-# allowed inside #[cfg(test)] blocks via the cfg_attr in src/main.rs so tests
+# allowed inside #[cfg(test)] blocks via the cfg_attr in src/lib.rs so tests
 # can still use unwrap/expect freely.
 unwrap_used = "warn"
 expect_used = "warn"

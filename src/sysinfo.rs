@@ -27,6 +27,7 @@ pub struct SystemInfo {
 }
 
 impl SystemInfo {
+    #[must_use]
     pub fn gather() -> Self {
         Self {
             hostname: get_hostname(),
@@ -50,11 +51,13 @@ impl SystemInfo {
     }
 
     /// Format load as a simple string (for classic layout backwards compat).
+    #[must_use]
     pub fn load_string(&self) -> String {
         format!("{:.2}", self.load_1)
     }
 
     /// Format memory as a simple string (for classic layout backwards compat).
+    #[must_use]
     pub fn memory_string(&self) -> String {
         if self.mem_total > 0 {
             format!("{}GB", self.mem_total / 1_073_741_824)

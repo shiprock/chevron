@@ -13,6 +13,7 @@ use crate::sysinfo::SystemInfo;
 
 use check::Check;
 
+#[must_use]
 pub fn run(args: &[String]) -> i32 {
     let opts = match parse_args(args) {
         Ok(o) => o,

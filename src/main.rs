@@ -1,36 +1,11 @@
-// Test modules contain many `unsafe { std::env::set_var / remove_var }` blocks
-// (mandatory unsafe in Rust 2024 edition). Per-block SAFETY comments would be
-// noise; the mutations are made race-free by `#[serial]` annotations on the
-// env-var-touching tests. Production code is still subject to the lint.
-#![cfg_attr(test, allow(clippy::undocumented_unsafe_blocks))]
-// Tests are allowed to panic on assertions, unwrap fixtures, etc. Production
-// code stays subject to the stricter `unwrap_used`/`expect_used`/`panic` lints.
-#![cfg_attr(
-    test,
-    allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::todo,
-        clippy::unimplemented,
-        clippy::dbg_macro,
-    )
-)]
-
-#[cfg(feature = "banner")]
-mod banner;
-mod color;
-mod config;
-mod health;
-mod repo_status;
-mod segments;
-mod shell;
-mod sysinfo;
-#[cfg(feature = "weather")]
-mod weather;
-
 use std::env;
 use std::path::Path;
+
+#[cfg(feature = "banner")]
+use plx::banner;
+use plx::{color, health, repo_status, segments, shell};
+#[cfg(feature = "weather")]
+use plx::weather;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
