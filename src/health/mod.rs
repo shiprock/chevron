@@ -18,7 +18,7 @@ pub fn run(args: &[String]) -> i32 {
     let opts = match parse_args(args) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("plx health: {e}");
+            eprintln!("chevron health: {e}");
             print_usage();
             return 2;
         }
@@ -36,7 +36,7 @@ pub fn run(args: &[String]) -> i32 {
         let info = SystemInfo::gather();
         let Some(check) = run_named(name, &info, &cfg) else {
             eprintln!(
-                "plx health: unknown check '{name}'. Available: {}",
+                "chevron health: unknown check '{name}'. Available: {}",
                 available_names().join(", ")
             );
             return 2;
@@ -202,7 +202,7 @@ fn supports_color() -> bool {
 }
 
 fn print_usage() {
-    eprintln!("Usage: plx health [OPTIONS]");
+    eprintln!("Usage: chevron health [OPTIONS]");
     eprintln!();
     eprintln!("  --fast              Skip slower checks (uptime, network, macOS extras)");
     eprintln!("  --no-color          Disable ANSI color output");

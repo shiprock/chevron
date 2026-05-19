@@ -33,7 +33,7 @@ pub fn render_from_status(home: &str, pwd: &str, status: Option<&RepoStatus>) ->
     }
 }
 
-/// Standalone entry for the `plx tmux-title` subcommand. Discovers the repo
+/// Standalone entry for the `chevron tmux-title` subcommand. Discovers the repo
 /// itself and computes a full `RepoStatus`. Shares its compute path with the
 /// prompt git segment so the title can't disagree with the prompt's idea of
 /// dirtiness.
@@ -88,8 +88,8 @@ mod tests {
     fn snap_clean_repo() {
         insta::assert_snapshot!(render_from_status(
             "/home/user",
-            "/home/user/src/plx",
-            Some(&clean_status("plx", "master"))
+            "/home/user/src/chevron",
+            Some(&clean_status("chevron", "master"))
         ));
     }
 
@@ -97,11 +97,11 @@ mod tests {
     fn snap_dirty_repo() {
         let s = RepoStatus {
             modified: 1,
-            ..clean_status("plx", "feature/refactor")
+            ..clean_status("chevron", "feature/refactor")
         };
         insta::assert_snapshot!(render_from_status(
             "/home/user",
-            "/home/user/src/plx",
+            "/home/user/src/chevron",
             Some(&s)
         ));
     }

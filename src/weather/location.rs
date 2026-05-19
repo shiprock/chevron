@@ -2,8 +2,8 @@
 //!
 //! Priority (highest first):
 //!
-//! 1. `opts.lat` + `opts.lon` (from `--lat` / `--lon` or `PLX_WEATHER_LAT` /
-//!    `PLX_WEATHER_LON`).
+//! 1. `opts.lat` + `opts.lon` (from `--lat` / `--lon` or `CHEVRON_WEATHER_LAT` /
+//!    `CHEVRON_WEATHER_LON`).
 //! 2. `opts.location_cmd` — run under `sh -c`; stdout must be `"lat|lon"`.
 //! 3. IP geolocation via ifconfig.co JSON (zero-config default).
 //!
@@ -148,9 +148,9 @@ mod tests {
 
     fn clear_env() {
         for k in [
-            "PLX_WEATHER_LAT",
-            "PLX_WEATHER_LON",
-            "PLX_WEATHER_LOCATION_CMD",
+            "CHEVRON_WEATHER_LAT",
+            "CHEVRON_WEATHER_LON",
+            "CHEVRON_WEATHER_LOCATION_CMD",
         ] {
             // SAFETY: test-only
             unsafe { std::env::remove_var(k) };

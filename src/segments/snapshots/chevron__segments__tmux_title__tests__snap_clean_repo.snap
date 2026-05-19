@@ -1,0 +1,6 @@
+---
+source: src/segments/tmux_title.rs
+assertion_line: 89
+expression: "render_from_status(\"/home/user\", \"/home/user/src/chevron\",\nSome(&clean_status(\"chevron\", \"master\")))"
+---
+#[fg=colour117]#[default] chevron master

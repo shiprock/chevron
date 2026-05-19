@@ -74,7 +74,7 @@ jobs:
   # Build under the Nix sandbox. Catches environment-specific issues that
   # plain cargo test on a GitHub runner can miss (different scheduling,
   # missing system deps, sandbox paths). The Nix sandbox is the environment
-  # downstream consumers actually use to build plx via the flake.
+  # downstream consumers actually use to build chevron via the flake.
   nix-build:
     name: Nix Build / ${{ matrix.os }}
     needs: check
@@ -108,13 +108,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: plx-linux-x86_64
+            artifact: chevron-linux-x86_64
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: plx-macos-x86_64
+            artifact: chevron-macos-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: plx-macos-aarch64
+            artifact: chevron-macos-aarch64
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -124,7 +124,7 @@ jobs:
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
       - name: Rename binary
-        run: cp target/${{ matrix.target }}/release/plx ${{ matrix.artifact }}
+        run: cp target/${{ matrix.target }}/release/chevron ${{ matrix.artifact }}
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:

@@ -1,10 +1,10 @@
 [package]
-name = "plx"
-version = "0.4.0"
+name = "chevron"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 description = "Configurable powerline prompt segments and tmux window titles for zsh, bash, and fish"
-repository = "https://github.com/mmichie/plx"
+repository = "https://github.com/shiprock/chevron"
 keywords = ["prompt", "powerline", "tmux", "bash", "shell"]
 categories = ["command-line-utilities"]
 

@@ -1,4 +1,4 @@
-//! `plx weather` subcommand.
+//! `chevron weather` subcommand.
 //!
 //! # Design contract
 //!
@@ -16,12 +16,12 @@
 //!
 //! # Precedence
 //!
-//! `CLI flag` > `PLX_WEATHER_*` env var > `[weather]` TOML > built-in default.
+//! `CLI flag` > `CHEVRON_WEATHER_*` env var > `[weather]` TOML > built-in default.
 //!
 //! # No CLIMA_* env vars
 //!
 //! We deliberately do NOT read `CLIMA_*` — that is one user's private vendored
-//! naming. Use the `PLX_WEATHER_*` namespace exclusively.
+//! naming. Use the `CHEVRON_WEATHER_*` namespace exclusively.
 
 mod args;
 mod cache;
@@ -37,14 +37,14 @@ use crate::config::{Config, WeatherConfig};
 
 pub use args::Options;
 
-/// Entry point for `plx weather <flags>`.
+/// Entry point for `chevron weather <flags>`.
 ///
 /// Error-silent: always exits 0 and always prints to stdout exactly one of:
 ///
 /// * a rendered line (e.g. `"Seattle, US \u{f00d} 54\u{b0}F"`)
 /// * an empty string
 ///
-/// Errors are reported only on stderr (and only when `PLX_WEATHER_DEBUG=1`).
+/// Errors are reported only on stderr (and only when `CHEVRON_WEATHER_DEBUG=1`).
 pub fn run(argv: &[String]) {
     // `--help` / `-h` bypasses everything and prints a manual help string.
     if argv.iter().any(|a| a == "--help" || a == "-h") {
@@ -188,8 +188,8 @@ fn now_secs() -> u64 {
 }
 
 fn debug(msg: &str) {
-    if std::env::var("PLX_WEATHER_DEBUG").ok().as_deref() == Some("1") {
-        eprintln!("plx weather: {msg}");
+    if std::env::var("CHEVRON_WEATHER_DEBUG").ok().as_deref() == Some("1") {
+        eprintln!("chevron weather: {msg}");
     }
 }
 

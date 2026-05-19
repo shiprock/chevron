@@ -58,7 +58,7 @@ pub fn resolve(name: &str, api_key: Option<&str>) -> Result<Box<dyn Provider>, S
         "openmeteo" | "" => Ok(Box::new(OpenMeteo)),
         "openweather" => {
             let key = api_key.filter(|k| !k.is_empty()).ok_or_else(|| {
-                String::from("openweather requires --api-key or PLX_WEATHER_API_KEY")
+                String::from("openweather requires --api-key or CHEVRON_WEATHER_API_KEY")
             })?;
             Ok(Box::new(OpenWeather::new(key.to_string())))
         }

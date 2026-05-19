@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end timing of plx subcommands with hyperfine.
+# End-to-end timing of chevron subcommands with hyperfine.
 #
 # Measures the full cost a shell pays per prompt redraw: dynamic linker, crate
 # init, libgit2 setup, the actual work, and writing to stdout. Complements the
@@ -19,7 +19,7 @@ fi
 echo "Building release binary..."
 cargo build --release --quiet
 
-BIN="./target/release/plx"
+BIN="./target/release/chevron"
 EXPORT_ARGS=("$@")
 
 run() {

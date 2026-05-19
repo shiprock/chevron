@@ -32,8 +32,8 @@ impl OpState {
 /// counts. Produced in a single libgit2 pass by [`RepoStatus::compute`].
 ///
 /// The renderer [`render_segment`] is pure over this struct — no I/O at
-/// render time. This is the data type the plxd daemon caches and serves
-/// in later phases; the inline-fallback path and daemon path both
+/// render time. This is the data type the chevrond daemon caches and
+/// serves in later phases; the inline-fallback path and daemon path both
 /// produce `RepoStatus` from identical code, so they cannot drift.
 #[derive(Debug, Clone)]
 pub struct RepoStatus {
@@ -354,10 +354,10 @@ pub fn render_segment(
     (out, Some(236))
 }
 
-/// Top-level entry for the `plx git` subcommand: discovers a repo from
+/// Top-level entry for the `chevron git` subcommand: discovers a repo from
 /// `discover_from`, computes status if found, renders the segment, and
 /// appends the terminal reset. This is also the inline fallback path that
-/// `plx prompt` uses when the daemon (phase 1+) is unavailable.
+/// `chevron prompt` uses when the daemon (phase 1+) is unavailable.
 #[must_use]
 pub fn render(discover_from: &std::path::Path) -> String {
     let mut repo = Repository::discover(discover_from).ok();
@@ -378,7 +378,7 @@ mod tests {
 
     fn clean_status() -> RepoStatus {
         RepoStatus {
-            repo_name: "plx".to_string(),
+            repo_name: "chevron".to_string(),
             branch: "master".to_string(),
             detached: false,
             state: None,

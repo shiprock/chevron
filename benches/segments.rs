@@ -16,8 +16,8 @@ use git2::Repository;
 use std::fs;
 use tempfile::TempDir;
 
-use plx::config::Config;
-use plx::segments::{git, path, prompt, tmux_title};
+use chevron::config::Config;
+use chevron::segments::{git, path, prompt, tmux_title};
 
 /// Minimal git repo with a single empty commit, mirroring `segments::testutil::init_repo`
 /// (which lives behind `#[cfg(test)]` and isn't reachable from a separate bench crate).
@@ -46,7 +46,7 @@ fn bench_path(c: &mut Criterion) {
         b.iter(|| {
             path::render(
                 black_box("/home/user"),
-                black_box("/home/user/src/plx"),
+                black_box("/home/user/src/chevron"),
                 None,
             )
         });
@@ -114,7 +114,7 @@ fn bench_git(c: &mut Criterion) {
         b.iter(|| git::RepoStatus::compute(black_box(&mut dirty_repo)));
     });
 
-    // Real-world: bench against the plx working tree itself if we happen to be
+    // Real-world: bench against the chevron working tree itself if we happen to be
     // in a checkout of it. Gives a representative number for a moderately-sized
     // repo with realistic .gitignore patterns, sub-trees, etc.
     if let Ok(mut repo) = Repository::discover(".") {
@@ -131,7 +131,7 @@ fn bench_tmux_title(c: &mut Criterion) {
 
     // Pure render — no repo discovery, no libgit2 calls.
     let status = git::RepoStatus {
-        repo_name: "plx".to_string(),
+        repo_name: "chevron".to_string(),
         branch: "master".to_string(),
         detached: false,
         state: None,
@@ -147,7 +147,7 @@ fn bench_tmux_title(c: &mut Criterion) {
         b.iter(|| {
             tmux_title::render_from_status(
                 black_box("/home/user"),
-                black_box("/home/user/src/plx"),
+                black_box("/home/user/src/chevron"),
                 Some(black_box(&status)),
             )
         });

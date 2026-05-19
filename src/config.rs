@@ -146,7 +146,7 @@ impl Config {
         match toml::from_str(&contents) {
             Ok(config) => config,
             Err(e) => {
-                eprintln!("plx: invalid config at {}: {e}", path.display());
+                eprintln!("chevron: invalid config at {}: {e}", path.display());
                 Self::default()
             }
         }
@@ -164,7 +164,7 @@ impl Config {
 }
 
 fn config_path() -> PathBuf {
-    if let Ok(path) = std::env::var("PLX_CONFIG") {
+    if let Ok(path) = std::env::var("CHEVRON_CONFIG") {
         return PathBuf::from(path);
     }
     let base = std::env::var("XDG_CONFIG_HOME").map_or_else(
@@ -174,7 +174,7 @@ fn config_path() -> PathBuf {
         },
         PathBuf::from,
     );
-    base.join("plx").join("config.toml")
+    base.join("chevron").join("config.toml")
 }
 
 #[cfg(test)]
@@ -291,11 +291,11 @@ host = "8.8.8.8"
     #[test]
     #[serial]
     fn load_missing_file_returns_default() {
-        // Serial: Config::load() reads PLX_CONFIG, racing with any test that
-        // sets it. Same pattern as the NODE_VERSION incident.
-        unsafe { std::env::set_var("PLX_CONFIG", "/tmp/plx-nonexistent-test.toml") };
+        // Serial: Config::load() reads CHEVRON_CONFIG, racing with any test
+        // that sets it. Same pattern as the NODE_VERSION incident.
+        unsafe { std::env::set_var("CHEVRON_CONFIG", "/tmp/chevron-nonexistent-test.toml") };
         let cfg = Config::load();
         assert!(cfg.segments.order.is_empty());
-        unsafe { std::env::remove_var("PLX_CONFIG") };
+        unsafe { std::env::remove_var("CHEVRON_CONFIG") };
     }
 }

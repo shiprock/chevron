@@ -1,6 +1,0 @@
----
-source: src/segments/tmux_title.rs
-assertion_line: 110
-expression: "render_from_info(\"/home/user\", \"/home/user/src/plx\", Some(&info))"
----
-#[fg=colour117]#[default] plx master

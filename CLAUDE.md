@@ -15,7 +15,7 @@ nix run . -- git              # Nix run directly
 
 ## Architecture
 
-plx is a single-binary CLI that renders powerline-styled terminal segments for shell prompts (Starship) and tmux window titles. All code lives in `src/main.rs` (~370 lines).
+chevron is a single-binary CLI that renders powerline-styled terminal segments for shell prompts (Starship) and tmux window titles. All code lives in `src/main.rs` (~370 lines).
 
 **Three subcommands** (selected by first CLI arg):
 - `path` — ANSI-colored powerline path with home collapsing and truncation

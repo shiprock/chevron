@@ -3,18 +3,18 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 /// Cache directory for health check results.
-/// Honors `PLX_HEALTH_CACHE` (for tests), then `XDG_CACHE_HOME`, then `$HOME/.cache`.
+/// Honors `CHEVRON_HEALTH_CACHE` (for tests), then `XDG_CACHE_HOME`, then `$HOME/.cache`.
 fn cache_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("PLX_HEALTH_CACHE") {
+    if let Ok(p) = std::env::var("CHEVRON_HEALTH_CACHE") {
         return PathBuf::from(p);
     }
     if let Ok(p) = std::env::var("XDG_CACHE_HOME") {
-        return PathBuf::from(p).join("plx").join("health");
+        return PathBuf::from(p).join("chevron").join("health");
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home)
         .join(".cache")
-        .join("plx")
+        .join("chevron")
         .join("health")
 }
 
@@ -49,9 +49,9 @@ mod tests {
     fn with_cache<F: FnOnce()>(f: F) {
         let tmp = TempDir::new().unwrap();
         // SAFETY: tests are serialized; env var is the cache root override.
-        unsafe { std::env::set_var("PLX_HEALTH_CACHE", tmp.path()) };
+        unsafe { std::env::set_var("CHEVRON_HEALTH_CACHE", tmp.path()) };
         f();
-        unsafe { std::env::remove_var("PLX_HEALTH_CACHE") };
+        unsafe { std::env::remove_var("CHEVRON_HEALTH_CACHE") };
     }
 
     #[test]

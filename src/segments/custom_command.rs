@@ -72,7 +72,7 @@ fn cache_path(command: &str) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     command.hash(&mut hasher);
     let hash = hasher.finish();
-    std::env::temp_dir().join(format!("plx-cmd-{hash:016x}.cache"))
+    std::env::temp_dir().join(format!("chevron-cmd-{hash:016x}.cache"))
 }
 
 fn get_cached_output(command: &str, cache_secs: u64, timeout_ms: u64) -> Option<String> {

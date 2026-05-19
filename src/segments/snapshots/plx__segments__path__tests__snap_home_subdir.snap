@@ -1,6 +1,0 @@
----
-source: src/segments/path.rs
-assertion_line: 225
-expression: "render(\"/home/user\", \"/home/user/src/plx\", None)"
----
-[38;5;238m[48;5;31m [38;5;15m~ [38;5;31m[48;5;237m [38;5;250msrc [38;5;244m [38;5;254mplx

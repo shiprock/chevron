@@ -1,6 +1,6 @@
-//! CLI and environment parsing for `plx weather`.
+//! CLI and environment parsing for `chevron weather`.
 //!
-//! We don't pull in clap — the flag surface is small and the rest of plx
+//! We don't pull in clap — the flag surface is small and the rest of chevron
 //! parses `env::args()` by hand. This module also layers env vars on top of
 //! CLI defaults so callers can see the CLI > env > TOML > built-in precedence
 //! in one place.
@@ -73,7 +73,7 @@ impl Options {
     }
 }
 
-/// Parse argv (the slice after `plx weather`), layering env vars on top of
+/// Parse argv (the slice after `chevron weather`), layering env vars on top of
 /// built-in defaults before flags override.
 ///
 /// Returns `Err` only when a flag is malformed (e.g. `--lat abc`). The caller
@@ -120,7 +120,7 @@ pub fn parse(argv: &[String]) -> Result<Options, String> {
             }
             "--show-city" => {
                 // Accept the positive form too — the default is true, but this
-                // makes the spec's `#(plx weather --show-city)` explicit.
+                // makes the spec's `#(chevron weather --show-city)` explicit.
                 opts.show_city = true;
                 opts.show_city_was_defaulted = false;
             }
@@ -148,40 +148,40 @@ pub fn parse(argv: &[String]) -> Result<Options, String> {
 }
 
 fn apply_env(opts: &mut Options) -> Result<(), String> {
-    if let Ok(v) = std::env::var("PLX_WEATHER_LAT")
+    if let Ok(v) = std::env::var("CHEVRON_WEATHER_LAT")
         && !v.is_empty()
     {
-        opts.lat = Some(parse_f64(&v, "PLX_WEATHER_LAT")?);
+        opts.lat = Some(parse_f64(&v, "CHEVRON_WEATHER_LAT")?);
     }
-    if let Ok(v) = std::env::var("PLX_WEATHER_LON")
+    if let Ok(v) = std::env::var("CHEVRON_WEATHER_LON")
         && !v.is_empty()
     {
-        opts.lon = Some(parse_f64(&v, "PLX_WEATHER_LON")?);
+        opts.lon = Some(parse_f64(&v, "CHEVRON_WEATHER_LON")?);
     }
-    if let Ok(v) = std::env::var("PLX_WEATHER_API_KEY")
+    if let Ok(v) = std::env::var("CHEVRON_WEATHER_API_KEY")
         && !v.is_empty()
     {
         opts.api_key = Some(v);
     }
-    if let Ok(v) = std::env::var("PLX_WEATHER_PROVIDER")
+    if let Ok(v) = std::env::var("CHEVRON_WEATHER_PROVIDER")
         && !v.is_empty()
     {
         opts.provider = v;
         opts.provider_was_defaulted = false;
     }
-    if let Ok(v) = std::env::var("PLX_WEATHER_UNITS")
+    if let Ok(v) = std::env::var("CHEVRON_WEATHER_UNITS")
         && !v.is_empty()
     {
         opts.units = normalize_units(&v);
         opts.units_was_defaulted = false;
     }
-    if let Ok(v) = std::env::var("PLX_WEATHER_CACHE_TTL")
+    if let Ok(v) = std::env::var("CHEVRON_WEATHER_CACHE_TTL")
         && !v.is_empty()
     {
-        opts.cache_ttl_min = parse_u64(&v, "PLX_WEATHER_CACHE_TTL")?;
+        opts.cache_ttl_min = parse_u64(&v, "CHEVRON_WEATHER_CACHE_TTL")?;
         opts.cache_ttl_was_defaulted = false;
     }
-    if let Ok(v) = std::env::var("PLX_WEATHER_LOCATION_CMD")
+    if let Ok(v) = std::env::var("CHEVRON_WEATHER_LOCATION_CMD")
         && !v.is_empty()
     {
         opts.location_cmd = Some(v);
@@ -222,10 +222,10 @@ fn normalize_units(s: &str) -> String {
 
 pub const fn help_text() -> &'static str {
     "\
-plx weather — fetch current conditions and print a one-line summary
+chevron weather — fetch current conditions and print a one-line summary
 
 USAGE:
-    plx weather [FLAGS]
+    chevron weather [FLAGS]
 
 LOCATION (optional; IP geolocation via ifconfig.co is used when none given):
         --lat FLOAT            Latitude
@@ -247,9 +247,9 @@ MISC:
     -h, --help                 Show this help
 
 ENVIRONMENT:
-    PLX_WEATHER_LAT, PLX_WEATHER_LON, PLX_WEATHER_API_KEY,
-    PLX_WEATHER_PROVIDER, PLX_WEATHER_UNITS, PLX_WEATHER_CACHE_TTL,
-    PLX_WEATHER_LOCATION_CMD, PLX_WEATHER_DEBUG=1 (log errors to stderr)
+    CHEVRON_WEATHER_LAT, CHEVRON_WEATHER_LON, CHEVRON_WEATHER_API_KEY,
+    CHEVRON_WEATHER_PROVIDER, CHEVRON_WEATHER_UNITS, CHEVRON_WEATHER_CACHE_TTL,
+    CHEVRON_WEATHER_LOCATION_CMD, CHEVRON_WEATHER_DEBUG=1 (log errors to stderr)
 
 NOTES:
     Designed for tmux status-right. Always exits 0 and prints an empty
@@ -265,13 +265,13 @@ mod tests {
 
     fn clear_env() {
         for k in [
-            "PLX_WEATHER_LAT",
-            "PLX_WEATHER_LON",
-            "PLX_WEATHER_API_KEY",
-            "PLX_WEATHER_PROVIDER",
-            "PLX_WEATHER_UNITS",
-            "PLX_WEATHER_CACHE_TTL",
-            "PLX_WEATHER_LOCATION_CMD",
+            "CHEVRON_WEATHER_LAT",
+            "CHEVRON_WEATHER_LON",
+            "CHEVRON_WEATHER_API_KEY",
+            "CHEVRON_WEATHER_PROVIDER",
+            "CHEVRON_WEATHER_UNITS",
+            "CHEVRON_WEATHER_CACHE_TTL",
+            "CHEVRON_WEATHER_LOCATION_CMD",
         ] {
             // SAFETY: test-only env mutation, guarded by serial_test in callers
             unsafe { std::env::remove_var(k) };
@@ -327,9 +327,9 @@ mod tests {
         clear_env();
         // SAFETY: test-only
         unsafe {
-            std::env::set_var("PLX_WEATHER_LAT", "40.0");
-            std::env::set_var("PLX_WEATHER_LON", "-74.0");
-            std::env::set_var("PLX_WEATHER_UNITS", "imperial");
+            std::env::set_var("CHEVRON_WEATHER_LAT", "40.0");
+            std::env::set_var("CHEVRON_WEATHER_LON", "-74.0");
+            std::env::set_var("CHEVRON_WEATHER_UNITS", "imperial");
         }
         let opts = parse(&[]).unwrap();
         assert_eq!(opts.lat, Some(40.0));
@@ -343,7 +343,7 @@ mod tests {
     fn cli_overrides_env() {
         clear_env();
         // SAFETY: test-only
-        unsafe { std::env::set_var("PLX_WEATHER_UNITS", "metric") };
+        unsafe { std::env::set_var("CHEVRON_WEATHER_UNITS", "metric") };
         let argv: Vec<String> = ["--units", "imperial"]
             .iter()
             .copied()

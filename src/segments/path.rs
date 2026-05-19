@@ -146,9 +146,9 @@ mod tests {
 
     #[test]
     fn home_subdir_shows_tilde() {
-        let out = render("/home/user", "/home/user/projects/plx", None);
+        let out = render("/home/user", "/home/user/projects/chevron", None);
         assert!(out.contains('~'), "expected ~ for home subdir");
-        assert!(out.contains("plx"));
+        assert!(out.contains("chevron"));
     }
 
     #[test]
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn snap_home_subdir() {
-        insta::assert_snapshot!(render("/home/user", "/home/user/src/plx", None));
+        insta::assert_snapshot!(render("/home/user", "/home/user/src/chevron", None));
     }
 
     #[test]

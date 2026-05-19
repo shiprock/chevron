@@ -15,7 +15,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn cmd() -> Command {
-    Command::cargo_bin("plx").unwrap()
+    Command::cargo_bin("chevron").unwrap()
 }
 
 /// Init a bare-minimum git repo with one empty commit so git operations work.
@@ -289,7 +289,7 @@ fn init_zsh_outputs_hook_registration() {
         .assert()
         .success()
         .stdout(predicate::str::contains("add-zsh-hook"))
-        .stdout(predicate::str::contains("plx prompt"));
+        .stdout(predicate::str::contains("chevron prompt"));
 }
 
 #[test]
@@ -304,7 +304,7 @@ fn init_bash_outputs_prompt_command() {
         .assert()
         .success()
         .stdout(predicate::str::contains("PROMPT_COMMAND"))
-        .stdout(predicate::str::contains("plx prompt"));
+        .stdout(predicate::str::contains("chevron prompt"));
 }
 
 #[test]
@@ -314,7 +314,7 @@ fn init_fish_outputs_fish_prompt() {
         .assert()
         .success()
         .stdout(predicate::str::contains("fish_prompt"))
-        .stdout(predicate::str::contains("plx prompt"));
+        .stdout(predicate::str::contains("chevron prompt"));
 }
 
 #[test]
@@ -428,7 +428,7 @@ fn health_config_tight_memory_threshold_triggers_critical() {
     // Memory is normally well under 95%; with a 1%/2% threshold any real
     // machine will land at critical.
     let tmp = TempDir::new().unwrap();
-    let cfg_path = tmp.path().join("plx.toml");
+    let cfg_path = tmp.path().join("chevron.toml");
     std::fs::write(
         &cfg_path,
         "[health.thresholds]\nmemory_warn = 1\nmemory_critical = 2\n",
@@ -436,7 +436,7 @@ fn health_config_tight_memory_threshold_triggers_critical() {
     .unwrap();
     cmd()
         .args(["health", "--check", "memory", "--json"])
-        .env("PLX_CONFIG", &cfg_path)
+        .env("CHEVRON_CONFIG", &cfg_path)
         .assert()
         .stdout(predicate::str::contains("\"severity\":\"critical\""));
 }
@@ -444,11 +444,11 @@ fn health_config_tight_memory_threshold_triggers_critical() {
 #[test]
 fn health_config_disabled_check_omitted_from_report() {
     let tmp = TempDir::new().unwrap();
-    let cfg_path = tmp.path().join("plx.toml");
+    let cfg_path = tmp.path().join("chevron.toml");
     std::fs::write(&cfg_path, "[health]\ndisabled = [\"memory\"]\n").unwrap();
     cmd()
         .args(["health", "--fast", "--json"])
-        .env("PLX_CONFIG", &cfg_path)
+        .env("CHEVRON_CONFIG", &cfg_path)
         .assert()
         .stdout(predicate::str::contains("\"name\":\"memory\"").not())
         .stdout(predicate::str::contains("\"name\":\"load\""));
@@ -457,11 +457,11 @@ fn health_config_disabled_check_omitted_from_report() {
 #[test]
 fn health_config_disabled_check_still_runs_in_single_check_mode() {
     let tmp = TempDir::new().unwrap();
-    let cfg_path = tmp.path().join("plx.toml");
+    let cfg_path = tmp.path().join("chevron.toml");
     std::fs::write(&cfg_path, "[health]\ndisabled = [\"memory\"]\n").unwrap();
     cmd()
         .args(["health", "--check", "memory", "--json"])
-        .env("PLX_CONFIG", &cfg_path)
+        .env("CHEVRON_CONFIG", &cfg_path)
         .assert()
         .stdout(predicate::str::contains("\"name\":\"memory\""));
 }
@@ -483,7 +483,7 @@ fn weather_help_lists_all_flags() {
         .stdout(predicate::str::contains("--no-show-city"))
         .stdout(predicate::str::contains("--no-show-icon"))
         .stdout(predicate::str::contains("--use-nerd-font"))
-        .stdout(predicate::str::contains("PLX_WEATHER_"));
+        .stdout(predicate::str::contains("CHEVRON_WEATHER_"));
 }
 
 #[cfg(feature = "weather")]
@@ -495,7 +495,7 @@ fn weather_bad_flag_is_error_silent() {
     cmd()
         .args(["weather", "--bogus-flag"])
         .env("XDG_CACHE_HOME", tmp.path())
-        .env("PLX_WEATHER_LOCATION_CMD", "false") // avoid IP geolocation
+        .env("CHEVRON_WEATHER_LOCATION_CMD", "false") // avoid IP geolocation
         .assert()
         .success();
 }
@@ -507,7 +507,7 @@ fn weather_bad_lat_is_error_silent() {
     cmd()
         .args(["weather", "--lat", "not-a-number"])
         .env("XDG_CACHE_HOME", tmp.path())
-        .env("PLX_WEATHER_LOCATION_CMD", "false") // avoid IP geolocation
+        .env("CHEVRON_WEATHER_LOCATION_CMD", "false") // avoid IP geolocation
         .assert()
         .success();
 }

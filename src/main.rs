@@ -2,10 +2,10 @@ use std::env;
 use std::path::Path;
 
 #[cfg(feature = "banner")]
-use plx::banner;
-use plx::{color, health, repo_status, segments, shell};
+use chevron::banner;
+use chevron::{color, health, repo_status, segments, shell};
 #[cfg(feature = "weather")]
-use plx::weather;
+use chevron::weather;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -34,7 +34,7 @@ fn main() {
                 job_count,
             );
             let raw = segments::prompt::render(&mut ctx);
-            let shell = env::var("PLX_SHELL").unwrap_or_default();
+            let shell = env::var("CHEVRON_SHELL").unwrap_or_default();
             // Only the prompt line gets escape wrapping; tmux title is plain.
             if let Some((prompt, title)) = raw.split_once('\n') {
                 print!("{}\n{}", color::wrap_for_shell(&shell, prompt), title);
@@ -54,14 +54,14 @@ fn main() {
             Some("bash") => print!("{}", shell::init_bash()),
             Some("fish") => print!("{}", shell::init_fish()),
             _ => {
-                eprintln!("Usage: plx init <zsh|bash|fish>");
+                eprintln!("Usage: chevron init <zsh|bash|fish>");
                 std::process::exit(1);
             }
         },
         Some("status") => repo_status::run(),
         Some("health") => std::process::exit(health::run(&args[2..])),
         Some("version" | "--version" | "-V") => {
-            println!("plx {}", env!("CARGO_PKG_VERSION"));
+            println!("chevron {}", env!("CARGO_PKG_VERSION"));
         }
         #[cfg(feature = "banner")]
         Some("banner") => {
@@ -90,7 +90,7 @@ fn main() {
                 #[cfg(feature = "weather")]
                 "weather",
             ];
-            eprintln!("Usage: plx <{}>", features.join("|"));
+            eprintln!("Usage: chevron <{}>", features.join("|"));
             std::process::exit(1);
         }
     }

@@ -1,0 +1,6 @@
+---
+source: src/segments/tmux_title.rs
+assertion_line: 102
+expression: "render_from_status(\"/home/user\", \"/home/user/src/chevron\", Some(&s))"
+---
+#[fg=colour174]#[default] chevron feature/refactor #[fg=colour245]#[default]

@@ -49,6 +49,7 @@
           craneLib = craneLibFor system;
         in
         craneLib.buildPackage {
+          pname = "chevron";
           src =
             let
               binFilter = path: _type: builtins.match ".*\\.bin$" path != null;
@@ -82,7 +83,7 @@
     {
       packages = forAllSystems (system: {
         default = buildFor system;
-        plx = buildFor system;
+        chevron = buildFor system;
       });
 
       devShells = forAllSystems (
@@ -92,7 +93,7 @@
           rust = rustToolchainFor system;
         in
         {
-          # Pinned rust + the deps needed to build plx interactively.
+          # Pinned rust + the deps needed to build chevron interactively.
           # Apple SDK is intentionally NOT pulled in here: rust-overlay's
           # rustc binds its own SDK via DEVELOPER_DIR and adding apple-sdk
           # collides with that. The crane build (above) still uses

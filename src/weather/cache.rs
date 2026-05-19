@@ -1,7 +1,7 @@
 //! Weather render cache.
 //!
-//! The cache file is JSON at `$XDG_CACHE_HOME/plx/weather.json`, falling back
-//! to `~/.cache/plx/weather.json`. We store one entry per cache key — a tuple
+//! The cache file is JSON at `$XDG_CACHE_HOME/chevron/weather.json`, falling back
+//! to `~/.cache/chevron/weather.json`. We store one entry per cache key — a tuple
 //! of (provider, rounded lat, rounded lon, units) — so callers who switch
 //! between e.g. metric and imperial during a debug session don't thrash.
 //!
@@ -73,24 +73,24 @@ impl Entry {
     }
 }
 
-/// Canonical cache path. Returns `$XDG_CACHE_HOME/plx/weather.json`, or
-/// `$HOME/.cache/plx/weather.json`, or `./.plx-weather.json` as a last resort.
+/// Canonical cache path. Returns `$XDG_CACHE_HOME/chevron/weather.json`, or
+/// `$HOME/.cache/chevron/weather.json`, or `./.chevron-weather.json` as a last resort.
 #[must_use]
 pub fn default_path() -> PathBuf {
     if let Ok(x) = std::env::var("XDG_CACHE_HOME")
         && !x.is_empty()
     {
-        return PathBuf::from(x).join("plx").join("weather.json");
+        return PathBuf::from(x).join("chevron").join("weather.json");
     }
     if let Ok(h) = std::env::var("HOME")
         && !h.is_empty()
     {
         return PathBuf::from(h)
             .join(".cache")
-            .join("plx")
+            .join("chevron")
             .join("weather.json");
     }
-    PathBuf::from(".plx-weather.json")
+    PathBuf::from(".chevron-weather.json")
 }
 
 /// Read the cache file. Returns `None` if the file doesn't exist or can't be
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn roundtrip_write_read() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("plx").join("weather.json");
+        let path = tmp.path().join("chevron").join("weather.json");
 
         let mut entry = Entry::default();
         entry.insert(
@@ -205,12 +205,12 @@ mod tests {
         // racing across modules could yield false negatives in either.
         // SAFETY: test-only
         unsafe {
-            std::env::set_var("XDG_CACHE_HOME", "/tmp/xdg-cache-test-plx");
+            std::env::set_var("XDG_CACHE_HOME", "/tmp/xdg-cache-test-chevron");
         }
         let p = default_path();
         assert!(
             p.to_string_lossy()
-                .contains("xdg-cache-test-plx/plx/weather.json")
+                .contains("xdg-cache-test-chevron/chevron/weather.json")
         );
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };
     }
