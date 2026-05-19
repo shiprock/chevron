@@ -115,7 +115,10 @@ mod tests {
             out.contains("CHEVRON_SHELL=bash"),
             "expected CHEVRON_SHELL=bash"
         );
-        assert!(out.contains("chevron prompt"), "expected chevron prompt call");
+        assert!(
+            out.contains("chevron prompt"),
+            "expected chevron prompt call"
+        );
         assert!(out.contains("EPOCHREALTIME"), "expected EPOCHREALTIME");
         assert!(out.contains("rename-window"), "should rename tmux window");
     }
@@ -144,7 +147,10 @@ mod tests {
             out.contains("CMD_DURATION"),
             "expected CMD_DURATION for timing"
         );
-        assert!(out.contains("chevron prompt"), "expected chevron prompt call");
+        assert!(
+            out.contains("chevron prompt"),
+            "expected chevron prompt call"
+        );
         assert!(out.contains("rename-window"), "should rename tmux window");
     }
 }

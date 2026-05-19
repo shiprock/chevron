@@ -3,9 +3,9 @@ use std::path::Path;
 
 #[cfg(feature = "banner")]
 use chevron::banner;
-use chevron::{color, health, repo_status, segments, shell};
 #[cfg(feature = "weather")]
 use chevron::weather;
+use chevron::{color, health, repo_status, segments, shell};
 
 fn main() {
     let args: Vec<String> = env::args().collect();

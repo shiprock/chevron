@@ -83,12 +83,7 @@ impl RepoStatus {
     /// indicator chip.
     #[must_use]
     pub fn is_dirty(&self) -> bool {
-        self.staged
-            + self.modified
-            + self.untracked
-            + self.conflicted
-            + self.ahead
-            + self.behind
+        self.staged + self.modified + self.untracked + self.conflicted + self.ahead + self.behind
             > 0
             || self.state.is_some()
     }
@@ -250,10 +245,7 @@ fn has_filter_attr(repo: &Repository, path: Option<&str>) -> bool {
 /// the closing arrow appropriate for "not a repo" so the previous segment
 /// terminates cleanly.
 #[must_use]
-pub fn render_segment(
-    status: Option<&RepoStatus>,
-    from_bg: Option<u8>,
-) -> (String, Option<u8>) {
+pub fn render_segment(status: Option<&RepoStatus>, from_bg: Option<u8>) -> (String, Option<u8>) {
     let Some(s) = status else {
         return (arrow(from_bg, 236), Some(236));
     };
@@ -592,7 +584,12 @@ mod tests {
 
         let s = RepoStatus::compute(&mut repo);
         assert!(s.detached, "detached flag should be set");
-        assert_eq!(s.branch.len(), 7, "branch should be 7-char SHA: {}", s.branch);
+        assert_eq!(
+            s.branch.len(),
+            7,
+            "branch should be 7-char SHA: {}",
+            s.branch
+        );
         assert!(s.branch.chars().all(|c| c.is_ascii_hexdigit()));
     }
 

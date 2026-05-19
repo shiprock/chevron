@@ -52,22 +52,10 @@ fn bench_path(c: &mut Criterion) {
         });
     });
     group.bench_function("non_home_deep", |b| {
-        b.iter(|| {
-            path::render(
-                black_box(""),
-                black_box("/var/log/nginx/error.log"),
-                None,
-            )
-        });
+        b.iter(|| path::render(black_box(""), black_box("/var/log/nginx/error.log"), None));
     });
     group.bench_function("very_deep_truncated", |b| {
-        b.iter(|| {
-            path::render(
-                black_box(""),
-                black_box("/a/b/c/d/e/f/g/h/i/j/k"),
-                None,
-            )
-        });
+        b.iter(|| path::render(black_box(""), black_box("/a/b/c/d/e/f/g/h/i/j/k"), None));
     });
     group.bench_function("with_max_dir_size", |b| {
         b.iter(|| {
