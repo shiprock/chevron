@@ -10,6 +10,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Opt into Node 24 for any action still pinned to Node 20 (e.g.
+  # rustsec/audit-check@v2.0.0). GitHub flips this default in June 2026
+  # and removes Node 20 in Sept 2026 — set explicitly so the warning
+  # stops cluttering the run log in the meantime.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # Scan Cargo.lock against the RustSec advisory database. Fails on any
@@ -85,8 +90,11 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # Vendor-neutral installer; deliberately not DeterminateSystems' since
+      # the FlakeHub auth handshake fails noisily and the build doesn't
+      # benefit from their magic-nix-cache for a single-binary repo like
+      # this. Pulls happen from cache.nixos.org as usual.
+      - uses: cachix/install-nix-action@v31
       # `nix flake check` evaluates all flake outputs (incl. cross-system) and
       # runs the formatter check before we commit to a full build. Catches
       # eval errors and `.nix` formatting drift independent of the build.
