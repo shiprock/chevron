@@ -1,6 +1,6 @@
 [package]
 name = "chevron"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 license = "MIT"
 description = "Configurable powerline prompt segments and tmux window titles for zsh, bash, and fish"
@@ -9,12 +9,16 @@ keywords = ["prompt", "powerline", "tmux", "bash", "shell"]
 categories = ["command-line-utilities"]
 
 [features]
-default = ["banner", "weather"]
+default = ["banner", "weather", "vendored-libgit2"]
 banner = ["dep:image"]
 weather = ["dep:ureq", "dep:serde_json"]
+# Opt-out: distro packagers (nixpkgs, etc.) build with
+# `--no-default-features --features banner,weather` to link the system
+# libgit2 instead of the vendored copy.
+vendored-libgit2 = ["git2/vendored-libgit2"]
 
 [dependencies]
-git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
+git2 = { version = "0.20", default-features = false }
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
