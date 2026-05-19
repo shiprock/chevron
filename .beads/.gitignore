@@ -21,6 +21,11 @@ redirect
 .jsonl.lock
 sync_base.jsonl
 export-state/
+export-state.json
+
+# Embedded Dolt working state (per-machine)
+backup/
+embeddeddolt/
 
 # Ephemeral store (SQLite - wisps/molecules, intentionally not versioned)
 ephemeral.sqlite3
