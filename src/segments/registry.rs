@@ -115,7 +115,7 @@ impl Segment for GitSegment {
     }
 
     fn render(&self, ctx: &mut PromptContext, from_bg: Option<u8>) -> SegmentOutput {
-        let status = ctx.repo.as_mut().map(git::RepoStatus::compute);
+        let status = crate::daemon::status_for_cwd(std::path::Path::new(&ctx.pwd));
         let (text, end_bg) = git::render_segment(status.as_ref(), from_bg);
         ctx.repo_status = status;
         SegmentOutput { text, end_bg }

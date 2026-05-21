@@ -346,14 +346,13 @@ pub fn render_segment(status: Option<&RepoStatus>, from_bg: Option<u8>) -> (Stri
     (out, Some(236))
 }
 
-/// Top-level entry for the `chevron git` subcommand: discovers a repo from
-/// `discover_from`, computes status if found, renders the segment, and
-/// appends the terminal reset. This is also the inline fallback path that
-/// `chevron prompt` uses when the daemon (phase 1+) is unavailable.
+/// Top-level entry for the `chevron git` subcommand. Goes through
+/// [`crate::daemon::status_for_cwd`] so the daemon-cached fast path is used
+/// when available; falls back to inline `Repository::discover` +
+/// `RepoStatus::compute` otherwise.
 #[must_use]
 pub fn render(discover_from: &std::path::Path) -> String {
-    let mut repo = Repository::discover(discover_from).ok();
-    let status = repo.as_mut().map(RepoStatus::compute);
+    let status = crate::daemon::status_for_cwd(discover_from);
     let (out, _) = render_segment(status.as_ref(), Some(237));
     format!("{out}{RST}")
 }

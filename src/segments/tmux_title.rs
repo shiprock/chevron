@@ -1,5 +1,3 @@
-use git2::Repository;
-
 use crate::color::{BRANCH_ICON, PENCIL_ICON};
 use crate::segments::git::RepoStatus;
 
@@ -33,25 +31,17 @@ pub fn render_from_status(home: &str, pwd: &str, status: Option<&RepoStatus>) ->
     }
 }
 
-/// Standalone entry for the `chevron tmux-title` subcommand. Discovers the repo
-/// itself and computes a full `RepoStatus`. Shares its compute path with the
-/// prompt git segment so the title can't disagree with the prompt's idea of
-/// dirtiness.
+/// Standalone entry for the `chevron tmux-title` subcommand. Goes through
+/// [`crate::daemon::status_for_cwd`] so it shares the daemon's cached
+/// view with the prompt's git segment — the two can't disagree about
+/// dirtiness even when computed in separate processes.
 #[must_use]
 pub fn render(home: &str, pwd: &str) -> String {
     if pwd == home {
         return "\u{1F3E0} ~".to_string();
     }
-
-    let Ok(mut repo) = Repository::discover(pwd) else {
-        let dir_name = std::path::Path::new(pwd)
-            .file_name()
-            .map_or_else(|| pwd.to_string(), |n| n.to_string_lossy().to_string());
-        return format!("\u{1F4C1} {dir_name}");
-    };
-
-    let status = RepoStatus::compute(&mut repo);
-    render_from_status(home, pwd, Some(&status))
+    let status = crate::daemon::status_for_cwd(std::path::Path::new(pwd));
+    render_from_status(home, pwd, status.as_ref())
 }
 
 #[cfg(test)]

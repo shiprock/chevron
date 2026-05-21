@@ -37,6 +37,8 @@
 //! phase 2 (chevron-1yz.4), `core.fsmonitor` in phase 3 (chevron-1yz.2).
 
 #[cfg(feature = "daemon")]
+pub mod client;
+#[cfg(feature = "daemon")]
 pub mod lifecycle;
 #[cfg(feature = "daemon")]
 pub mod listener;
@@ -46,3 +48,28 @@ pub mod paths;
 pub mod proto;
 #[cfg(feature = "daemon")]
 pub mod state;
+
+use std::path::Path;
+
+use crate::segments::git::RepoStatus;
+
+/// Unified status entry point used by `chevron git`, the prompt path, and
+/// `chevron tmux-title`. With the `daemon` feature enabled (default), this
+/// tries the running daemon first and falls back to inline compute on any
+/// failure or when the env var `CHEVRON_NO_DAEMON=1` is set. With the
+/// feature disabled, it always computes inline.
+///
+/// `cwd` is canonicalized before being sent to the daemon so the cache key
+/// is stable across symlinks and relative paths.
+#[must_use]
+pub fn status_for_cwd(cwd: &Path) -> Option<RepoStatus> {
+    let canon = cwd.canonicalize().ok()?;
+    #[cfg(feature = "daemon")]
+    if std::env::var_os("CHEVRON_NO_DAEMON").is_none()
+        && let Some(s) = client::try_query(&canon)
+    {
+        return Some(s);
+    }
+    let mut repo = git2::Repository::discover(&canon).ok()?;
+    Some(RepoStatus::compute(&mut repo))
+}

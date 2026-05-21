@@ -1,5 +1,3 @@
-use git2::Repository;
-
 use crate::config::Config;
 use crate::segments::{git, registry, reset, tmux_title};
 
@@ -7,7 +5,6 @@ pub struct PromptContext {
     pub home: String,
     pub pwd: String,
     pub max_dir_size: Option<usize>,
-    pub repo: Option<Repository>,
     pub exit_status: i32,
     pub duration_ms: u64,
     pub job_count: u32,
@@ -29,13 +26,11 @@ impl PromptContext {
         let pwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        let repo = Repository::discover(".").ok();
         let in_tmux = std::env::var("TMUX").is_ok();
         Self {
             home,
             pwd,
             max_dir_size,
-            repo,
             exit_status,
             duration_ms,
             job_count,
@@ -95,7 +90,10 @@ mod tests {
     #[serial]
     fn renders_path_and_git() {
         let tmp = TempDir::new().unwrap();
-        let repo = init_repo(tmp.path());
+        // Side-effect: lays down .git/ in tmp so the daemon-or-inline path
+        // can discover a repo at this cwd. The Repository handle itself is
+        // no longer plumbed through PromptContext.
+        let _ = init_repo(tmp.path());
 
         // SAFETY: test-only
         unsafe { std::env::remove_var("IN_NIX_SHELL") };
@@ -104,7 +102,6 @@ mod tests {
             home: "/home/user".to_string(),
             pwd: tmp.path().to_string_lossy().to_string(),
             max_dir_size: None,
-            repo: Some(repo),
             exit_status: 0,
             duration_ms: 0,
             job_count: 0,
@@ -128,7 +125,6 @@ mod tests {
             home: "/home/user".to_string(),
             pwd: "/tmp".to_string(),
             max_dir_size: None,
-            repo: None,
             exit_status: 0,
             duration_ms: 0,
             job_count: 0,
@@ -146,7 +142,10 @@ mod tests {
     #[serial]
     fn tmux_mode_appends_title_line() {
         let tmp = TempDir::new().unwrap();
-        let repo = init_repo(tmp.path());
+        // Side-effect: lays down .git/ in tmp so the daemon-or-inline path
+        // can discover a repo at this cwd. The Repository handle itself is
+        // no longer plumbed through PromptContext.
+        let _ = init_repo(tmp.path());
 
         // SAFETY: test-only
         unsafe { std::env::remove_var("IN_NIX_SHELL") };
@@ -155,7 +154,6 @@ mod tests {
             home: "/home/user".to_string(),
             pwd: tmp.path().to_string_lossy().to_string(),
             max_dir_size: None,
-            repo: Some(repo),
             exit_status: 0,
             duration_ms: 0,
             job_count: 0,
@@ -188,7 +186,6 @@ mod tests {
             home: "/home/user".to_string(),
             pwd: "/tmp".to_string(),
             max_dir_size: None,
-            repo: None,
             exit_status: 0,
             duration_ms: 0,
             job_count: 0,
@@ -211,7 +208,6 @@ mod tests {
             home: "/home/user".to_string(),
             pwd: "/home/user/projects".to_string(),
             max_dir_size: Some(20),
-            repo: None,
             exit_status: 0,
             duration_ms: 0,
             job_count: 0,
