@@ -173,7 +173,26 @@ PROMPT_COMMAND=_chevron_precmd
 #[must_use]
 pub fn init_fish() -> &'static str {
     r#"function fish_prompt
+    # Transient branch: short prompt with exit-coloured chevron. Triggered
+    # when the user hits Enter — _chevron_transient_enter sets the flag and
+    # forces a repaint before executing the command. We unset the flag here
+    # so the next full prompt (after the command runs) renders normally.
+    if set -q _chevron_transient_show
+        set -e _chevron_transient_show
+        set -l last_exit 0
+        set -q _chevron_last_exit; and set last_exit $_chevron_last_exit
+        if test $last_exit -eq 0
+            set_color green
+        else
+            set_color red
+        end
+        echo -n '❯ '
+        set_color normal
+        return
+    end
+
     set -l exit_status $status
+    set -g _chevron_last_exit $exit_status
     set -l duration_ms $CMD_DURATION
     set -l job_count (count (jobs -p 2>/dev/null))
     set -l chevron_output (CHEVRON_SHELL=fish command chevron prompt 20 $exit_status $duration_ms $job_count)
@@ -185,6 +204,39 @@ pub fn init_fish() -> &'static str {
             tmux set-option -p @custom_title "" \; set-option -p @dir_title "$lines[2]" \; rename-window "$lines[2]"
         end
     end
+end
+
+# Post-execution duration tag: fish exposes $CMD_DURATION directly, so we
+# can hook fish_postexec without the timestamp arithmetic zsh needs.
+function _chevron_postexec --on-event fish_postexec
+    test "$CHEVRON_TRANSIENT" = "0"; and return
+    set -l threshold $CHEVRON_TRANSIENT_DURATION_MS
+    test -z "$threshold"; and set threshold 2000
+    test $CMD_DURATION -lt $threshold; and return
+    if test $CMD_DURATION -ge 60000
+        set -l mins (math "$CMD_DURATION / 60000")
+        set -l rem (math "($CMD_DURATION % 60000) / 1000")
+        printf '\033[2m %dm %ds\033[0m\n' $mins $rem
+    else
+        set -l secs (math "$CMD_DURATION / 1000")
+        set -l frac (math "($CMD_DURATION % 1000) / 100")
+        printf '\033[2m %d.%ds\033[0m\n' $secs $frac
+    end
+end
+
+# Transient prompt: bind Enter to a wrapper that flips the flag,
+# repaints (which re-runs fish_prompt -> short form), and then executes.
+# The deferred-event ordering matters here: `commandline -f` schedules
+# operations to run after the current binding returns, so the flag stays
+# set when fish_prompt fires for the repaint, then the execute follows.
+function _chevron_transient_enter
+    set -g _chevron_transient_show 1
+    commandline -f repaint
+    commandline -f execute
+end
+if test "$CHEVRON_TRANSIENT" != "0"
+    bind \r _chevron_transient_enter
+    bind \n _chevron_transient_enter
 end
 "#
 }
@@ -433,5 +485,70 @@ mod tests {
             "expected chevron prompt call"
         );
         assert!(out.contains("rename-window"), "should rename tmux window");
+    }
+
+    #[test]
+    fn fish_binds_enter_for_transient_prompt() {
+        let out = init_fish();
+        assert!(
+            out.contains("bind \\r _chevron_transient_enter")
+                && out.contains("bind \\n _chevron_transient_enter"),
+            "expected Enter and Ctrl-J bound to the transient wrapper"
+        );
+        assert!(
+            out.contains("commandline -f repaint") && out.contains("commandline -f execute"),
+            "transient wrapper should repaint then execute"
+        );
+    }
+
+    #[test]
+    fn fish_transient_branch_uses_short_chevron() {
+        let out = init_fish();
+        assert!(
+            out.contains("set -q _chevron_transient_show"),
+            "fish_prompt should branch on the transient flag"
+        );
+        assert!(
+            out.contains("set -e _chevron_transient_show"),
+            "transient branch must unset the flag so the next full prompt isn't transient too"
+        );
+        // Green/red branch on exit status.
+        assert!(out.contains("set_color green"));
+        assert!(out.contains("set_color red"));
+    }
+
+    #[test]
+    fn fish_transient_respects_opt_out_env_var() {
+        let out = init_fish();
+        assert!(
+            out.contains(r#"if test "$CHEVRON_TRANSIENT" != "0""#),
+            "Enter binding should be skipped when CHEVRON_TRANSIENT=0"
+        );
+    }
+
+    #[test]
+    fn fish_postexec_emits_duration_tag() {
+        let out = init_fish();
+        assert!(
+            out.contains("--on-event fish_postexec"),
+            "should use fish's postexec event"
+        );
+        assert!(
+            out.contains("CHEVRON_TRANSIENT_DURATION_MS"),
+            "duration threshold configurable via env var"
+        );
+        assert!(out.contains(r"\033[2m"), "duration line uses dim styling");
+        assert!(
+            out.contains("CMD_DURATION"),
+            "should read fish's $CMD_DURATION"
+        );
+    }
+
+    #[test]
+    fn fish_duration_format_pivots_at_minute() {
+        let out = init_fish();
+        assert!(out.contains("60000"), "60s pivot present");
+        assert!(out.contains("%dm %ds"), "minute format present");
+        assert!(out.contains("%d.%ds"), "sub-minute decimal format present");
     }
 }
