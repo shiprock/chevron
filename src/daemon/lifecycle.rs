@@ -119,6 +119,64 @@ pub fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(signed, 0) == 0 }
 }
 
+/// `chevron daemon stop` — read pidfile, send SIGTERM, wait briefly.
+/// Returns a process exit code (0 success, non-zero failure).
+#[must_use]
+pub fn stop() -> i32 {
+    let pid_path = paths::pid_path();
+    let Ok(pid) = read_pidfile(&pid_path) else {
+        eprintln!(
+            "chevrond: not running (no pidfile at {})",
+            pid_path.display()
+        );
+        return 1;
+    };
+    let Ok(signed) = libc::pid_t::try_from(pid) else {
+        eprintln!("chevrond: pidfile contains out-of-range pid {pid}");
+        return 1;
+    };
+    if !pid_alive(pid) {
+        eprintln!("chevrond: pid {pid} is not alive; removing stale pidfile");
+        let _ = fs::remove_file(&pid_path);
+        return 1;
+    }
+    // SAFETY: signed is in valid pid_t range; SIGTERM is a defined signal.
+    unsafe {
+        libc::kill(signed, libc::SIGTERM);
+    }
+
+    // Wait up to 2 seconds for the process to exit. Poll cheaply.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if !pid_alive(pid) {
+            let _ = fs::remove_file(&pid_path);
+            let _ = fs::remove_file(paths::socket_path());
+            return 0;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    eprintln!("chevrond: timed out waiting for pid {pid} to exit");
+    1
+}
+
+/// `chevron daemon status` — print running state to stdout.
+/// Returns 0 if a live daemon is found, 1 otherwise.
+#[must_use]
+pub fn status() -> i32 {
+    let pid_path = paths::pid_path();
+    let Ok(pid) = read_pidfile(&pid_path) else {
+        println!("chevrond: not running");
+        return 1;
+    };
+    if pid_alive(pid) {
+        println!("chevrond: running (pid {pid})");
+        0
+    } else {
+        println!("chevrond: not running (stale pidfile, pid {pid})");
+        1
+    }
+}
+
 fn write_pidfile(path: &Path) -> io::Result<()> {
     let pid = std::process::id();
     let tmp = path.with_extension("pid.tmp");

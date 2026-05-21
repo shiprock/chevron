@@ -7,6 +7,7 @@ use chevron::banner;
 use chevron::weather;
 use chevron::{color, health, repo_status, segments, shell};
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -60,6 +61,21 @@ fn main() {
         },
         Some("status") => repo_status::run(),
         Some("health") => std::process::exit(health::run(&args[2..])),
+        #[cfg(feature = "daemon")]
+        Some("daemon") => match args.get(2).map(String::as_str) {
+            Some("serve") => {
+                if let Err(e) = chevron::daemon::lifecycle::serve() {
+                    eprintln!("chevrond: {e}");
+                    std::process::exit(1);
+                }
+            }
+            Some("stop") => std::process::exit(chevron::daemon::lifecycle::stop()),
+            Some("status") => std::process::exit(chevron::daemon::lifecycle::status()),
+            _ => {
+                eprintln!("Usage: chevron daemon <serve|stop|status>");
+                std::process::exit(1);
+            }
+        },
         Some("version" | "--version" | "-V") => {
             println!("chevron {}", env!("CARGO_PKG_VERSION"));
         }
@@ -84,6 +100,8 @@ fn main() {
                 "init",
                 "status",
                 "health",
+                #[cfg(feature = "daemon")]
+                "daemon",
                 "version",
                 #[cfg(feature = "banner")]
                 "banner",
