@@ -4,9 +4,19 @@ pub fn init_zsh() -> &'static str {
     r#"_chevron_preexec() {
     _chevron_cmd_start=$EPOCHREALTIME
     _chevron_cmd_title="$1"
+    # OSC 133 C: command output is about to start. Modern terminals
+    # (Ghostty, WezTerm, iTerm2, Kitty, VS Code, Windows Terminal) use
+    # this to mark the boundary between prompt and command output for
+    # navigation, grouping, and "copy output only". Older terminals
+    # silently ignore unknown OSC sequences.
+    [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;C\a'
 }
 _chevron_precmd() {
     local exit_status=$?
+    # OSC 133 D: the just-completed command finished with $exit_status.
+    # Emitted first so it closes out the previous command region before
+    # we print the duration tag and next prompt's A marker.
+    [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;D;%d\a' $exit_status
     local duration_ms=0
     if [[ -n "$_chevron_cmd_start" ]]; then
         duration_ms=$(( ($EPOCHREALTIME - _chevron_cmd_start) * 1000 ))
@@ -59,7 +69,8 @@ _chevron_precmd() {
             chevron_output="$(chevron prompt 20 $exit_status $duration_ms $job_count)"
         fi
     fi
-    PROMPT="${chevron_output%%$'\n'*} "
+    _chevron_make_prompt "${chevron_output%%$'\n'*}"
+    PROMPT="$REPLY"
     # Stash transient prompt for the accept-line widget. Colour reflects
     # the just-completed command's exit status, so scrollback retains a
     # visual cue (green/red chevron) even after the full prompt collapses.
@@ -95,7 +106,8 @@ _chevron_async_callback() {
     zle -F "$fd"
     exec {fd}<&-
     if [[ -n "$fresh" ]]; then
-        PROMPT="${fresh%%$'\n'*} "
+        _chevron_make_prompt "${fresh%%$'\n'*}"
+        PROMPT="$REPLY"
         if [[ -n "$TMUX" && "$fresh" == *$'\n'* ]]; then
             local _chevron_tmux_title="${fresh#*$'\n'}"
             local _chevron_priority=$(tmux show-options -w -v @priority_title 2>/dev/null)
@@ -110,7 +122,11 @@ _chevron_async_callback() {
 # (single chevron) so scrollback stays clean and copy-paste captures only
 # the command, not the prompt chrome. Disable with CHEVRON_TRANSIENT=0.
 _chevron_accept_line() {
-    PROMPT="$_chevron_transient_prompt"
+    # Strip the trailing space from the transient prompt since
+    # _chevron_make_prompt re-adds one when wrapping; otherwise we'd get
+    # a double space between the chevron and the user's input cursor.
+    _chevron_make_prompt "${_chevron_transient_prompt% }"
+    PROMPT="$REPLY"
     zle .reset-prompt
     # Chain through any prior accept-line override (zsh-autosuggest, etc.)
     # if one exists; otherwise fall back to the built-in.
@@ -118,6 +134,19 @@ _chevron_accept_line() {
         zle "$_chevron_orig_accept_line"
     else
         zle .accept-line
+    fi
+}
+# Build a PROMPT value, optionally wrapping in OSC 133 A/B markers so
+# modern terminals can identify the prompt-vs-command boundary. Returns
+# the value via REPLY (zsh convention) to avoid a subshell fork. The
+# `%{…%}` brackets tell zsh's prompt-width tracker that the escape bytes
+# are zero-width; without them, the cursor column drifts after each
+# prompt and line editing breaks.
+_chevron_make_prompt() {
+    if [[ "${CHEVRON_OSC133:-1}" != "0" ]]; then
+        REPLY=$'%{\e]133;A\a%}'"$1"$' %{\e]133;B\a%}'
+    else
+        REPLY="$1 "
     fi
 }
 # Cache file for the async fast path. Owner-only directory so the cached
@@ -150,10 +179,14 @@ pub fn init_bash() -> &'static str {
     r#"_chevron_preexec() {
     [[ -n "$_chevron_in_precmd" ]] && return
     _chevron_cmd_start=${_chevron_cmd_start:-$EPOCHREALTIME}
+    # OSC 133 C: command output is about to start.
+    [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;C\a'
 }
 _chevron_precmd() {
     local exit_status=$?
     _chevron_in_precmd=1
+    # OSC 133 D: previous command finished with $exit_status.
+    [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;D;%d\a' $exit_status
     local duration_ms=0
     if [[ -n "$_chevron_cmd_start" ]]; then
         duration_ms=$(LC_ALL=C awk "BEGIN { printf \"%d\", ($EPOCHREALTIME - $_chevron_cmd_start) * 1000 }")
@@ -177,7 +210,15 @@ _chevron_precmd() {
     local job_count=$(( $(jobs -p 2>/dev/null | wc -l) ))
     local chevron_output
     chevron_output="$(CHEVRON_SHELL=bash chevron prompt 20 $exit_status $duration_ms $job_count)"
-    PS1="${chevron_output%%$'\n'*} "
+    # Wrap PS1 in OSC 133 A/B markers when enabled. The `\[…\]` brackets
+    # tell bash's prompt-width tracker that the escape bytes are
+    # zero-width; without them, line editing miscounts columns.
+    local _chevron_body="${chevron_output%%$'\n'*}"
+    if [[ "${CHEVRON_OSC133:-1}" != "0" ]]; then
+        PS1=$'\\[\e]133;A\a\\]'"$_chevron_body"$' \\[\e]133;B\a\\]'
+    else
+        PS1="$_chevron_body "
+    fi
     if [[ -n "$TMUX" && "$chevron_output" == *$'\n'* ]]; then
         local tmux_title="${chevron_output#*$'\n'}"
         local priority=$(tmux show-options -w -v @priority_title 2>/dev/null)
@@ -203,6 +244,7 @@ pub fn init_fish() -> &'static str {
         set -e _chevron_transient_show
         set -l last_exit 0
         set -q _chevron_last_exit; and set last_exit $_chevron_last_exit
+        test "$CHEVRON_OSC133" != "0"; and printf '\e]133;A\a'
         if test $last_exit -eq 0
             set_color green
         else
@@ -210,6 +252,7 @@ pub fn init_fish() -> &'static str {
         end
         echo -n '❯ '
         set_color normal
+        test "$CHEVRON_OSC133" != "0"; and printf '\e]133;B\a'
         return
     end
 
@@ -219,7 +262,9 @@ pub fn init_fish() -> &'static str {
     set -l job_count (count (jobs -p 2>/dev/null))
     set -l chevron_output (CHEVRON_SHELL=fish command chevron prompt 20 $exit_status $duration_ms $job_count)
     set -l lines (string split \n -- $chevron_output)
+    test "$CHEVRON_OSC133" != "0"; and printf '\e]133;A\a'
     echo -n "$lines[1] "
+    test "$CHEVRON_OSC133" != "0"; and printf '\e]133;B\a'
     if set -q TMUX; and test (count $lines) -gt 1
         set -l priority (tmux show-options -w -v @priority_title 2>/dev/null)
         if test -z "$priority"
@@ -228,9 +273,19 @@ pub fn init_fish() -> &'static str {
     end
 end
 
+# Pre-execution: emit OSC 133 C so the terminal knows command output is
+# about to start.
+function _chevron_preexec --on-event fish_preexec
+    test "$CHEVRON_OSC133" != "0"; and printf '\e]133;C\a'
+end
+
 # Post-execution duration tag: fish exposes $CMD_DURATION directly, so we
 # can hook fish_postexec without the timestamp arithmetic zsh needs.
 function _chevron_postexec --on-event fish_postexec
+    # Capture $status FIRST — every later command resets it.
+    set -l exit_status $status
+    # OSC 133 D: previous command finished.
+    test "$CHEVRON_OSC133" != "0"; and printf '\e]133;D;%d\a' $exit_status
     test "$CHEVRON_TRANSIENT" = "0"; and return
     set -l threshold $CHEVRON_TRANSIENT_DURATION_MS
     test -z "$threshold"; and set threshold 2000
@@ -514,6 +569,106 @@ mod tests {
         assert!(
             out.contains(r#"[[ "${CHEVRON_TRANSIENT:-1}" != "0" ]] && (( duration_ms >="#),
             "duration tag should be guarded by CHEVRON_TRANSIENT"
+        );
+    }
+
+    #[test]
+    fn zsh_emits_osc133_markers_by_default() {
+        let out = init_zsh();
+        // C in preexec, D in precmd, A+B wrapping PROMPT.
+        assert!(
+            out.contains(r"printf '\e]133;C\a'"),
+            "preexec should emit OSC 133 C"
+        );
+        assert!(
+            out.contains(r"printf '\e]133;D;%d\a'"),
+            "precmd should emit OSC 133 D with exit status"
+        );
+        assert!(
+            out.contains(r"\e]133;A\a") && out.contains(r"\e]133;B\a"),
+            "PROMPT helper should reference A and B markers"
+        );
+    }
+
+    #[test]
+    fn zsh_osc133_markers_are_width_bracketed() {
+        // zsh's `%{...%}` tells the prompt-width tracker the bytes are
+        // zero-width. Without it, cursor column drifts on every prompt.
+        let out = init_zsh();
+        assert!(
+            out.contains(r"%{\e]133;A\a%}") && out.contains(r"%{\e]133;B\a%}"),
+            "OSC 133 escapes inside PROMPT must be inside %{{...%}}"
+        );
+    }
+
+    #[test]
+    fn zsh_osc133_respects_opt_out() {
+        let out = init_zsh();
+        assert!(
+            out.contains(r#"[[ "${CHEVRON_OSC133:-1}" != "0" ]]"#),
+            "OSC 133 emission should be gated by CHEVRON_OSC133"
+        );
+    }
+
+    #[test]
+    fn bash_emits_osc133_markers_by_default() {
+        let out = init_bash();
+        assert!(
+            out.contains(r"printf '\e]133;C\a'"),
+            "preexec should emit OSC 133 C"
+        );
+        assert!(
+            out.contains(r"printf '\e]133;D;%d\a'"),
+            "precmd should emit OSC 133 D with exit status"
+        );
+        // bash uses \[...\] not zsh's %{...%}. The init script's raw
+        // string contains `\\[` (two backslashes) because that's the
+        // escape needed to put a literal `\[` into bash's ANSI-C quoted
+        // string `$'...'`, which then expands to bash's prompt
+        // non-printing marker `\[`.
+        assert!(
+            out.contains(r"\\[\e]133;A\a\\]") && out.contains(r"\\[\e]133;B\a\\]"),
+            "bash PS1 must wrap OSC escapes in \\[...\\] (via $'\\\\[...\\\\]' in the source)"
+        );
+    }
+
+    #[test]
+    fn bash_osc133_respects_opt_out() {
+        let out = init_bash();
+        assert!(
+            out.contains(r#"[[ "${CHEVRON_OSC133:-1}" != "0" ]]"#),
+            "OSC 133 emission should be gated by CHEVRON_OSC133"
+        );
+    }
+
+    #[test]
+    fn fish_emits_osc133_markers_by_default() {
+        let out = init_fish();
+        // C from fish_preexec, D from fish_postexec, A+B in fish_prompt.
+        assert!(
+            out.contains("--on-event fish_preexec"),
+            "fish needs a fish_preexec handler to emit OSC 133 C"
+        );
+        assert!(
+            out.contains(r"printf '\e]133;C\a'"),
+            "preexec should printf OSC 133 C"
+        );
+        assert!(
+            out.contains(r"printf '\e]133;D;%d\a'"),
+            "postexec should printf OSC 133 D with exit status"
+        );
+        assert!(
+            out.contains(r"printf '\e]133;A\a'") && out.contains(r"printf '\e]133;B\a'"),
+            "fish_prompt should print A and B around the visible prompt"
+        );
+    }
+
+    #[test]
+    fn fish_osc133_respects_opt_out() {
+        let out = init_fish();
+        assert!(
+            out.contains(r#"test "$CHEVRON_OSC133" != "0""#),
+            "fish should gate OSC 133 emission on CHEVRON_OSC133"
         );
     }
 
