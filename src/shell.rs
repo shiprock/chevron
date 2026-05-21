@@ -140,6 +140,13 @@ fi
 
 #[must_use]
 pub fn init_bash() -> &'static str {
+    // Bash port intentionally skips the transient prompt that zsh and fish
+    // implement. Bash has no clean equivalent of ZLE's accept-line override,
+    // and the two viable workarounds (bind -x with cursor codes; DEBUG trap
+    // with $BASH_COMMAND) both break on multi-line input, wrapped lines, and
+    // compound commands. Same reason powerlevel10k stays zsh-only and
+    // Starship's bash init doesn't transient-collapse. The post-exec
+    // duration tag, however, ports cleanly and is enabled here.
     r#"_chevron_preexec() {
     [[ -n "$_chevron_in_precmd" ]] && return
     _chevron_cmd_start=${_chevron_cmd_start:-$EPOCHREALTIME}
@@ -151,6 +158,21 @@ _chevron_precmd() {
     if [[ -n "$_chevron_cmd_start" ]]; then
         duration_ms=$(LC_ALL=C awk "BEGIN { printf \"%d\", ($EPOCHREALTIME - $_chevron_cmd_start) * 1000 }")
         unset _chevron_cmd_start
+    fi
+    # Post-execution duration tag: a dim line shown between command output
+    # and the next prompt when the command exceeded the threshold (default
+    # 2000ms). Same logic and format as the zsh/fish init. Disable with
+    # CHEVRON_TRANSIENT=0; threshold via CHEVRON_TRANSIENT_DURATION_MS.
+    if [[ "${CHEVRON_TRANSIENT:-1}" != "0" ]] && (( duration_ms >= ${CHEVRON_TRANSIENT_DURATION_MS:-2000} )); then
+        if (( duration_ms >= 60000 )); then
+            local _chevron_mins=$(( duration_ms / 60000 ))
+            local _chevron_rem=$(( (duration_ms % 60000) / 1000 ))
+            printf '\033[2m %dm %ds\033[0m\n' "$_chevron_mins" "$_chevron_rem"
+        else
+            local _chevron_secs=$(( duration_ms / 1000 ))
+            local _chevron_frac=$(( (duration_ms % 1000) / 100 ))
+            printf '\033[2m %d.%ds\033[0m\n' "$_chevron_secs" "$_chevron_frac"
+        fi
     fi
     local job_count=$(( $(jobs -p 2>/dev/null | wc -l) ))
     local chevron_output
@@ -462,6 +484,55 @@ mod tests {
         assert!(
             out.contains("_chevron_in_precmd"),
             "expected reentry guard in bash init"
+        );
+    }
+
+    #[test]
+    fn bash_emits_duration_tag_for_slow_commands() {
+        let out = init_bash();
+        assert!(
+            out.contains("CHEVRON_TRANSIENT_DURATION_MS"),
+            "expected configurable duration threshold"
+        );
+        assert!(
+            out.contains(r"\033[2m"),
+            "duration line should use dim styling"
+        );
+    }
+
+    #[test]
+    fn bash_duration_tag_respects_minute_threshold() {
+        let out = init_bash();
+        assert!(out.contains("60000"), "expected 60s pivot");
+        assert!(out.contains("%dm %ds"), "expected minutes/seconds format");
+        assert!(out.contains("%d.%ds"), "expected sub-minute decimal format");
+    }
+
+    #[test]
+    fn bash_duration_tag_disabled_with_transient() {
+        let out = init_bash();
+        assert!(
+            out.contains(r#"[[ "${CHEVRON_TRANSIENT:-1}" != "0" ]] && (( duration_ms >="#),
+            "duration tag should be guarded by CHEVRON_TRANSIENT"
+        );
+    }
+
+    #[test]
+    fn bash_deliberately_does_not_ship_transient_prompt() {
+        // Bash transient via `bind -x` or DEBUG-trap cursor codes breaks on
+        // multi-line input, wrapped lines, and compound commands. We
+        // deliberately don't ship it. This test locks in that decision so
+        // a future change that adds it must also remove this test (and the
+        // comment in init_bash) — forcing the author to confront the
+        // edge-case story.
+        let out = init_bash();
+        assert!(
+            !out.contains("bind -x"),
+            "bash init should not bind -x — no clean transient possible"
+        );
+        assert!(
+            !out.contains("_chevron_transient_show") && !out.contains("_chevron_accept_line"),
+            "no zsh/fish-style transient flag in bash init"
         );
     }
 
