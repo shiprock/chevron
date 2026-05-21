@@ -37,6 +37,10 @@
 //! phase 2 (chevron-1yz.4), `core.fsmonitor` in phase 3 (chevron-1yz.2).
 
 #[cfg(feature = "daemon")]
+pub mod lifecycle;
+#[cfg(feature = "daemon")]
+pub mod listener;
+#[cfg(feature = "daemon")]
 pub mod paths;
 #[cfg(feature = "daemon")]
 pub mod proto;
