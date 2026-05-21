@@ -35,7 +35,7 @@ impl OpState {
 /// render time. This is the data type the chevrond daemon caches and
 /// serves in later phases; the inline-fallback path and daemon path both
 /// produce `RepoStatus` from identical code, so they cannot drift.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoStatus {
     pub repo_name: String,
     /// Either the branch shorthand ("master", "feature/foo"), the 7-char

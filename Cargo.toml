@@ -9,13 +9,16 @@ keywords = ["prompt", "powerline", "tmux", "bash", "shell"]
 categories = ["command-line-utilities"]
 
 [features]
-default = ["banner", "weather", "vendored-libgit2"]
+default = ["banner", "weather", "vendored-libgit2", "daemon"]
 banner = ["dep:image"]
 weather = ["dep:ureq", "dep:serde_json"]
 # Opt-out: distro packagers (nixpkgs, etc.) build with
 # `--no-default-features --features banner,weather` to link the system
 # libgit2 instead of the vendored copy.
 vendored-libgit2 = ["git2/vendored-libgit2"]
+# chevrond: TTL-cached background daemon serving RepoStatus over a Unix
+# socket. Without this feature, status_for_cwd always computes inline.
+daemon = []
 
 [dependencies]
 git2 = { version = "0.20", default-features = false }

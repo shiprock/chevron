@@ -21,6 +21,7 @@
 pub mod banner;
 pub mod color;
 pub mod config;
+pub mod daemon;
 pub mod health;
 pub mod repo_status;
 pub mod segments;
