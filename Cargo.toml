@@ -18,12 +18,13 @@ weather = ["dep:ureq", "dep:serde_json"]
 vendored-libgit2 = ["git2/vendored-libgit2"]
 # chevrond: TTL-cached background daemon serving RepoStatus over a Unix
 # socket. Without this feature, status_for_cwd always computes inline.
-daemon = []
+daemon = ["dep:notify"]
 
 [dependencies]
 git2 = { version = "0.20", default-features = false }
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 libc = "0.2"
+notify = { version = "8", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
 toml = "0.8"

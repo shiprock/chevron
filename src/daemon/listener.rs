@@ -155,6 +155,10 @@ pub fn handle_status(cwd: &Path, state_tx: &Sender<StateMsg>) -> Response {
     let Some(workdir) = repo.workdir().and_then(|p| p.canonicalize().ok()) else {
         return Response::Status(None);
     };
+    // `repo.path()` returns the actual gitdir — handles submodules and
+    // git-worktrees where `.git` is a file pointing elsewhere. This is
+    // what we hand to the watcher.
+    let git_dir = repo.path().to_path_buf();
 
     // Cache lookup.
     let (reply_tx, reply_rx) = mpsc::channel();
@@ -185,6 +189,7 @@ pub fn handle_status(cwd: &Path, state_tx: &Sender<StateMsg>) -> Response {
     let status = RepoStatus::compute(&mut repo);
     let _ = state_tx.send(StateMsg::Insert {
         workdir,
+        git_dir,
         status: status.clone(),
         computed_at: Instant::now(),
     });
