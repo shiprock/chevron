@@ -102,7 +102,21 @@ impl Segment for PathSegment {
     }
 
     fn render(&self, ctx: &mut PromptContext, from_bg: Option<u8>) -> SegmentOutput {
-        let (text, end_bg) = path::render_with(&ctx.home, &ctx.pwd, ctx.max_dir_size, from_bg);
+        // Discover the repo so the path renderer can collapse to a
+        // repo-relative form (chevron-ir6). This is redundant with the
+        // GitSegment's discover that follows; carrying workdir through
+        // the daemon's RepoStatus would eliminate the double-lookup as
+        // a follow-on. ~50 µs cold, sub-µs warm via libgit2 internals.
+        let workdir = git2::Repository::discover(&ctx.pwd)
+            .ok()
+            .and_then(|r| r.workdir().and_then(|p| p.canonicalize().ok()));
+        let (text, end_bg) = path::render_with_repo(
+            &ctx.home,
+            &ctx.pwd,
+            ctx.max_dir_size,
+            from_bg,
+            workdir.as_deref(),
+        );
         SegmentOutput { text, end_bg }
     }
 }

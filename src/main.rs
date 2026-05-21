@@ -18,7 +18,12 @@ fn main() {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
             let max_dir_size = args.get(2).and_then(|s| s.parse::<usize>().ok());
-            print!("{}", segments::path::render(&home, &pwd, max_dir_size));
+            // render_aware discovers any git repo so the path collapses
+            // to a repo-relative form when applicable (chevron-ir6).
+            print!(
+                "{}",
+                segments::path::render_aware(&home, &pwd, max_dir_size)
+            );
         }
         Some("git") => print!("{}", segments::git::render(Path::new("."))),
         Some("nix-shell") => print!("{}", segments::nix_shell::render()),

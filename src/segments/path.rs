@@ -1,4 +1,5 @@
 use std::fmt::Write;
+use std::path::Path;
 
 use crate::color::{THIN, arrow, fg};
 
@@ -10,6 +11,27 @@ fn truncate_dir(name: &str, max: usize) -> String {
     format!("{truncated}\u{2026}")
 }
 
+/// When `pwd` lives inside a git repo, strip the repo's parent directory
+/// from the front so the repo name becomes the first visible component.
+/// `~/src/chevron/src/segments` (workdir `~/src/chevron`) renders as
+/// `chevron/src/segments` — the `~/src/` prefix is shared across many
+/// repos and just adds noise.
+///
+/// Returns `None` if there's no workdir, the workdir has no parent, or
+/// `pwd` isn't actually inside the workdir's parent (a defensive check
+/// against caller bugs).
+fn try_rebase_to_repo(pwd: &str, repo_workdir: Option<&Path>) -> Option<String> {
+    let workdir = repo_workdir?;
+    let workdir_parent = workdir.parent()?;
+    let pwd_path = Path::new(pwd);
+    let stripped = pwd_path.strip_prefix(workdir_parent).ok()?;
+    let rendered = stripped.to_string_lossy().into_owned();
+    if rendered.is_empty() {
+        return None;
+    }
+    Some(rendered)
+}
+
 #[must_use]
 pub fn render_with(
     home: &str,
@@ -17,9 +39,32 @@ pub fn render_with(
     max_dir_size: Option<usize>,
     from_bg: Option<u8>,
 ) -> (String, Option<u8>) {
+    render_with_repo(home, pwd, max_dir_size, from_bg, None)
+}
+
+#[must_use]
+pub fn render_with_repo(
+    home: &str,
+    pwd: &str,
+    max_dir_size: Option<usize>,
+    from_bg: Option<u8>,
+    repo_workdir: Option<&Path>,
+) -> (String, Option<u8>) {
+    // Adaptive: inside a git repo, render relative to the repo's parent
+    // dir so the repo name leads. Outside a repo (or when explicitly
+    // disabled via CHEVRON_REPO_RELATIVE_PATH=0), fall through to the
+    // home-collapse behaviour.
+    let repo_rebase = if std::env::var("CHEVRON_REPO_RELATIVE_PATH").ok().as_deref() == Some("0") {
+        None
+    } else {
+        try_rebase_to_repo(pwd, repo_workdir)
+    };
+
     // Require an exact match or a `/` immediately after `home` so HOME=/home/user
     // does not match /home/user2/foo (which would render as "~2/foo").
-    let path = if !home.is_empty()
+    let path = if let Some(rebased) = repo_rebase {
+        rebased
+    } else if !home.is_empty()
         && pwd.starts_with(home)
         && (pwd.len() == home.len() || pwd.as_bytes().get(home.len()) == Some(&b'/'))
     {
@@ -95,9 +140,24 @@ pub fn render(home: &str, pwd: &str, max_dir_size: Option<usize>) -> String {
     render_with(home, pwd, max_dir_size, Some(238)).0
 }
 
+/// Top-level entry for the `chevron path` subcommand. Discovers any git
+/// repo at `pwd` so the repo-relative rendering kicks in even outside the
+/// prompt path. The discover is ~50 µs cold; if it becomes a bottleneck
+/// we could plumb the daemon's already-known workdir through the wire
+/// protocol instead.
+#[must_use]
+pub fn render_aware(home: &str, pwd: &str, max_dir_size: Option<usize>) -> String {
+    let workdir = git2::Repository::discover(pwd)
+        .ok()
+        .and_then(|r| r.workdir().and_then(|p| p.canonicalize().ok()));
+    render_with_repo(home, pwd, max_dir_size, Some(238), workdir.as_deref()).0
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{render, render_with, truncate_dir};
+    use super::{render, render_with, render_with_repo, truncate_dir, try_rebase_to_repo};
+    use serial_test::serial;
+    use std::path::Path;
 
     #[test]
     fn home_shows_tilde() {
@@ -196,6 +256,140 @@ mod tests {
         assert!(
             out.contains("very-long-directory-name"),
             "should preserve full name: {out}"
+        );
+    }
+
+    // ── chevron-ir6: repo-relative path rendering ───────────────────────
+
+    #[test]
+    fn rebase_strips_workdir_parent_at_workdir_root() {
+        let out = try_rebase_to_repo(
+            "/Users/mim/src/chevron",
+            Some(Path::new("/Users/mim/src/chevron")),
+        );
+        assert_eq!(out.as_deref(), Some("chevron"));
+    }
+
+    #[test]
+    fn rebase_strips_workdir_parent_deep() {
+        let out = try_rebase_to_repo(
+            "/Users/mim/src/chevron/src/segments",
+            Some(Path::new("/Users/mim/src/chevron")),
+        );
+        assert_eq!(out.as_deref(), Some("chevron/src/segments"));
+    }
+
+    #[test]
+    fn rebase_returns_none_for_pwd_outside_workdir_parent() {
+        // pwd is sibling to the repo, not under its parent → don't rebase.
+        let out = try_rebase_to_repo("/var/log", Some(Path::new("/Users/mim/src/chevron")));
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn rebase_returns_none_when_no_workdir() {
+        let out = try_rebase_to_repo("/anywhere", None);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn rebase_returns_none_when_pwd_equals_workdir_parent() {
+        // pwd is the parent directory itself — strip_prefix returns empty.
+        // That's not a useful path to render; bail and let the caller fall
+        // back to home-collapse.
+        let out = try_rebase_to_repo("/Users/mim/src", Some(Path::new("/Users/mim/src/chevron")));
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn rebase_handles_workdir_at_filesystem_root() {
+        // /repo's parent is /. strip_prefix("/")  on /repo/sub → "repo/sub".
+        let out = try_rebase_to_repo("/repo/sub", Some(Path::new("/repo")));
+        assert_eq!(out.as_deref(), Some("repo/sub"));
+    }
+
+    #[test]
+    fn render_inside_repo_drops_home_prefix() {
+        let out = render_with_repo(
+            "/Users/mim",
+            "/Users/mim/src/chevron/src/segments",
+            None,
+            Some(238),
+            Some(Path::new("/Users/mim/src/chevron")),
+        )
+        .0;
+        // Should NOT contain ~ — we used the repo-relative form instead.
+        let visible: String = out
+            .chars()
+            .filter(|c| !c.is_ascii_control() && *c != '\u{1b}')
+            .collect();
+        assert!(
+            !visible.contains('~'),
+            "inside-repo render should not show ~: {visible}"
+        );
+        assert!(visible.contains("chevron"), "should show repo name");
+        assert!(visible.contains("segments"), "should show deep dir");
+        // ~/src should not appear as path segments — the whole point.
+        assert!(
+            !visible.contains(" mim "),
+            "should not include $HOME path: {visible}"
+        );
+    }
+
+    #[test]
+    fn render_inside_repo_at_workdir_root() {
+        let out = render_with_repo(
+            "/Users/mim",
+            "/Users/mim/src/chevron",
+            None,
+            Some(238),
+            Some(Path::new("/Users/mim/src/chevron")),
+        )
+        .0;
+        let visible: String = out
+            .chars()
+            .filter(|c| !c.is_ascii_control() && *c != '\u{1b}')
+            .collect();
+        assert!(visible.contains("chevron"));
+        assert!(!visible.contains('~'), "{visible}");
+    }
+
+    #[test]
+    fn render_outside_repo_keeps_home_collapse() {
+        // No workdir → home-collapse path unchanged.
+        let out = render_with_repo("/Users/mim", "/Users/mim/Documents", None, Some(238), None).0;
+        let visible: String = out
+            .chars()
+            .filter(|c| !c.is_ascii_control() && *c != '\u{1b}')
+            .collect();
+        assert!(
+            visible.contains('~'),
+            "outside-repo should still home-collapse: {visible}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn opt_out_via_env_var_disables_rebase() {
+        // SAFETY: test-only env mutation, serialised.
+        unsafe { std::env::set_var("CHEVRON_REPO_RELATIVE_PATH", "0") };
+        let out = render_with_repo(
+            "/Users/mim",
+            "/Users/mim/src/chevron/src",
+            None,
+            Some(238),
+            Some(Path::new("/Users/mim/src/chevron")),
+        )
+        .0;
+        unsafe { std::env::remove_var("CHEVRON_REPO_RELATIVE_PATH") };
+        let visible: String = out
+            .chars()
+            .filter(|c| !c.is_ascii_control() && *c != '\u{1b}')
+            .collect();
+        // With the opt-out, we fall back to home-collapse → ~ appears.
+        assert!(
+            visible.contains('~'),
+            "opt-out should restore home-collapse: {visible}"
         );
     }
 
