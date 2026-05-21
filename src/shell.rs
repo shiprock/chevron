@@ -16,6 +16,14 @@ _chevron_precmd() {
     local chevron_output
     chevron_output="$(chevron prompt 20 $exit_status $duration_ms $job_count)"
     PROMPT="${chevron_output%%$'\n'*} "
+    # Stash transient prompt for the accept-line widget. Colour reflects
+    # the just-completed command's exit status, so scrollback retains a
+    # visual cue (green/red chevron) even after the full prompt collapses.
+    if (( exit_status == 0 )); then
+        _chevron_transient_prompt='%F{green}❯%f '
+    else
+        _chevron_transient_prompt='%F{red}❯%f '
+    fi
     if [[ -n "$TMUX" && "$chevron_output" == *$'\n'* ]]; then
         local tmux_title="${chevron_output#*$'\n'}"
         local priority=$(tmux show-options -w -v @priority_title 2>/dev/null)
@@ -25,9 +33,31 @@ _chevron_precmd() {
     fi
     unset _chevron_cmd_title
 }
+# Transient prompt: rewrite the just-issued prompt line to a minimal stub
+# (single chevron) so scrollback stays clean and copy-paste captures only
+# the command, not the prompt chrome. Disable with CHEVRON_TRANSIENT=0.
+_chevron_accept_line() {
+    PROMPT="$_chevron_transient_prompt"
+    zle .reset-prompt
+    # Chain through any prior accept-line override (zsh-autosuggest, etc.)
+    # if one exists; otherwise fall back to the built-in.
+    if [[ -n "$_chevron_orig_accept_line" ]]; then
+        zle "$_chevron_orig_accept_line"
+    else
+        zle .accept-line
+    fi
+}
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd _chevron_precmd
 add-zsh-hook preexec _chevron_preexec
+if [[ "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
+    # Preserve any existing override (load order matters — initialise
+    # chevron after other prompt tools for best compatibility).
+    if [[ "${widgets[accept-line]}" == user:* ]]; then
+        _chevron_orig_accept_line="${widgets[accept-line]#user:}"
+    fi
+    zle -N accept-line _chevron_accept_line
+fi
 "#
 }
 
@@ -98,6 +128,56 @@ mod tests {
             "should check priority title"
         );
         assert!(out.contains("rename-window"), "should rename tmux window");
+    }
+
+    #[test]
+    fn zsh_registers_transient_accept_line_widget() {
+        let out = init_zsh();
+        assert!(
+            out.contains("zle -N accept-line _chevron_accept_line"),
+            "expected zle widget registration"
+        );
+        assert!(
+            out.contains("zle .reset-prompt"),
+            "transient widget must reset-prompt before accept"
+        );
+    }
+
+    #[test]
+    fn zsh_transient_respects_opt_out_env_var() {
+        let out = init_zsh();
+        assert!(
+            out.contains("CHEVRON_TRANSIENT"),
+            "expected opt-out env var check"
+        );
+    }
+
+    #[test]
+    fn zsh_transient_prompt_reflects_exit_status() {
+        let out = init_zsh();
+        assert!(
+            out.contains("%F{green}"),
+            "success path should use green chevron"
+        );
+        assert!(
+            out.contains("%F{red}"),
+            "failure path should use red chevron"
+        );
+    }
+
+    #[test]
+    fn zsh_transient_chains_prior_accept_line_override() {
+        // If another prompt tool (zsh-autosuggest etc.) already wrapped
+        // accept-line, we must call through to it instead of clobbering.
+        let out = init_zsh();
+        assert!(
+            out.contains("_chevron_orig_accept_line"),
+            "should preserve prior accept-line override"
+        );
+        assert!(
+            out.contains("widgets[accept-line]"),
+            "should inspect the existing widget binding"
+        );
     }
 
     #[test]
