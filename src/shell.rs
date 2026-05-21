@@ -12,6 +12,25 @@ _chevron_precmd() {
         duration_ms=${duration_ms%.*}
         unset _chevron_cmd_start
     fi
+    # Post-execution duration tag: if the just-completed command took
+    # longer than the threshold, emit a dim duration line below its
+    # output and above the next prompt. This preserves timing info in
+    # scrollback even after the transient prompt has collapsed. Opt out
+    # via CHEVRON_TRANSIENT=0 (also disables the transient itself);
+    # threshold configurable via CHEVRON_TRANSIENT_DURATION_MS (default
+    # 2000ms). Printed in precmd, so it lands naturally between the
+    # command output and the next PROMPT zsh is about to draw.
+    if [[ "${CHEVRON_TRANSIENT:-1}" != "0" ]] && (( duration_ms >= ${CHEVRON_TRANSIENT_DURATION_MS:-2000} )); then
+        if (( duration_ms >= 60000 )); then
+            local _chevron_mins=$(( duration_ms / 60000 ))
+            local _chevron_rem=$(( (duration_ms % 60000) / 1000 ))
+            printf '\033[2m %dm %ds\033[0m\n' "$_chevron_mins" "$_chevron_rem"
+        else
+            local _chevron_secs=$(( duration_ms / 1000 ))
+            local _chevron_frac=$(( (duration_ms % 1000) / 100 ))
+            printf '\033[2m %d.%ds\033[0m\n' "$_chevron_secs" "$_chevron_frac"
+        fi
+    fi
     local job_count=${(%):-%j}
     local chevron_output
     chevron_output="$(chevron prompt 20 $exit_status $duration_ms $job_count)"
@@ -162,6 +181,42 @@ mod tests {
         assert!(
             out.contains("%F{red}"),
             "failure path should use red chevron"
+        );
+    }
+
+    #[test]
+    fn zsh_emits_duration_tag_for_slow_commands() {
+        let out = init_zsh();
+        assert!(
+            out.contains("CHEVRON_TRANSIENT_DURATION_MS"),
+            "expected configurable duration threshold"
+        );
+        // The dim ANSI escape (CSI 2m) is the marker for the duration line.
+        assert!(
+            out.contains(r"\033[2m"),
+            "duration line should use dim styling"
+        );
+    }
+
+    #[test]
+    fn zsh_duration_tag_respects_minute_threshold() {
+        // For >= 60s commands the format switches to `Xm Ys` so the line
+        // stays compact (`125.0s` is harder to scan than `2m 5s`).
+        let out = init_zsh();
+        assert!(out.contains("60000"), "expected the 60s pivot");
+        assert!(out.contains("%dm %ds"), "expected minutes/seconds format");
+        assert!(out.contains("%d.%ds"), "expected sub-minute decimal format");
+    }
+
+    #[test]
+    fn zsh_duration_tag_disabled_with_transient() {
+        // CHEVRON_TRANSIENT=0 turns off both transient AND duration. The
+        // tag's emission is guarded by the same env check; check the
+        // duration block sits inside that guard.
+        let out = init_zsh();
+        assert!(
+            out.contains(r#"[[ "${CHEVRON_TRANSIENT:-1}" != "0" ]] && (( duration_ms >="#),
+            "duration tag should be guarded by CHEVRON_TRANSIENT"
         );
     }
 
