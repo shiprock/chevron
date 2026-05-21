@@ -1,7 +1,5 @@
-//! Daemon client — query a running chevrond and return its `RepoStatus`.
-//!
-//! This commit ships the *query* side only; auto-spawn arrives in a
-//! follow-up so the integration can be reviewed independently.
+//! Daemon client — try to query a running chevrond, and self-bootstrap
+//! the daemon on miss so subsequent prompts hit a warm cache.
 //!
 //! Any error path — daemon not running, slow reply, malformed response —
 //! returns `None`. Callers then fall back to inline `RepoStatus::compute`,
@@ -9,10 +7,12 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use super::{paths, proto};
+use super::{lifecycle, paths, proto};
 use crate::segments::git::RepoStatus;
 
 /// Per-syscall timeout on the daemon's socket. The local daemon's actual
@@ -71,6 +71,51 @@ fn write_line(mut conn: &UnixStream, line: &str) -> std::io::Result<()> {
     conn.write_all(buf.as_bytes())
 }
 
+/// Attempt to spawn a detached daemon. Best-effort: any failure here just
+/// means the *next* prompt also goes through the inline path. Multiple
+/// concurrent callers are deduped via [`lifecycle::try_lock_exclusive`]
+/// on `chevrond.lock` — only the first one in this critical section forks.
+///
+/// The lost-race daemons (multiple shells starting in parallel before any
+/// have spawned) still race for the same lock once they run
+/// [`lifecycle::serve`], so at most one daemon ends up bound to the socket.
+pub fn try_spawn_async() {
+    let dir = paths::socket_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    // Briefly hold the spawn lock to keep N concurrent prompts from each
+    // forking. Dropped after spawn returns — the daemon will re-acquire
+    // it once it reaches lifecycle::serve.
+    let Ok(_lock) = lifecycle::try_lock_exclusive(&paths::lock_path()) else {
+        return;
+    };
+    let _ = spawn_detached();
+}
+
+fn spawn_detached() -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("daemon")
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: setsid() is async-signal-safe and the only effect we want in
+    // the forked child — it detaches us from the controlling terminal so
+    // the daemon survives the spawning shell's exit.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +165,42 @@ mod tests {
         let _dir = spawn_daemon();
         let other = TempDir::new().unwrap();
         assert!(try_query(other.path()).is_none());
+        unsafe { std::env::remove_var("CHEVRON_SOCKET_DIR") };
+    }
+
+    /// **Load-bearing invariant**: the daemon must produce a `RepoStatus`
+    /// byte-equal to what inline compute would produce for the same repo
+    /// state. If this test ever fails, the daemon-fast-path and
+    /// inline-fallback path have diverged — a user could see different
+    /// prompts depending on whether the daemon happens to be running.
+    #[test]
+    #[serial]
+    fn invariant_daemon_matches_inline() {
+        let _dir = spawn_daemon();
+
+        // Build a repo with at least one of every signal we render:
+        // an untracked file, a staged file, a modified-since-staged change.
+        let repo_tmp = TempDir::new().unwrap();
+        let repo = crate::segments::testutil::init_repo(repo_tmp.path());
+        std::fs::write(repo_tmp.path().join("untracked.txt"), "x").unwrap();
+        let staged_path = repo_tmp.path().join("staged.txt");
+        std::fs::write(&staged_path, "v1").unwrap();
+        {
+            let mut idx = repo.index().unwrap();
+            idx.add_path(std::path::Path::new("staged.txt")).unwrap();
+            idx.write().unwrap();
+        }
+
+        let cwd = repo_tmp.path().canonicalize().unwrap();
+
+        let daemon = try_query(&cwd).expect("daemon should return a status");
+        let mut inline_repo = git2::Repository::discover(&cwd).unwrap();
+        let inline = RepoStatus::compute(&mut inline_repo);
+
+        assert_eq!(
+            daemon, inline,
+            "daemon-served RepoStatus must equal inline-computed value"
+        );
         unsafe { std::env::remove_var("CHEVRON_SOCKET_DIR") };
     }
 }

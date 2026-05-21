@@ -65,10 +65,14 @@ use crate::segments::git::RepoStatus;
 pub fn status_for_cwd(cwd: &Path) -> Option<RepoStatus> {
     let canon = cwd.canonicalize().ok()?;
     #[cfg(feature = "daemon")]
-    if std::env::var_os("CHEVRON_NO_DAEMON").is_none()
-        && let Some(s) = client::try_query(&canon)
-    {
-        return Some(s);
+    if std::env::var_os("CHEVRON_NO_DAEMON").is_none() {
+        if let Some(s) = client::try_query(&canon) {
+            return Some(s);
+        }
+        // Miss. Inline-compute below to give the current prompt a result,
+        // and kick off a detached daemon spawn so the *next* prompt is
+        // served from cache. Best-effort, non-blocking.
+        client::try_spawn_async();
     }
     let mut repo = git2::Repository::discover(&canon).ok()?;
     Some(RepoStatus::compute(&mut repo))

@@ -69,10 +69,13 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+            Some("start") => {
+                chevron::daemon::client::try_spawn_async();
+            }
             Some("stop") => std::process::exit(chevron::daemon::lifecycle::stop()),
             Some("status") => std::process::exit(chevron::daemon::lifecycle::status()),
             _ => {
-                eprintln!("Usage: chevron daemon <serve|stop|status>");
+                eprintln!("Usage: chevron daemon <serve|start|stop|status>");
                 std::process::exit(1);
             }
         },
