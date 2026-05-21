@@ -240,6 +240,78 @@ fn prompt_in_tmux_produces_two_lines() {
     );
 }
 
+#[test]
+fn prompt_writes_cache_file_when_env_set() {
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    let cwd = tmp.path().canonicalize().unwrap();
+    let cache = tmp.path().join("cache").join("last-prompt");
+
+    let output = cmd()
+        .args(["prompt", "20", "0", "0", "0"])
+        .current_dir(&cwd)
+        .env("HOME", "/nonexistent")
+        .env("CHEVRON_CACHE_FILE", &cache)
+        .env_remove("IN_NIX_SHELL")
+        .env_remove("AWS_PROFILE")
+        .env_remove("VIRTUAL_ENV")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let printed = String::from_utf8_lossy(&output).to_string();
+
+    assert!(cache.exists(), "cache file should be created");
+    let cached = std::fs::read_to_string(&cache).unwrap();
+    let (cached_cwd, cached_body) = cached.split_once('\n').unwrap();
+    assert_eq!(
+        cached_cwd,
+        cwd.to_string_lossy(),
+        "first line of cache must be the cwd at render time"
+    );
+    assert_eq!(
+        cached_body, printed,
+        "cache body must byte-match the prompt that was printed"
+    );
+}
+
+#[test]
+fn prompt_cache_write_is_atomic_via_tmp_rename() {
+    // Verify the .tmp staging file doesn't linger after a successful write.
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    let cache = tmp.path().join("cache.dat");
+
+    cmd()
+        .args(["prompt", "20", "0", "0", "0"])
+        .current_dir(tmp.path())
+        .env("CHEVRON_CACHE_FILE", &cache)
+        .env_remove("IN_NIX_SHELL")
+        .assert()
+        .success();
+
+    assert!(cache.exists());
+    assert!(
+        !tmp.path().join("cache.tmp").exists(),
+        ".tmp staging file should have been renamed"
+    );
+}
+
+#[test]
+fn prompt_works_without_cache_env_var() {
+    // Sanity: with CHEVRON_CACHE_FILE unset, prompt rendering is unaffected.
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    cmd()
+        .args(["prompt", "20", "0", "0", "0"])
+        .current_dir(tmp.path())
+        .env_remove("CHEVRON_CACHE_FILE")
+        .env_remove("IN_NIX_SHELL")
+        .assert()
+        .success();
+}
+
 // ── tmux-title ───────────────────────────────────────────────────────────────
 
 #[test]

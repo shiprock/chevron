@@ -37,10 +37,18 @@ fn main() {
             let raw = segments::prompt::render(&mut ctx);
             let shell = env::var("CHEVRON_SHELL").unwrap_or_default();
             // Only the prompt line gets escape wrapping; tmux title is plain.
-            if let Some((prompt, title)) = raw.split_once('\n') {
-                print!("{}\n{}", color::wrap_for_shell(&shell, prompt), title);
+            let printed = if let Some((prompt, title)) = raw.split_once('\n') {
+                format!("{}\n{}", color::wrap_for_shell(&shell, prompt), title)
             } else {
-                print!("{}", color::wrap_for_shell(&shell, &raw));
+                color::wrap_for_shell(&shell, &raw)
+            };
+            print!("{printed}");
+            // Async fast path (chevron-7fs.5): when CHEVRON_CACHE_FILE is
+            // set, write the rendered prompt to that path so the next
+            // precmd can `cat` it instead of forking us again. The shell's
+            // init script populates this var when CHEVRON_ASYNC=1.
+            if let Ok(cache_path) = env::var("CHEVRON_CACHE_FILE") {
+                write_prompt_cache(&cache_path, &printed);
             }
         }
         Some("tmux-title") => {
@@ -114,5 +122,37 @@ fn main() {
             eprintln!("Usage: chevron <{}>", features.join("|"));
             std::process::exit(1);
         }
+    }
+}
+
+/// Async fast-path support: write the rendered prompt to `cache_path` so
+/// the shell's `precmd` can re-use it on the next prompt without forking
+/// chevron. Format is two parts separated by `\n`:
+///
+/// ```text
+/// <current working directory>
+/// <rendered prompt output, exactly as printed to stdout>
+/// ```
+///
+/// On read, the shell checks the first line against `$PWD` — a mismatch
+/// means the cache is for some other directory and the shell should fall
+/// through to a synchronous render.
+///
+/// Writes are atomic (write to `.tmp`, then `rename`) so a concurrent
+/// reader either sees the previous content or the new content, never a
+/// torn write. All failures are silent: the cache is best-effort, and a
+/// failed write just means the next prompt pays the sync cost.
+fn write_prompt_cache(cache_path: &str, printed: &str) {
+    let path = Path::new(cache_path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    let payload = format!("{}\n{printed}", cwd.display());
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, payload).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
