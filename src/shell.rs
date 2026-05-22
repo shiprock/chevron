@@ -10,6 +10,14 @@ pub fn init_zsh() -> &'static str {
     # navigation, grouping, and "copy output only". Older terminals
     # silently ignore unknown OSC sequences.
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;C\a'
+    # DECSC: save cursor position for the precmd transient-colour
+    # rewrite. At preexec time the transient has actually been painted
+    # (unlike inside the accept-line widget, where ZLE buffers the
+    # redraw and our save would land at the pre-collapse position) and
+    # the cursor sits one line below the transient. precmd does \e8
+    # (DECRC) + \e[A to step up onto the transient line.
+    printf '\e7' > /dev/tty 2>/dev/null
+    _chevron_transient_pending=1
 }
 _chevron_precmd() {
     local exit_status=$?
@@ -17,16 +25,17 @@ _chevron_precmd() {
     # Emitted first so it closes out the previous command region before
     # we print the duration tag and next prompt's A marker.
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;D;%d\a' $exit_status
-    # Color-correct the transient prompt (chevron-4xq). accept-line drew
-    # a neutral chevron because $exit_status wasn't known yet; rewrite
-    # that line now with the right colour:
-    #   \e[s   SCOSC: stash current cursor (next-prompt row).
-    #   \e8    DECRC: jump to the cursor saved at accept-line (end of
-    #          the transient line).
-    #   \r\e[2K  reset to col 0 and erase the line.
+    # Color-correct the transient prompt (chevron-4xq). preexec saved
+    # the cursor at the line BELOW the painted transient; this rewrites
+    # the transient line itself with the now-known exit-status colour.
+    #   \e[s    SCOSC: stash current cursor (next-prompt row, where
+    #           zsh will draw PROMPT after precmd returns).
+    #   \e8     DECRC: jump to preexec's saved position (line below the
+    #           transient).
+    #   \e[A\r  step UP one row onto the transient line, return to col 0.
+    #   \e[2K   erase that line.
     #   \e[3<n>m❯ \e[0m <cmd>   redraw with the exit-status colour.
-    #   \e[u   SCORC: jump back to the next-prompt row so zsh's main
-    #          loop renders PROMPT where it belongs.
+    #   \e[u    SCORC: jump back to the next-prompt row.
     # Known limitations:
     #   - Commands that themselves do DECSC/DECRC (vim, less, man, any
     #     alt-screen app) overwrite our save; the rewrite skips silently
@@ -35,6 +44,8 @@ _chevron_precmd() {
     #   - Commands whose output scrolls the screen past the transient
     #     line: the saved row is no longer the transient row; rewrite
     #     lands on whatever line is at that absolute row now. Glitch.
+    #   - Multi-line input or wrapped input: \e[A only steps up one row,
+    #     so only the last visible row of the transient gets rewritten.
     if [[ -n "$_chevron_transient_pending" && "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
         local _chevron_color_code
         if (( exit_status == 0 )); then
@@ -51,7 +62,7 @@ _chevron_precmd() {
             _chevron_osc_a=$'\e]133;A\a'
             _chevron_osc_b=$'\e]133;B\a'
         fi
-        printf '\e[s\e8\r\e[2K%s\e[3%dm❯\e[0m %s%s\e[u' \
+        printf '\e[s\e8\e[A\r\e[2K%s\e[3%dm❯\e[0m %s%s\e[u' \
             "$_chevron_osc_a" "$_chevron_color_code" \
             "$_chevron_osc_b" "$_chevron_rewrite_cmd" > /dev/tty 2>/dev/null
         unset _chevron_transient_pending
@@ -164,13 +175,11 @@ _chevron_accept_line() {
     _chevron_make_prompt "${_chevron_transient_prompt% }"
     PROMPT="$REPLY"
     zle .reset-prompt
-    # DECSC saves cursor position at end of the transient line. precmd
-    # uses this (via \e8) to jump back here and rewrite the chevron with
-    # the now-known exit-status colour. Writing to /dev/tty bypasses
-    # ZLE's redraw bookkeeping — ZLE doesn't track the terminal's saved-
-    # cursor slot so this stays consistent with its view.
-    printf '\e7' > /dev/tty 2>/dev/null
-    _chevron_transient_pending=1
+    # NOTE: cursor save for the precmd color-correction is done in
+    # _chevron_preexec, not here. Saving inside the widget runs BEFORE
+    # ZLE actually paints the transient (the redraw is buffered until
+    # the widget unwinds), so a save here would land at the pre-collapse
+    # cursor position and DECRC would later restore to the wrong line.
     # Chain through any prior accept-line override (zsh-autosuggest, etc.)
     # if one exists; otherwise fall back to the built-in.
     if [[ -n "$_chevron_orig_accept_line" ]]; then
@@ -287,11 +296,11 @@ pub fn init_fish() -> &'static str {
         set -e _chevron_transient_show
         # Neutral chevron — the colour gets corrected in fish_postexec
         # once the exit status is actually known. See chevron-4xq.
+        # Cursor save for the postexec rewrite happens in fish_preexec
+        # below, after the transient is actually painted.
         test "$CHEVRON_OSC133" != "0"; and printf '\e]133;A\a'
         echo -n '❯ '
         test "$CHEVRON_OSC133" != "0"; and printf '\e]133;B\a'
-        # DECSC: save cursor for fish_postexec's color correction.
-        printf '\e7' > /dev/tty 2>/dev/null
         set -g _chevron_transient_pending 1
         return
     end
@@ -314,9 +323,13 @@ pub fn init_fish() -> &'static str {
 end
 
 # Pre-execution: emit OSC 133 C so the terminal knows command output is
-# about to start.
+# about to start, and save cursor for the postexec transient-color
+# rewrite (chevron-4xq). At preexec time the transient has been painted
+# (fish_prompt + commandline -f repaint completed) and the cursor sits
+# one line below the transient.
 function _chevron_preexec --on-event fish_preexec
     test "$CHEVRON_OSC133" != "0"; and printf '\e]133;C\a'
+    printf '\e7' > /dev/tty 2>/dev/null
 end
 
 # Post-execution duration tag: fish exposes $CMD_DURATION directly, so we
@@ -341,7 +354,7 @@ function _chevron_postexec --on-event fish_postexec
             set osc_a \e\]133\;A\a
             set osc_b \e\]133\;B\a
         end
-        printf '\e[s\e8\r\e[2K%s\e[3%dm❯\e[0m %s%s\e[u' \
+        printf '\e[s\e8\e[A\r\e[2K%s\e[3%dm❯\e[0m %s%s\e[u' \
             "$osc_a" $color_code "$osc_b" "$rewrite_cmd" > /dev/tty 2>/dev/null
     end
     test "$CHEVRON_TRANSIENT" = "0"; and return
@@ -433,25 +446,44 @@ mod tests {
     }
 
     #[test]
-    fn zsh_accept_line_saves_cursor_for_precmd_rewrite() {
+    fn zsh_preexec_saves_cursor_for_precmd_rewrite() {
+        // The save MUST be in preexec, not the accept-line widget.
+        // Saving inside the widget runs before ZLE actually paints
+        // the transient (the redraw is buffered until the widget
+        // unwinds), so the save lands at the pre-collapse position
+        // and DECRC later restores to the wrong line.
         let out = init_zsh();
         assert!(
             out.contains(r"printf '\e7' > /dev/tty 2>/dev/null"),
-            "accept-line must DECSC-save cursor so precmd can rewrite later"
+            "preexec must DECSC-save cursor so precmd can rewrite later"
         );
         assert!(
             out.contains("_chevron_transient_pending=1"),
             "should set pending flag so precmd knows to rewrite"
+        );
+        // And it should NOT be inside _chevron_accept_line.
+        let widget_start = out.find("_chevron_accept_line() {").unwrap();
+        let widget_end = out[widget_start..]
+            .find("\n}\n")
+            .map(|i| widget_start + i)
+            .unwrap();
+        let widget_body = &out[widget_start..widget_end];
+        assert!(
+            !widget_body.contains("printf '\\e7'"),
+            "save must NOT be in the accept-line widget — ZLE buffers the redraw"
         );
     }
 
     #[test]
     fn zsh_precmd_color_corrects_via_cursor_rewrite() {
         let out = init_zsh();
-        // SCOSC + DECRC + erase + colored chevron + cmd + SCORC sequence.
+        // SCOSC + DECRC + up-one + CR + erase + colored chevron + SCORC.
+        // The \e[A step matters: preexec saved at the line BELOW the
+        // transient, so we need to move up onto the transient line
+        // before erasing.
         assert!(
-            out.contains(r"\e[s\e8\r\e[2K"),
-            "precmd should SCOSC, DECRC, CR, erase line"
+            out.contains(r"\e[s\e8\e[A\r\e[2K"),
+            "precmd should SCOSC, DECRC, cursor-up, CR, erase line"
         );
         assert!(
             out.contains(r"\e[3%dm❯\e[0m"),
@@ -834,20 +866,31 @@ mod tests {
 
     #[test]
     fn fish_postexec_color_corrects_transient_via_cursor_rewrite() {
-        // chevron-4xq: fish_postexec needs to SCOSC + DECRC + erase +
-        // colored chevron + SCORC to fix the off-by-one we used to have
-        // when the transient branch tried to colour the chevron from the
-        // previous command's exit.
+        // chevron-4xq: fish_postexec needs to SCOSC + DECRC + step-up +
+        // erase + colored chevron + SCORC. Cursor save lives in
+        // fish_preexec (after the transient is painted), so postexec's
+        // DECRC restores to the line BELOW the transient and \e[A
+        // walks up onto it.
         let out = init_fish();
         assert!(
-            out.contains(r"\e[s\e8\r\e[2K"),
-            "postexec should SCOSC, DECRC, CR, erase line"
+            out.contains(r"\e[s\e8\e[A\r\e[2K"),
+            "postexec should SCOSC, DECRC, up-one, CR, erase line"
         );
         assert!(out.contains(r"\e[3%dm❯\e[0m"), "colour + chevron + reset");
         assert!(out.contains(r"\e[u"), "should SCORC restore");
         assert!(
             out.contains("set -g _chevron_transient_pending 1"),
             "fish_prompt's transient branch should set the pending flag"
+        );
+        // Save must be in fish_preexec, not fish_prompt's transient branch.
+        let preexec_start = out.find("function _chevron_preexec").unwrap();
+        let preexec_end = out[preexec_start..]
+            .find("\nend\n")
+            .map(|i| preexec_start + i)
+            .unwrap();
+        assert!(
+            out[preexec_start..preexec_end].contains(r"printf '\e7'"),
+            "fish_preexec must contain the DECSC save"
         );
     }
 
