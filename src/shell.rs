@@ -11,12 +11,21 @@ pub fn init_zsh() -> &'static str {
     # silently ignore unknown OSC sequences.
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;C\a'
     # Save the cursor's absolute row (via DSR) for the precmd transient-
-    # colour rewrite. preexec fires AFTER ZLE's accept-line newline,
-    # so the cursor is on the row just below the painted transient.
-    # We use DSR + absolute positioning rather than DECSC/DECRC because
-    # some terminals (especially under tmux) silently drop \e8.
+    # colour rewrite. preexec fires AFTER ZLE handed control back to
+    # outside mode (echo restored), so we MUST disable echo around the
+    # DSR query — otherwise the kernel echoes the response bytes
+    # (`^[[N;NR`) to stdout, where they leak into the upcoming
+    # command's output. We save and restore the full stty state to
+    # avoid stomping anything else the user set.
     if [[ "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
+        local _chevron_stty=$(stty -g 2>/dev/null)
+        # Both -echo (suppress kernel echo) AND -icanon (drop line-mode
+        # buffering) — line-mode could otherwise echo control bytes via
+        # echoctl regardless of the -echo flag. min/time:0/1 makes read
+        # see bytes as they arrive instead of waiting for a line.
+        stty -echo -icanon min 0 time 0 2>/dev/null
         _chevron_query_row
+        [[ -n "$_chevron_stty" ]] && stty "$_chevron_stty" 2>/dev/null
         _chevron_transient_save_row="$REPLY"
     fi
 }
