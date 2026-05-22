@@ -85,7 +85,24 @@ _chevron_precmd() {
             local _chevron_R_saved="$_chevron_transient_save_row"
             local _chevron_R_transient=$(( _chevron_R_saved - 1 ))
             local _chevron_delta=$(( _chevron_R_current - _chevron_R_saved ))
-            if (( _chevron_R_transient > 0 && _chevron_delta >= 0 && _chevron_delta < 200 )); then
+            local _chevron_lines=${LINES:-24}
+            local _chevron_available=$(( _chevron_lines - _chevron_R_saved ))
+            # Scroll detection: any of these means the saved row is
+            # no longer the transient line.
+            #   - R_saved at/past bottom: any output scrolled.
+            #   - R_current at/past bottom: cursor clamped because the
+            #     command exceeded screen height. delta looks safe but
+            #     is bogus.
+            #   - delta > available: output ran past the bottom edge.
+            # Leaving the chevron neutral in those cases is honest;
+            # streaming commands (ps, ls of huge dirs, cargo build)
+            # commonly trigger one of these and the user gets a clean
+            # gray chevron without a glitched rewrite.
+            if (( _chevron_R_transient > 0 \
+                && _chevron_R_saved < _chevron_lines \
+                && _chevron_R_current < _chevron_lines \
+                && _chevron_delta >= 0 \
+                && _chevron_delta <= _chevron_available )); then
                 local _chevron_color_code
                 if (( exit_status == 0 )); then
                     _chevron_color_code=2
