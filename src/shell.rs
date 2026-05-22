@@ -17,6 +17,45 @@ _chevron_precmd() {
     # Emitted first so it closes out the previous command region before
     # we print the duration tag and next prompt's A marker.
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;D;%d\a' $exit_status
+    # Color-correct the transient prompt (chevron-4xq). accept-line drew
+    # a neutral chevron because $exit_status wasn't known yet; rewrite
+    # that line now with the right colour:
+    #   \e[s   SCOSC: stash current cursor (next-prompt row).
+    #   \e8    DECRC: jump to the cursor saved at accept-line (end of
+    #          the transient line).
+    #   \r\e[2K  reset to col 0 and erase the line.
+    #   \e[3<n>m❯ \e[0m <cmd>   redraw with the exit-status colour.
+    #   \e[u   SCORC: jump back to the next-prompt row so zsh's main
+    #          loop renders PROMPT where it belongs.
+    # Known limitations:
+    #   - Commands that themselves do DECSC/DECRC (vim, less, man, any
+    #     alt-screen app) overwrite our save; the rewrite skips silently
+    #     and the user sees the neutral chevron — incorrect colour but
+    #     not actively misleading.
+    #   - Commands whose output scrolls the screen past the transient
+    #     line: the saved row is no longer the transient row; rewrite
+    #     lands on whatever line is at that absolute row now. Glitch.
+    if [[ -n "$_chevron_transient_pending" && "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
+        local _chevron_color_code
+        if (( exit_status == 0 )); then
+            _chevron_color_code=2
+        else
+            _chevron_color_code=1
+        fi
+        # Cmd may be multi-line; rewrite only the first line so we don't
+        # write past the column we landed on.
+        local _chevron_rewrite_cmd="${_chevron_cmd_title%%$'\n'*}"
+        local _chevron_osc_a=""
+        local _chevron_osc_b=""
+        if [[ "${CHEVRON_OSC133:-1}" != "0" ]]; then
+            _chevron_osc_a=$'\e]133;A\a'
+            _chevron_osc_b=$'\e]133;B\a'
+        fi
+        printf '\e[s\e8\r\e[2K%s\e[3%dm❯\e[0m %s%s\e[u' \
+            "$_chevron_osc_a" "$_chevron_color_code" \
+            "$_chevron_osc_b" "$_chevron_rewrite_cmd" > /dev/tty 2>/dev/null
+        unset _chevron_transient_pending
+    fi
     local duration_ms=0
     if [[ -n "$_chevron_cmd_start" ]]; then
         duration_ms=$(( ($EPOCHREALTIME - _chevron_cmd_start) * 1000 ))
@@ -71,14 +110,11 @@ _chevron_precmd() {
     fi
     _chevron_make_prompt "${chevron_output%%$'\n'*}"
     PROMPT="$REPLY"
-    # Stash transient prompt for the accept-line widget. Colour reflects
-    # the just-completed command's exit status, so scrollback retains a
-    # visual cue (green/red chevron) even after the full prompt collapses.
-    if (( exit_status == 0 )); then
-        _chevron_transient_prompt='%F{green}❯%f '
-    else
-        _chevron_transient_prompt='%F{red}❯%f '
-    fi
+    # Transient stub for accept-line. Rendered neutrally (no green/red)
+    # because at accept-line time we can't know the about-to-run
+    # command's exit status. precmd does the color correction in place
+    # via the cursor-rewrite block above, once the exit is known.
+    _chevron_transient_prompt='❯ '
     if [[ -n "$TMUX" && "$chevron_output" == *$'\n'* ]]; then
         local tmux_title="${chevron_output#*$'\n'}"
         local priority=$(tmux show-options -w -v @priority_title 2>/dev/null)
@@ -128,6 +164,13 @@ _chevron_accept_line() {
     _chevron_make_prompt "${_chevron_transient_prompt% }"
     PROMPT="$REPLY"
     zle .reset-prompt
+    # DECSC saves cursor position at end of the transient line. precmd
+    # uses this (via \e8) to jump back here and rewrite the chevron with
+    # the now-known exit-status colour. Writing to /dev/tty bypasses
+    # ZLE's redraw bookkeeping — ZLE doesn't track the terminal's saved-
+    # cursor slot so this stays consistent with its view.
+    printf '\e7' > /dev/tty 2>/dev/null
+    _chevron_transient_pending=1
     # Chain through any prior accept-line override (zsh-autosuggest, etc.)
     # if one exists; otherwise fall back to the built-in.
     if [[ -n "$_chevron_orig_accept_line" ]]; then
@@ -242,17 +285,14 @@ pub fn init_fish() -> &'static str {
     # so the next full prompt (after the command runs) renders normally.
     if set -q _chevron_transient_show
         set -e _chevron_transient_show
-        set -l last_exit 0
-        set -q _chevron_last_exit; and set last_exit $_chevron_last_exit
+        # Neutral chevron — the colour gets corrected in fish_postexec
+        # once the exit status is actually known. See chevron-4xq.
         test "$CHEVRON_OSC133" != "0"; and printf '\e]133;A\a'
-        if test $last_exit -eq 0
-            set_color green
-        else
-            set_color red
-        end
         echo -n '❯ '
-        set_color normal
         test "$CHEVRON_OSC133" != "0"; and printf '\e]133;B\a'
+        # DECSC: save cursor for fish_postexec's color correction.
+        printf '\e7' > /dev/tty 2>/dev/null
+        set -g _chevron_transient_pending 1
         return
     end
 
@@ -286,6 +326,24 @@ function _chevron_postexec --on-event fish_postexec
     set -l exit_status $status
     # OSC 133 D: previous command finished.
     test "$CHEVRON_OSC133" != "0"; and printf '\e]133;D;%d\a' $exit_status
+    # Color-correct the transient prompt (chevron-4xq). The transient
+    # branch of fish_prompt drew a neutral chevron and saved cursor with
+    # \e7; now that we know $exit_status, jump back and rewrite. See
+    # the zsh implementation for full rationale + edge-case notes.
+    if set -q _chevron_transient_pending; and test "$CHEVRON_TRANSIENT" != "0"
+        set -e _chevron_transient_pending
+        set -l color_code 2
+        test $exit_status -ne 0; and set color_code 1
+        set -l rewrite_cmd (string split -m 1 \n -- $argv[1])[1]
+        set -l osc_a ""
+        set -l osc_b ""
+        if test "$CHEVRON_OSC133" != "0"
+            set osc_a \e\]133\;A\a
+            set osc_b \e\]133\;B\a
+        end
+        printf '\e[s\e8\r\e[2K%s\e[3%dm❯\e[0m %s%s\e[u' \
+            "$osc_a" $color_code "$osc_b" "$rewrite_cmd" > /dev/tty 2>/dev/null
+    end
     test "$CHEVRON_TRANSIENT" = "0"; and return
     set -l threshold $CHEVRON_TRANSIENT_DURATION_MS
     test -z "$threshold"; and set threshold 2000
@@ -359,15 +417,49 @@ mod tests {
     }
 
     #[test]
-    fn zsh_transient_prompt_reflects_exit_status() {
+    fn zsh_transient_initial_render_is_neutral() {
+        // The accept-line widget draws a neutral chevron because exit
+        // status isn't known yet at collapse time. precmd rewrites with
+        // colour once the command finishes (chevron-4xq).
         let out = init_zsh();
         assert!(
-            out.contains("%F{green}"),
-            "success path should use green chevron"
+            out.contains("_chevron_transient_prompt='❯ '"),
+            "transient prompt should be a plain chevron, no %F{{...}} colour"
         );
         assert!(
-            out.contains("%F{red}"),
-            "failure path should use red chevron"
+            !out.contains("_chevron_transient_prompt='%F{green}"),
+            "no exit-based colour stashed (that was the off-by-one bug)"
+        );
+    }
+
+    #[test]
+    fn zsh_accept_line_saves_cursor_for_precmd_rewrite() {
+        let out = init_zsh();
+        assert!(
+            out.contains(r"printf '\e7' > /dev/tty 2>/dev/null"),
+            "accept-line must DECSC-save cursor so precmd can rewrite later"
+        );
+        assert!(
+            out.contains("_chevron_transient_pending=1"),
+            "should set pending flag so precmd knows to rewrite"
+        );
+    }
+
+    #[test]
+    fn zsh_precmd_color_corrects_via_cursor_rewrite() {
+        let out = init_zsh();
+        // SCOSC + DECRC + erase + colored chevron + cmd + SCORC sequence.
+        assert!(
+            out.contains(r"\e[s\e8\r\e[2K"),
+            "precmd should SCOSC, DECRC, CR, erase line"
+        );
+        assert!(
+            out.contains(r"\e[3%dm❯\e[0m"),
+            "should emit colour code + chevron + reset"
+        );
+        assert!(
+            out.contains(r"\e[u"),
+            "should SCORC restore to pre-rewrite cursor"
         );
     }
 
@@ -738,9 +830,25 @@ mod tests {
             out.contains("set -e _chevron_transient_show"),
             "transient branch must unset the flag so the next full prompt isn't transient too"
         );
-        // Green/red branch on exit status.
-        assert!(out.contains("set_color green"));
-        assert!(out.contains("set_color red"));
+    }
+
+    #[test]
+    fn fish_postexec_color_corrects_transient_via_cursor_rewrite() {
+        // chevron-4xq: fish_postexec needs to SCOSC + DECRC + erase +
+        // colored chevron + SCORC to fix the off-by-one we used to have
+        // when the transient branch tried to colour the chevron from the
+        // previous command's exit.
+        let out = init_fish();
+        assert!(
+            out.contains(r"\e[s\e8\r\e[2K"),
+            "postexec should SCOSC, DECRC, CR, erase line"
+        );
+        assert!(out.contains(r"\e[3%dm❯\e[0m"), "colour + chevron + reset");
+        assert!(out.contains(r"\e[u"), "should SCORC restore");
+        assert!(
+            out.contains("set -g _chevron_transient_pending 1"),
+            "fish_prompt's transient branch should set the pending flag"
+        );
     }
 
     #[test]
