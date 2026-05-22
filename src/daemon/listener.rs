@@ -103,6 +103,22 @@ pub fn handle_connection(conn: UnixStream, state_tx: &Sender<StateMsg>) {
                     return;
                 }
             }
+            Request::CmdStart(event) => {
+                // Fire-and-forget into the state actor's queue. ACK as
+                // soon as the message is dispatched — durability is
+                // guaranteed only up to the actor's last commit
+                // (synchronous=NORMAL + WAL), which is fine for Phase 1.
+                let _ = state_tx.send(StateMsg::CmdStart(event));
+                if send_resp(&conn, &Response::Ack).is_err() {
+                    return;
+                }
+            }
+            Request::CmdEnd(event) => {
+                let _ = state_tx.send(StateMsg::CmdEnd(event));
+                if send_resp(&conn, &Response::Ack).is_err() {
+                    return;
+                }
+            }
         }
     }
 }
@@ -231,7 +247,8 @@ mod tests {
     fn spawn_handler() -> (Client, Sender<StateMsg>, std::thread::JoinHandle<()>) {
         let (a, b) = UnixStream::pair().unwrap();
         a.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let (state_tx, _state_join) = state::spawn(state::TTL).unwrap();
+        let db = state::open_memory_db().unwrap();
+        let (state_tx, _state_join) = state::spawn(state::TTL, db).unwrap();
         let tx_for_handler = state_tx.clone();
         let join = std::thread::spawn(move || handle_connection(b, &tx_for_handler));
         (Client::new(a), state_tx, join)

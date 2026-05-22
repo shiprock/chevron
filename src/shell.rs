@@ -28,6 +28,17 @@ pub fn init_zsh() -> &'static str {
         [[ -n "$_chevron_stty" ]] && stty "$_chevron_stty" 2>/dev/null
         _chevron_transient_save_row="$REPLY"
     fi
+    # Command lifecycle hook (chevron-1yn): publish to chevrond so the
+    # query CLI and live segments can consume the history. Disabled by
+    # CHEVRON_HISTORY=0; skipped for empty commands and for commands
+    # that begin with a space (HISTCONTROL=ignorespace discipline — the
+    # convention for transient secrets). cmd-start prints a ULID we
+    # stash in _chevron_cmd_id, then precmd uses that to emit cmd-end.
+    if [[ "${CHEVRON_HISTORY:-1}" != "0" && -n "$1" && "$1" != " "* ]]; then
+        _chevron_cmd_id=$(chevron event cmd-start "$_chevron_session_id" "$PWD" "$1")
+    else
+        unset _chevron_cmd_id
+    fi
 }
 # Query the current cursor row via DSR (\e[6n). Stores the row in REPLY
 # (empty on failure). One `read -d 'R'` call instead of a per-byte loop
@@ -132,6 +143,16 @@ _chevron_precmd() {
         duration_ms=$(( ($EPOCHREALTIME - _chevron_cmd_start) * 1000 ))
         duration_ms=${duration_ms%.*}
         unset _chevron_cmd_start
+    fi
+    # Command lifecycle finish event (chevron-1yn). Mirror of cmd-start
+    # in preexec: only emitted when preexec stashed an id (i.e.
+    # CHEVRON_HISTORY enabled and the command wasn't ignorespace'd).
+    # Synchronous like cmd-start — the chevron binary's UDS publish
+    # path is bounded at ~25 ms, comparable to the prompt-render fork
+    # already in this function.
+    if [[ -n "$_chevron_cmd_id" ]]; then
+        chevron event cmd-end "$_chevron_cmd_id" "$exit_status" "$duration_ms"
+        unset _chevron_cmd_id
     fi
     # Post-execution duration tag: if the just-completed command took
     # longer than the threshold, emit a dim duration line below its
@@ -276,6 +297,13 @@ if [[ "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
     fi
     zle -N accept-line _chevron_accept_line
 fi
+# Session id for the command-lifecycle hooks (chevron-1yn). Minted once
+# at init so every command from this shell shares it; sub-shells get
+# their own. Stays unset when CHEVRON_HISTORY=0 so the preexec/precmd
+# bookkeeping short-circuits without forking.
+if [[ "${CHEVRON_HISTORY:-1}" != "0" && -z "$_chevron_session_id" ]]; then
+    _chevron_session_id=$(chevron event new-session 2>/dev/null)
+fi
 "#
 }
 
@@ -293,6 +321,19 @@ pub fn init_bash() -> &'static str {
     _chevron_cmd_start=${_chevron_cmd_start:-$EPOCHREALTIME}
     # OSC 133 C: command output is about to start.
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;C\a'
+    # Command lifecycle hook (chevron-1yn). $BASH_COMMAND is the literal
+    # of the next command bash is about to run via the DEBUG trap. Skip
+    # the publish when CHEVRON_HISTORY=0, when $BASH_COMMAND is empty,
+    # and when it begins with a space (the HISTCONTROL=ignorespace
+    # convention) — matching the zsh/fish opt-out shape. Bash fires the
+    # DEBUG trap once per simple command in a pipeline; we only stash
+    # an id for the first one and rely on cmd-end in precmd to close it.
+    if [[ "${CHEVRON_HISTORY:-1}" != "0" \
+        && -n "$BASH_COMMAND" \
+        && "$BASH_COMMAND" != " "* \
+        && -z "$_chevron_cmd_id" ]]; then
+        _chevron_cmd_id=$(chevron event cmd-start "$_chevron_session_id" "$PWD" "$BASH_COMMAND")
+    fi
 }
 _chevron_precmd() {
     local exit_status=$?
@@ -303,6 +344,15 @@ _chevron_precmd() {
     if [[ -n "$_chevron_cmd_start" ]]; then
         duration_ms=$(LC_ALL=C awk "BEGIN { printf \"%d\", ($EPOCHREALTIME - $_chevron_cmd_start) * 1000 }")
         unset _chevron_cmd_start
+    fi
+    # Command lifecycle finish event (chevron-1yn). Bash counterpart of
+    # the zsh precmd cmd-end emission — exit_status and duration_ms are
+    # already computed above. _chevron_cmd_id is left unset by preexec
+    # when CHEVRON_HISTORY=0 or for ignorespace'd commands, so this
+    # silently skips in those cases.
+    if [[ -n "$_chevron_cmd_id" ]]; then
+        chevron event cmd-end "$_chevron_cmd_id" "$exit_status" "$duration_ms"
+        unset _chevron_cmd_id
     fi
     # Post-execution duration tag: a dim line shown between command output
     # and the next prompt when the command exceeded the threshold (default
@@ -342,6 +392,12 @@ _chevron_precmd() {
 }
 trap '_chevron_preexec' DEBUG
 PROMPT_COMMAND=_chevron_precmd
+# Session id for the command-lifecycle hooks (chevron-1yn). One per
+# shell process; stays unset when CHEVRON_HISTORY=0 so the trap/PROMPT_COMMAND
+# bookkeeping short-circuits without forking.
+if [[ "${CHEVRON_HISTORY:-1}" != "0" && -z "$_chevron_session_id" ]]; then
+    _chevron_session_id=$(chevron event new-session 2>/dev/null)
+fi
 "#
 }
 
@@ -388,6 +444,15 @@ end
 # about to start.
 function _chevron_preexec --on-event fish_preexec
     test "$CHEVRON_OSC133" != "0"; and printf '\e]133;C\a'
+    # Command lifecycle hook (chevron-1yn). fish_preexec passes the
+    # literal command line as $argv[1]. Skip when CHEVRON_HISTORY=0,
+    # empty cmd, or leading-space (ignorespace convention).
+    set -e _chevron_cmd_id
+    if test "$CHEVRON_HISTORY" != "0"
+        and test -n "$argv[1]"
+        and not string match -q ' *' -- "$argv[1]"
+        set -g _chevron_cmd_id (chevron event cmd-start "$_chevron_session_id" "$PWD" "$argv[1]")
+    end
 end
 
 # Post-execution duration tag: fish exposes $CMD_DURATION directly, so we
@@ -397,6 +462,13 @@ function _chevron_postexec --on-event fish_postexec
     set -l exit_status $status
     # OSC 133 D: previous command finished.
     test "$CHEVRON_OSC133" != "0"; and printf '\e]133;D;%d\a' $exit_status
+    # Command lifecycle finish event (chevron-1yn). Mirrors fish_preexec:
+    # only emit if cmd-start stashed an id (history enabled, non-empty,
+    # non-ignorespace command). $CMD_DURATION is in ms already.
+    if set -q _chevron_cmd_id
+        chevron event cmd-end "$_chevron_cmd_id" "$exit_status" "$CMD_DURATION"
+        set -e _chevron_cmd_id
+    end
     test "$CHEVRON_TRANSIENT" = "0"; and return
     set -l threshold $CHEVRON_TRANSIENT_DURATION_MS
     test -z "$threshold"; and set threshold 2000
@@ -425,6 +497,12 @@ end
 if test "$CHEVRON_TRANSIENT" != "0"
     bind \r _chevron_transient_enter
     bind \n _chevron_transient_enter
+end
+# Session id for the command-lifecycle hooks (chevron-1yn). Once per
+# fish process; stays unset when CHEVRON_HISTORY=0 so the hooks
+# short-circuit without forking.
+if test "$CHEVRON_HISTORY" != "0"; and not set -q _chevron_session_id
+    set -g _chevron_session_id (chevron event new-session 2>/dev/null)
 end
 "#
 }
@@ -1002,5 +1080,112 @@ mod tests {
         assert!(out.contains("60000"), "60s pivot present");
         assert!(out.contains("%dm %ds"), "minute format present");
         assert!(out.contains("%d.%ds"), "sub-minute decimal format present");
+    }
+
+    // ── chevron-1yn Phase 1: command-lifecycle publish ──────────────────
+
+    #[test]
+    fn zsh_publishes_cmd_lifecycle_to_chevrond() {
+        let out = init_zsh();
+        assert!(
+            out.contains("_chevron_cmd_id=$(chevron event cmd-start"),
+            "preexec must capture a cmd id from chevron event cmd-start"
+        );
+        assert!(
+            out.contains(r#"chevron event cmd-end "$_chevron_cmd_id""#),
+            "precmd must publish cmd-end with the captured id"
+        );
+        assert!(
+            out.contains("_chevron_session_id=$(chevron event new-session"),
+            "init must mint a session id once per shell"
+        );
+    }
+
+    #[test]
+    fn zsh_lifecycle_respects_history_opt_out() {
+        let out = init_zsh();
+        // preexec guard: CHEVRON_HISTORY=0 short-circuits.
+        assert!(
+            out.contains(r#""${CHEVRON_HISTORY:-1}" != "0""#),
+            "expected CHEVRON_HISTORY opt-out gate"
+        );
+        // Ignorespace pattern: leading-space commands are excluded.
+        assert!(
+            out.contains(r#""$1" != " "*"#),
+            "leading-space (ignorespace) commands should be excluded"
+        );
+    }
+
+    #[test]
+    fn bash_publishes_cmd_lifecycle_to_chevrond() {
+        let out = init_bash();
+        assert!(
+            out.contains("_chevron_cmd_id=$(chevron event cmd-start"),
+            "DEBUG-trap preexec must capture a cmd id"
+        );
+        assert!(
+            out.contains(r#"chevron event cmd-end "$_chevron_cmd_id""#),
+            "PROMPT_COMMAND must publish cmd-end"
+        );
+        assert!(
+            out.contains("_chevron_session_id=$(chevron event new-session"),
+            "init must mint a session id"
+        );
+    }
+
+    #[test]
+    fn bash_lifecycle_uses_bash_command_for_cmd_text() {
+        // The DEBUG trap fires before the command runs; bash exposes the
+        // literal line as $BASH_COMMAND. Confirm the preexec branch uses
+        // that rather than something stale or invented.
+        let out = init_bash();
+        assert!(
+            out.contains(
+                r#"chevron event cmd-start "$_chevron_session_id" "$PWD" "$BASH_COMMAND""#
+            ),
+            "preexec should pass $BASH_COMMAND as the cmd argument"
+        );
+    }
+
+    #[test]
+    fn bash_lifecycle_skips_when_already_capturing() {
+        // Bash fires DEBUG per simple command in a pipeline; we should
+        // only stash an id on the first one (so cmd-end in precmd has a
+        // single id to close).
+        let out = init_bash();
+        assert!(
+            out.contains(r#"-z "$_chevron_cmd_id""#),
+            "preexec should guard against re-publishing within a single PROMPT_COMMAND cycle"
+        );
+    }
+
+    #[test]
+    fn fish_publishes_cmd_lifecycle_to_chevrond() {
+        let out = init_fish();
+        assert!(
+            out.contains("set -g _chevron_cmd_id (chevron event cmd-start"),
+            "fish_preexec must capture a cmd id"
+        );
+        assert!(
+            out.contains(r#"chevron event cmd-end "$_chevron_cmd_id""#),
+            "fish_postexec must publish cmd-end"
+        );
+        assert!(
+            out.contains("set -g _chevron_session_id (chevron event new-session"),
+            "init must mint a session id"
+        );
+    }
+
+    #[test]
+    fn fish_lifecycle_respects_history_opt_out_and_ignorespace() {
+        let out = init_fish();
+        assert!(
+            out.contains(r#"test "$CHEVRON_HISTORY" != "0""#),
+            "fish lifecycle hook must check CHEVRON_HISTORY"
+        );
+        assert!(
+            out.contains(r#"string match -q ' *' -- "$argv[1]""#),
+            "fish lifecycle hook must skip leading-space (ignorespace) commands"
+        );
     }
 }

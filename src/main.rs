@@ -75,6 +75,8 @@ fn main() {
         Some("status") => repo_status::run(),
         Some("health") => std::process::exit(health::run(&args[2..])),
         #[cfg(feature = "daemon")]
+        Some("event") => std::process::exit(chevron::event::run(&args[2..])),
+        #[cfg(feature = "daemon")]
         Some("daemon") => match args.get(2).map(String::as_str) {
             Some("serve") => {
                 if let Err(e) = chevron::daemon::lifecycle::serve() {
@@ -118,6 +120,8 @@ fn main() {
                 "health",
                 #[cfg(feature = "daemon")]
                 "daemon",
+                #[cfg(feature = "daemon")]
+                "event",
                 "version",
                 #[cfg(feature = "banner")]
                 "banner",

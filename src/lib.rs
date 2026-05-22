@@ -22,6 +22,8 @@ pub mod banner;
 pub mod color;
 pub mod config;
 pub mod daemon;
+#[cfg(feature = "daemon")]
+pub mod event;
 pub mod health;
 pub mod repo_status;
 pub mod segments;

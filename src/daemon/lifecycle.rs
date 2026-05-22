@@ -60,7 +60,13 @@ pub fn serve() -> io::Result<()> {
 
     write_pidfile(&paths::pid_path())?;
 
-    let (state_tx, _state_join) = state::spawn(state::TTL)?;
+    // Open the command-history database under the socket dir (chevron-1yn
+    // Phase 1). Schema is applied here once at startup; the state actor
+    // owns the connection for its lifetime. Schema failures are fatal
+    // because the lifecycle subcommand has no way to surface them later.
+    let db =
+        state::open_db(&dir).map_err(|e| io::Error::other(format!("open commands.db: {e}")))?;
+    let (state_tx, _state_join) = state::spawn(state::TTL, db)?;
 
     listener::serve_loop(&unix_listener, &state_tx);
 

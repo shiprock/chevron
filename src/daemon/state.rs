@@ -34,7 +34,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use rusqlite::Connection;
 
+use super::proto::{CmdEndEvent, CmdStartEvent};
 use crate::segments::git::RepoStatus;
 
 /// Cache freshness window. Tight enough that working-tree edits not
@@ -81,6 +83,15 @@ pub enum StateMsg {
     /// that workdir's cache entry. Sent by the notify watcher callback;
     /// also useful for hand-driven tests.
     FsEvent(Vec<PathBuf>),
+    /// Persist a command-started event. Fire-and-forget: the listener
+    /// ACKs the client as soon as the message lands on this channel.
+    /// Phase 1 of chevron-1yn; consumed by the SQLite-backed commands
+    /// table.
+    CmdStart(CmdStartEvent),
+    /// Persist a command-finished event by updating the existing row
+    /// keyed by `id`. Silent no-op if no matching row exists (e.g. the
+    /// daemon was restarted between start and end).
+    CmdEnd(CmdEndEvent),
     /// Stop the actor. Mainly for tests; production exits via signal.
     Shutdown,
 }
@@ -94,15 +105,22 @@ struct State {
     /// `workdir → last query time`. Drives LRU eviction.
     last_query: HashMap<PathBuf, Instant>,
     watcher: Option<RecommendedWatcher>,
+    /// `SQLite` handle for the commands log (chevron-1yn Phase 1).
+    /// Owned by the state thread so writes serialise naturally and we
+    /// don't need a Mutex. Single-writer `SQLite` has no contention;
+    /// queries against this file (Phase 2's `chevron history`) will
+    /// open separate read-only connections under WAL.
+    db: Connection,
 }
 
 impl State {
-    fn new(watcher: Option<RecommendedWatcher>) -> Self {
+    fn new(watcher: Option<RecommendedWatcher>, db: Connection) -> Self {
         Self {
             cache: HashMap::new(),
             watches: HashMap::new(),
             last_query: HashMap::new(),
             watcher,
+            db,
         }
     }
 
@@ -182,6 +200,40 @@ impl State {
         self.cache.remove(&stale_workdir);
         self.last_query.remove(&stale_workdir);
     }
+
+    fn record_cmd_start(&self, e: &CmdStartEvent) {
+        // INSERT OR IGNORE so a duplicate id (shouldn't happen with
+        // client-side ULIDs but worth guarding against) doesn't error
+        // out the actor. Logging an error here would write to stderr
+        // which the daemon redirects to /dev/null — silent on duplicate
+        // is the only reasonable behaviour.
+        let _ = self.db.execute(
+            "INSERT OR IGNORE INTO commands \
+             (id, session_id, hostname, cwd, cmd, started_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                e.id,
+                e.session_id,
+                e.hostname,
+                e.cwd.to_string_lossy(),
+                e.cmd,
+                e.started_at_ms,
+            ],
+        );
+    }
+
+    fn record_cmd_end(&self, e: &CmdEndEvent) {
+        // UPDATE — silent no-op if no matching id (daemon restarted
+        // between start and end, or end arrived for an event we never
+        // saw). Phase 2's history query just won't see this row's
+        // completion fields; it's still in the table.
+        let _ = self.db.execute(
+            "UPDATE commands \
+             SET finished_at = ?2, duration_ms = ?3, exit_status = ?4 \
+             WHERE id = ?1",
+            rusqlite::params![e.id, e.finished_at_ms, e.duration_ms, e.exit_status,],
+        );
+    }
 }
 
 /// Walk `path`'s ancestors looking for a gitdir registered in `watches`.
@@ -198,17 +250,22 @@ fn resolve_workdir<'a>(watches: &'a HashMap<PathBuf, PathBuf>, path: &Path) -> O
     None
 }
 
-/// Drive the actor loop. Owns the cache and watcher for the lifetime of
-/// the call.
+/// Drive the actor loop. Owns the cache, watcher, and `SQLite` handle
+/// for the lifetime of the call.
 #[allow(clippy::needless_pass_by_value)]
-pub fn run(rx: Receiver<StateMsg>, tx: Sender<StateMsg>, ttl: Duration) {
+pub fn run(rx: Receiver<StateMsg>, tx: Sender<StateMsg>, ttl: Duration, db: Connection) {
     let watcher = make_watcher(&tx);
-    run_inner(rx, watcher, ttl);
+    run_inner(rx, watcher, ttl, db);
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_inner(rx: Receiver<StateMsg>, watcher: Option<RecommendedWatcher>, ttl: Duration) {
-    let mut state = State::new(watcher);
+fn run_inner(
+    rx: Receiver<StateMsg>,
+    watcher: Option<RecommendedWatcher>,
+    ttl: Duration,
+    db: Connection,
+) {
+    let mut state = State::new(watcher, db);
 
     while let Ok(msg) = rx.recv() {
         match msg {
@@ -227,6 +284,8 @@ fn run_inner(rx: Receiver<StateMsg>, watcher: Option<RecommendedWatcher>, ttl: D
             StateMsg::FsEvent(paths) => {
                 state.invalidate_for_event_paths(&paths);
             }
+            StateMsg::CmdStart(e) => state.record_cmd_start(&e),
+            StateMsg::CmdEnd(e) => state.record_cmd_end(&e),
             StateMsg::Shutdown => break,
         }
     }
@@ -248,30 +307,96 @@ fn make_watcher(tx: &Sender<StateMsg>) -> Option<RecommendedWatcher> {
 }
 
 /// Spawn the state actor on a named thread. Returns the channel sender plus a
-/// join handle.
+/// join handle. The actor takes ownership of `db` for its lifetime.
 ///
 /// # Errors
 ///
 /// Returns the [`io::Error`](std::io::Error) from `thread::Builder::spawn`
 /// only if the OS can't create a thread (resource exhaustion).
-pub fn spawn(ttl: Duration) -> std::io::Result<(Sender<StateMsg>, JoinHandle<()>)> {
+pub fn spawn(ttl: Duration, db: Connection) -> std::io::Result<(Sender<StateMsg>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel();
     let tx_for_run = tx.clone();
     let handle = std::thread::Builder::new()
         .name("chevrond-state".into())
-        .spawn(move || run(rx, tx_for_run, ttl))?;
+        .spawn(move || run(rx, tx_for_run, ttl, db))?;
     Ok((tx, handle))
+}
+
+/// Open the commands database at `dir/commands.db`, apply the schema,
+/// and return a write-mode connection. WAL + `synchronous=NORMAL`
+/// keeps per-event writes well under a millisecond on SSD while still
+/// letting concurrent readers (Phase 2's `chevron history`) see
+/// committed rows.
+///
+/// # Errors
+///
+/// Returns the underlying [`rusqlite::Error`] if the directory isn't
+/// writable, the file is corrupt, or the schema-application fails.
+pub fn open_db(dir: &Path) -> rusqlite::Result<Connection> {
+    let path = dir.join("commands.db");
+    let conn = Connection::open(&path)?;
+    apply_schema(&conn)?;
+    Ok(conn)
+}
+
+/// Test-only counterpart to [`open_db`] that opens an in-memory DB. The
+/// resulting connection is only usable from the thread that holds it,
+/// which matches the state actor's ownership model.
+///
+/// # Errors
+///
+/// Returns the underlying [`rusqlite::Error`] if the in-memory DB
+/// can't be initialised — should be impossible in practice but the
+/// signature matches [`open_db`] for symmetry.
+#[cfg(test)]
+pub fn open_memory_db() -> rusqlite::Result<Connection> {
+    let conn = Connection::open_in_memory()?;
+    apply_schema(&conn)?;
+    Ok(conn)
+}
+
+fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
+    // WAL gives concurrent readers + one writer with no journal-file
+    // contention; synchronous=NORMAL gives durability up to the last
+    // checkpoint, which is fine for command history (a crash losing the
+    // last few seconds of commands is acceptable; corruption is not).
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '1');
+
+        CREATE TABLE IF NOT EXISTS commands (
+            id           TEXT PRIMARY KEY,
+            session_id   TEXT NOT NULL,
+            hostname     TEXT NOT NULL,
+            cwd          TEXT NOT NULL,
+            cmd          TEXT NOT NULL,
+            started_at   INTEGER NOT NULL,
+            finished_at  INTEGER,
+            duration_ms  INTEGER,
+            exit_status  INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_commands_cwd          ON commands(cwd);
+        CREATE INDEX IF NOT EXISTS idx_commands_started_at   ON commands(started_at);
+        CREATE INDEX IF NOT EXISTS idx_commands_exit_status  ON commands(exit_status);",
+    )?;
+    Ok(())
 }
 
 /// Test-only: spawn the actor without a real `notify` watcher. Logical
 /// watch tracking still happens (so LRU and `FsEvent` invalidation can
 /// be exercised) but no actual `notify` resources are created.
 #[cfg(test)]
-fn spawn_no_watcher(ttl: Duration) -> (Sender<StateMsg>, JoinHandle<()>) {
+fn spawn_no_watcher(ttl: Duration, db: Connection) -> (Sender<StateMsg>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     let handle = std::thread::Builder::new()
         .name("chevrond-state-test".into())
-        .spawn(move || run_inner(rx, None, ttl))
+        .spawn(move || run_inner(rx, None, ttl, db))
         .unwrap();
     (tx, handle)
 }
@@ -335,7 +460,7 @@ mod tests {
 
     #[test]
     fn get_miss_returns_none() {
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
         assert!(query(&tx, PathBuf::from("/nonexistent")).is_none());
         tx.send(StateMsg::Shutdown).unwrap();
         handle.join().unwrap();
@@ -343,7 +468,7 @@ mod tests {
 
     #[test]
     fn insert_then_get_returns_fresh() {
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
         let workdir = PathBuf::from("/repo");
         let git_dir = workdir.join(".git");
         insert(&tx, &workdir, &git_dir, "master");
@@ -356,7 +481,7 @@ mod tests {
     #[test]
     fn stale_entry_returns_none() {
         // TTL = 50 ms, entry timestamped 500 ms ago → expired.
-        let (tx, handle) = spawn(Duration::from_millis(50)).unwrap();
+        let (tx, handle) = spawn(Duration::from_millis(50), open_memory_db().unwrap()).unwrap();
         let workdir = PathBuf::from("/repo");
         tx.send(StateMsg::Insert {
             workdir: workdir.clone(),
@@ -372,7 +497,7 @@ mod tests {
 
     #[test]
     fn insert_overwrites_previous_entry() {
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
         let workdir = PathBuf::from("/repo");
         let git_dir = workdir.join(".git");
         insert(&tx, &workdir, &git_dir, "old");
@@ -385,7 +510,7 @@ mod tests {
 
     #[test]
     fn multiple_workdirs_independent() {
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
         let a = PathBuf::from("/a");
         let b = PathBuf::from("/b");
         insert(&tx, &a, &a.join(".git"), "branch-a");
@@ -400,7 +525,7 @@ mod tests {
     fn shutdown_drains_pending_messages() {
         // Messages queued before Shutdown should still be processed in
         // FIFO order. We rely on this for deterministic test cleanup.
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
         let workdir = PathBuf::from("/repo");
         let git_dir = workdir.join(".git");
         insert(&tx, &workdir, &git_dir, "master");
@@ -421,7 +546,7 @@ mod tests {
         // If the handler thread gives up before the reply lands, the state
         // thread's `reply.send(...)` returns Err — but the actor must keep
         // processing subsequent messages.
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
         let (reply_tx, reply_rx) = mpsc::channel();
         drop(reply_rx);
         tx.send(StateMsg::Get {
@@ -449,7 +574,7 @@ mod tests {
         let git_dir = workdir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
 
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
         insert(&tx, &workdir, &git_dir, "master");
         assert!(query(&tx, workdir.clone()).is_some());
 
@@ -474,7 +599,7 @@ mod tests {
         let git_dir = workdir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
 
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
         insert(&tx, &workdir, &git_dir, "master");
 
         tx.send(StateMsg::FsEvent(vec![PathBuf::from("/var/log/something")]))
@@ -514,6 +639,156 @@ mod tests {
         assert_eq!(resolve_workdir(&watches, Path::new("/r/src/main.rs")), None);
     }
 
+    // ── Phase 1 (chevron-1yn.1): command lifecycle persistence ───────────
+
+    fn fixture_cmd_start(id: &str) -> CmdStartEvent {
+        CmdStartEvent {
+            id: id.to_string(),
+            session_id: "sess-abc".to_string(),
+            hostname: "matt-mbp".to_string(),
+            cwd: PathBuf::from("/Users/mim/src/chevron"),
+            cmd: "cargo test".to_string(),
+            started_at_ms: 1_000,
+        }
+    }
+
+    fn fixture_cmd_end(id: &str) -> CmdEndEvent {
+        CmdEndEvent {
+            id: id.to_string(),
+            finished_at_ms: 2_500,
+            duration_ms: 1_500,
+            exit_status: 0,
+        }
+    }
+
+    /// Drain by sending Shutdown and joining the thread, which releases
+    /// the actor's owned connection so a fresh reader can open the file
+    /// without write-lock contention.
+    fn drain(tx: &Sender<StateMsg>, handle: JoinHandle<()>) {
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn cmd_start_inserts_row_with_pending_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = open_db(tmp.path()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), db).unwrap();
+        tx.send(StateMsg::CmdStart(fixture_cmd_start("id-1")))
+            .unwrap();
+        drain(&tx, handle);
+
+        let conn = Connection::open(tmp.path().join("commands.db")).unwrap();
+        let (cmd, started_at, finished_at, exit_status): (String, i64, Option<i64>, Option<i64>) =
+            conn.query_row(
+                "SELECT cmd, started_at, finished_at, exit_status FROM commands WHERE id = ?1",
+                ["id-1"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(cmd, "cargo test");
+        assert_eq!(started_at, 1_000);
+        // Completion columns must be NULL until CmdEnd lands.
+        assert!(finished_at.is_none());
+        assert!(exit_status.is_none());
+    }
+
+    #[test]
+    fn cmd_end_fills_completion_columns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = open_db(tmp.path()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), db).unwrap();
+        tx.send(StateMsg::CmdStart(fixture_cmd_start("id-2")))
+            .unwrap();
+        tx.send(StateMsg::CmdEnd(fixture_cmd_end("id-2"))).unwrap();
+        drain(&tx, handle);
+
+        let conn = Connection::open(tmp.path().join("commands.db")).unwrap();
+        let (finished_at, duration_ms, exit_status): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT finished_at, duration_ms, exit_status FROM commands WHERE id = ?1",
+                ["id-2"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(finished_at, 2_500);
+        assert_eq!(duration_ms, 1_500);
+        assert_eq!(exit_status, 0);
+    }
+
+    #[test]
+    fn cmd_end_without_start_is_silent_noop() {
+        // A CmdEnd referencing an unknown id (daemon restarted between
+        // start and end, or the start was opt-ed-out via leading space)
+        // must not error the actor or insert a partial row.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = open_db(tmp.path()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), db).unwrap();
+        tx.send(StateMsg::CmdEnd(fixture_cmd_end("orphan")))
+            .unwrap();
+        // The actor should still be alive for follow-up traffic.
+        tx.send(StateMsg::CmdStart(fixture_cmd_start("id-3")))
+            .unwrap();
+        drain(&tx, handle);
+
+        let conn = Connection::open(tmp.path().join("commands.db")).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "only the successful CmdStart should have a row");
+        let has_orphan: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM commands WHERE id = ?1",
+                ["orphan"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_orphan, 0);
+    }
+
+    #[test]
+    fn duplicate_cmd_start_ignores_second_insert() {
+        // Client-side ULIDs shouldn't repeat, but if they do (e.g. test
+        // fixture replay), the second insert must be a no-op rather
+        // than blowing up the actor with a UNIQUE constraint error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = open_db(tmp.path()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), db).unwrap();
+        tx.send(StateMsg::CmdStart(fixture_cmd_start("dup")))
+            .unwrap();
+        let mut second = fixture_cmd_start("dup");
+        second.cmd = "second insert wins? (no)".to_string();
+        tx.send(StateMsg::CmdStart(second)).unwrap();
+        drain(&tx, handle);
+
+        let conn = Connection::open(tmp.path().join("commands.db")).unwrap();
+        let cmd: String = conn
+            .query_row("SELECT cmd FROM commands WHERE id = ?1", ["dup"], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        // INSERT OR IGNORE keeps the first one.
+        assert_eq!(cmd, "cargo test");
+    }
+
+    #[test]
+    fn open_db_seeds_schema_version_and_is_idempotent() {
+        // Opening twice on the same dir must succeed (CREATE TABLE IF
+        // NOT EXISTS + INSERT OR IGNORE keep things deterministic) and
+        // the schema_version row must read back as '1'.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _ = open_db(tmp.path()).unwrap();
+        let conn = open_db(tmp.path()).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "1");
+    }
+
     #[test]
     fn lru_eviction_at_cap() {
         // Use `spawn_no_watcher` to avoid creating 65 real `notify`
@@ -521,7 +796,7 @@ mod tests {
         // makes the test multi-second. Logical watch tracking still
         // happens via the unconditional `watches` insert, so LRU is
         // exercised. Use throwaway PathBufs (no real dirs needed).
-        let (tx, handle) = spawn_no_watcher(test_ttl());
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap());
         let workdirs: Vec<PathBuf> = (0..=MAX_WATCHES)
             .map(|i| PathBuf::from(format!("/tmp/lru-test-{i}")))
             .collect();

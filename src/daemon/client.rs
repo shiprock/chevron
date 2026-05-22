@@ -21,6 +21,12 @@ use crate::segments::git::RepoStatus;
 /// inline compute — the shell still gets a prompt.
 const QUERY_TIMEOUT: Duration = Duration::from_millis(10);
 
+/// Per-syscall timeout for fire-and-forget lifecycle events (`CMD_START`,
+/// `CMD_END`). Longer than `QUERY_TIMEOUT` because losing a history
+/// event silently is worse than a 25 ms blip on the keystroke hot path
+/// — but still bounded so a hung daemon can't pin preexec indefinitely.
+const PUBLISH_TIMEOUT: Duration = Duration::from_millis(25);
+
 /// Ask the running daemon for `cwd`'s status. Returns `None` for any
 /// failure so the caller can transparently degrade to inline compute.
 ///
@@ -69,6 +75,59 @@ fn write_line(mut conn: &UnixStream, line: &str) -> std::io::Result<()> {
     buf.push_str(line);
     buf.push('\n');
     conn.write_all(buf.as_bytes())
+}
+
+/// Publish a lifecycle event (`CMD_START` or `CMD_END`) to the running
+/// daemon. Returns `true` if the daemon ack'd within [`PUBLISH_TIMEOUT`],
+/// `false` on any failure. The shell hooks treat both as success — a
+/// lost event just means one missing history row.
+///
+/// Why HELLO + read response + send + read ACK rather than write-and-close:
+/// without reading the daemon's HELLO response, a client closing the
+/// socket immediately can trip the daemon's `send_resp` into `EPIPE` and
+/// short-circuit the per-connection loop before it processes our actual
+/// event. The two round-trips are ~100 µs on local UDS — well under the
+/// [`PUBLISH_TIMEOUT`] budget.
+#[must_use]
+pub fn try_publish_event(req: &proto::Request) -> bool {
+    debug_assert!(
+        matches!(req, proto::Request::CmdStart(_) | proto::Request::CmdEnd(_)),
+        "try_publish_event is for lifecycle events only"
+    );
+    let Ok(conn) = UnixStream::connect(paths::socket_path()) else {
+        return false;
+    };
+    if conn.set_read_timeout(Some(PUBLISH_TIMEOUT)).is_err()
+        || conn.set_write_timeout(Some(PUBLISH_TIMEOUT)).is_err()
+    {
+        return false;
+    }
+    let mut reader = BufReader::new(&conn);
+    let mut line = String::new();
+    if write_line(
+        &conn,
+        &proto::encode_request(&proto::Request::Hello(proto::PROTO_VERSION)),
+    )
+    .is_err()
+    {
+        return false;
+    }
+    if reader.read_line(&mut line).is_err() {
+        return false;
+    }
+    match proto::decode_response(&line) {
+        Ok(proto::Response::Hello(v)) if v == proto::PROTO_VERSION => {}
+        _ => return false,
+    }
+
+    line.clear();
+    if write_line(&conn, &proto::encode_request(req)).is_err() {
+        return false;
+    }
+    if reader.read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(proto::decode_response(&line), Ok(proto::Response::Ack))
 }
 
 /// Attempt to spawn a detached daemon. Best-effort: any failure here just
@@ -132,7 +191,8 @@ mod tests {
         unsafe { std::env::set_var("CHEVRON_SOCKET_DIR", dir.path()) };
         let sock = dir.path().join("chevrond.sock");
         let listener_sock = UnixListener::bind(&sock).unwrap();
-        let (state_tx, _state_join) = state::spawn(state::TTL).unwrap();
+        let db = state::open_db(dir.path()).unwrap();
+        let (state_tx, _state_join) = state::spawn(state::TTL, db).unwrap();
         std::thread::spawn(move || listener::serve_loop(&listener_sock, &state_tx));
         dir
     }
@@ -165,6 +225,69 @@ mod tests {
         let _dir = spawn_daemon();
         let other = TempDir::new().unwrap();
         assert!(try_query(other.path()).is_none());
+        unsafe { std::env::remove_var("CHEVRON_SOCKET_DIR") };
+    }
+
+    #[test]
+    #[serial]
+    fn try_publish_event_returns_false_when_no_daemon() {
+        let dir = TempDir::new().unwrap();
+        unsafe { std::env::set_var("CHEVRON_SOCKET_DIR", dir.path()) };
+        let req = proto::Request::CmdStart(proto::CmdStartEvent {
+            id: "id-1".into(),
+            session_id: "s".into(),
+            hostname: "h".into(),
+            cwd: dir.path().to_path_buf(),
+            cmd: "ls".into(),
+            started_at_ms: 1,
+        });
+        assert!(!try_publish_event(&req));
+        unsafe { std::env::remove_var("CHEVRON_SOCKET_DIR") };
+    }
+
+    #[test]
+    #[serial]
+    fn try_publish_event_persists_cmd_start_and_end() {
+        // End-to-end: publish a CmdStart + CmdEnd via the public client,
+        // then open the on-disk DB and verify the row landed with the
+        // correct completion fields. This is the integration that proves
+        // the wire layer, the actor's SQLite path, and the lifecycle
+        // helpers compose correctly.
+        let dir = spawn_daemon();
+
+        let start = proto::CmdStartEvent {
+            id: "test-cmd-1".to_string(),
+            session_id: "test-sess".to_string(),
+            hostname: "test-host".to_string(),
+            cwd: std::path::PathBuf::from("/tmp/test"),
+            cmd: "echo 'hi  there'".to_string(),
+            started_at_ms: 100,
+        };
+        assert!(try_publish_event(&proto::Request::CmdStart(start.clone())));
+
+        let end = proto::CmdEndEvent {
+            id: "test-cmd-1".to_string(),
+            finished_at_ms: 250,
+            duration_ms: 150,
+            exit_status: 0,
+        };
+        assert!(try_publish_event(&proto::Request::CmdEnd(end)));
+
+        // Use a fresh read-only connection so the actor's writer-side
+        // WAL state still flushes our row to readers. WAL allows
+        // concurrent reads against an open writer.
+        let conn = rusqlite::Connection::open(dir.path().join("commands.db")).unwrap();
+        let (cmd, finished_at, exit_status): (String, i64, i64) = conn
+            .query_row(
+                "SELECT cmd, finished_at, exit_status FROM commands WHERE id = ?1",
+                ["test-cmd-1"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(cmd, "echo 'hi  there'");
+        assert_eq!(finished_at, 250);
+        assert_eq!(exit_status, 0);
+
         unsafe { std::env::remove_var("CHEVRON_SOCKET_DIR") };
     }
 

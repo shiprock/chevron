@@ -9,11 +9,14 @@
 //! Requests (client → server):
 //!   HELLO <version>
 //!   STATUS <path>
+//!   CMD_START id=<ulid> session=<ulid> host=<host> cwd=<path> started_at=<ms> cmd=<cmd>
+//!   CMD_END id=<ulid> finished_at=<ms> duration_ms=<u64> exit=<i32>
 //!   QUIT
 //!
 //! Responses (server → client):
 //!   HELLO <version>
 //!   OK key=value key=value ...
+//!   ACK
 //!   NONE
 //!   ERR <reason>
 //! ```
@@ -22,14 +25,19 @@
 //!
 //! Numeric fields (`staged`, `modified`, …) and bools (`detached`) are written
 //! plain. The optional `state` field is `rebasing|merging|cherry|bisect` or
-//! omitted entirely. String fields (`repo_name`, `branch`) and the `STATUS`
-//! path arg are **percent-encoded** for the two reserved bytes:
+//! omitted entirely. String fields (`repo_name`, `branch`, `cmd`, …) and the
+//! `STATUS` path arg are **percent-encoded**:
 //!
 //! - `%` (0x25) → `%25`
-//! - ` ` (0x20) → `%20`
+//! - any byte at or below 0x20 (control + space) → `%XX` (uppercase hex)
+//! - DEL (0x7F) → `%7F`
 //!
-//! That's the entire escaping rule. Branch refs already forbid spaces per
-//! `git check-ref-format`; repo directory names commonly contain them.
+//! Everything else (printable ASCII and any byte >= 0x80) is passed through
+//! literally. The decoder accepts any well-formed `%XX` pair, so future
+//! encoder changes that escape more bytes remain wire-compatible. This is
+//! deliberately a small subset of RFC 3986 — just enough to keep the
+//! line-oriented kv format unambiguous even when `cmd` contains tabs,
+//! newlines, or other whitespace.
 //!
 //! ## Field order
 //!
@@ -44,10 +52,38 @@ use crate::segments::git::{OpState, RepoStatus};
 /// The protocol version this build speaks. Bumped on incompatible changes.
 pub const PROTO_VERSION: u32 = 1;
 
+/// `CMD_START` payload. IDs are ULIDs minted client-side so preexec
+/// doesn't need to await a daemon round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CmdStartEvent {
+    pub id: String,
+    pub session_id: String,
+    pub hostname: String,
+    pub cwd: PathBuf,
+    pub cmd: String,
+    /// Unix-epoch milliseconds. Stored as i64 to keep the door open for
+    /// `time::OffsetDateTime` conversion later without unsigned-cast
+    /// gymnastics, and to match `SQLite`'s INTEGER affinity.
+    pub started_at_ms: i64,
+}
+
+/// `CMD_END` payload. `id` refers to a previously-published
+/// [`CmdStartEvent`]; if the daemon never saw the start (e.g. the shell
+/// hook fired into a then-dead daemon), the update is a silent no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CmdEndEvent {
+    pub id: String,
+    pub finished_at_ms: i64,
+    pub duration_ms: u64,
+    pub exit_status: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     Hello(u32),
     Status(PathBuf),
+    CmdStart(CmdStartEvent),
+    CmdEnd(CmdEndEvent),
     Quit,
 }
 
@@ -56,6 +92,10 @@ pub enum Response {
     Hello(u32),
     /// `Some` → `OK …`; `None` → `NONE` (no repo discovered at the given path).
     Status(Option<RepoStatus>),
+    /// Generic acknowledgement for fire-and-forget messages
+    /// (`CMD_START`, `CMD_END`). The daemon ACKs as soon as it has
+    /// queued the event for storage — durability is not guaranteed.
+    Ack,
     Err(String),
 }
 
@@ -89,6 +129,8 @@ pub fn encode_request(req: &Request) -> String {
     match req {
         Request::Hello(v) => format!("HELLO {v}"),
         Request::Status(p) => format!("STATUS {}", percent_encode(&p.to_string_lossy())),
+        Request::CmdStart(e) => encode_cmd_start(e),
+        Request::CmdEnd(e) => encode_cmd_end(e),
         Request::Quit => "QUIT".to_string(),
     }
 }
@@ -99,8 +141,33 @@ pub fn encode_response(resp: &Response) -> String {
         Response::Hello(v) => format!("HELLO {v}"),
         Response::Status(None) => "NONE".to_string(),
         Response::Status(Some(s)) => encode_status_ok(s),
+        Response::Ack => "ACK".to_string(),
         Response::Err(reason) => format!("ERR {}", percent_encode(reason)),
     }
+}
+
+fn encode_cmd_start(e: &CmdStartEvent) -> String {
+    let mut out = String::with_capacity(192);
+    out.push_str("CMD_START");
+    write_kv_str(&mut out, "id", &e.id);
+    write_kv_str(&mut out, "session", &e.session_id);
+    write_kv_str(&mut out, "host", &e.hostname);
+    write_kv_str(&mut out, "cwd", &e.cwd.to_string_lossy());
+    write_kv_num(&mut out, "started_at", e.started_at_ms);
+    // `cmd` last so it's easy to eyeball in `socat` dumps — the rest of the
+    // fields are short and stable; cmd can run long.
+    write_kv_str(&mut out, "cmd", &e.cmd);
+    out
+}
+
+fn encode_cmd_end(e: &CmdEndEvent) -> String {
+    let mut out = String::with_capacity(80);
+    out.push_str("CMD_END");
+    write_kv_str(&mut out, "id", &e.id);
+    write_kv_num(&mut out, "finished_at", e.finished_at_ms);
+    write_kv_num(&mut out, "duration_ms", e.duration_ms);
+    write_kv_num(&mut out, "exit", e.exit_status);
+    out
 }
 
 fn encode_status_ok(s: &RepoStatus) -> String {
@@ -137,6 +204,15 @@ fn write_kv_bool(out: &mut String, key: &str, val: bool) {
 }
 
 fn write_kv_u32(out: &mut String, key: &str, val: u32) {
+    use std::fmt::Write;
+    let _ = write!(out, " {key}={val}");
+}
+
+/// Numeric kv writer for the lifecycle opcodes — accepts anything that
+/// `Display`s as a sane integer literal (i32/i64/u64). Sibling to
+/// [`write_kv_u32`] which predates the lifecycle work and is left
+/// untouched to minimise churn in the status-encoding call sites.
+fn write_kv_num<T: std::fmt::Display>(out: &mut String, key: &str, val: T) {
     use std::fmt::Write;
     let _ = write!(out, " {key}={val}");
 }
@@ -197,6 +273,8 @@ pub fn decode_request(line: &str) -> Result<Request, ProtoError> {
             let path = percent_decode(path_enc)?;
             Ok(Request::Status(PathBuf::from(path)))
         }
+        "CMD_START" => decode_cmd_start(rest).map(Request::CmdStart),
+        "CMD_END" => decode_cmd_end(rest).map(Request::CmdEnd),
         "QUIT" => {
             if !rest.trim().is_empty() {
                 return Err(ProtoError::Malformed("QUIT takes no arguments"));
@@ -205,6 +283,63 @@ pub fn decode_request(line: &str) -> Result<Request, ProtoError> {
         }
         other => Err(ProtoError::UnknownOpcode(other.to_string())),
     }
+}
+
+fn decode_cmd_start(rest: &str) -> Result<CmdStartEvent, ProtoError> {
+    let mut id: Option<String> = None;
+    let mut session: Option<String> = None;
+    let mut host: Option<String> = None;
+    let mut cwd: Option<String> = None;
+    let mut started_at: Option<i64> = None;
+    let mut cmd: Option<String> = None;
+    for tok in rest.split_ascii_whitespace() {
+        let (k, v) = tok
+            .split_once('=')
+            .ok_or(ProtoError::Malformed("CMD_START kv missing '='"))?;
+        match k {
+            "id" => id = Some(percent_decode(v)?),
+            "session" => session = Some(percent_decode(v)?),
+            "host" => host = Some(percent_decode(v)?),
+            "cwd" => cwd = Some(percent_decode(v)?),
+            "started_at" => started_at = Some(parse_i64(v)?),
+            "cmd" => cmd = Some(percent_decode(v)?),
+            // Forward-compat: ignore unknown keys.
+            _ => {}
+        }
+    }
+    Ok(CmdStartEvent {
+        id: id.ok_or(ProtoError::Malformed("CMD_START missing id"))?,
+        session_id: session.ok_or(ProtoError::Malformed("CMD_START missing session"))?,
+        hostname: host.ok_or(ProtoError::Malformed("CMD_START missing host"))?,
+        cwd: PathBuf::from(cwd.ok_or(ProtoError::Malformed("CMD_START missing cwd"))?),
+        cmd: cmd.ok_or(ProtoError::Malformed("CMD_START missing cmd"))?,
+        started_at_ms: started_at.ok_or(ProtoError::Malformed("CMD_START missing started_at"))?,
+    })
+}
+
+fn decode_cmd_end(rest: &str) -> Result<CmdEndEvent, ProtoError> {
+    let mut id: Option<String> = None;
+    let mut finished_at: Option<i64> = None;
+    let mut duration_ms: Option<u64> = None;
+    let mut exit: Option<i32> = None;
+    for tok in rest.split_ascii_whitespace() {
+        let (k, v) = tok
+            .split_once('=')
+            .ok_or(ProtoError::Malformed("CMD_END kv missing '='"))?;
+        match k {
+            "id" => id = Some(percent_decode(v)?),
+            "finished_at" => finished_at = Some(parse_i64(v)?),
+            "duration_ms" => duration_ms = Some(parse_u64(v)?),
+            "exit" => exit = Some(parse_i32(v)?),
+            _ => {}
+        }
+    }
+    Ok(CmdEndEvent {
+        id: id.ok_or(ProtoError::Malformed("CMD_END missing id"))?,
+        finished_at_ms: finished_at.ok_or(ProtoError::Malformed("CMD_END missing finished_at"))?,
+        duration_ms: duration_ms.ok_or(ProtoError::Malformed("CMD_END missing duration_ms"))?,
+        exit_status: exit.ok_or(ProtoError::Malformed("CMD_END missing exit"))?,
+    })
 }
 
 /// Parse one line (without trailing `\n`) as a response.
@@ -233,6 +368,12 @@ pub fn decode_response(line: &str) -> Result<Response, ProtoError> {
                 return Err(ProtoError::Malformed("NONE takes no arguments"));
             }
             Ok(Response::Status(None))
+        }
+        "ACK" => {
+            if !rest.trim().is_empty() {
+                return Err(ProtoError::Malformed("ACK takes no arguments"));
+            }
+            Ok(Response::Ack)
         }
         "OK" => decode_status_ok(rest).map(|s| Response::Status(Some(s))),
         "ERR" => {
@@ -305,6 +446,18 @@ fn parse_u32(s: &str) -> Result<u32, ProtoError> {
     s.parse().map_err(|_| ProtoError::Malformed("expected u32"))
 }
 
+fn parse_i32(s: &str) -> Result<i32, ProtoError> {
+    s.parse().map_err(|_| ProtoError::Malformed("expected i32"))
+}
+
+fn parse_i64(s: &str) -> Result<i64, ProtoError> {
+    s.parse().map_err(|_| ProtoError::Malformed("expected i64"))
+}
+
+fn parse_u64(s: &str) -> Result<u64, ProtoError> {
+    s.parse().map_err(|_| ProtoError::Malformed("expected u64"))
+}
+
 fn strip_eol(s: &str) -> &str {
     s.strip_suffix('\n')
         .unwrap_or(s)
@@ -318,48 +471,67 @@ fn split_opcode(line: &str) -> (&str, &str) {
 
 // ── Percent encoding ────────────────────────────────────────────────────────
 
-/// Encode `%` → `%25` and ` ` → `%20`. Nothing else needs escaping for the
-/// line-oriented kv format: the parser splits on ASCII whitespace and `=`, and
-/// we control the strings (no newlines reach this function — branch refs and
-/// directory names can't contain them).
+/// Escape any byte that isn't printable-ASCII-except-`%` as `%XX`
+/// (uppercase hex). Pass-through set is `[0x21, 0x7E] \ {%}` — letters,
+/// digits, common punctuation. Everything else (control bytes including
+/// space, DEL, and any byte ≥ 0x80) gets hex-escaped, so a UTF-8 string
+/// round-trips byte-for-byte through [`percent_decode`] even when it
+/// contains non-ASCII codepoints.
+///
+/// The wider escape set (vs the original `%25`/`%20`-only scheme) exists
+/// to make the `cmd` field of `CMD_START` safe: a heredoc or copy-paste
+/// command may contain tabs, newlines, or non-ASCII text that would
+/// otherwise break the line-oriented kv parser or be reinterpreted
+/// through Latin-1 at the decoder. Existing STATUS encoding output is
+/// unchanged for any realistic input (branches/repo names are ASCII).
 fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
-        match b {
-            b'%' => out.push_str("%25"),
-            b' ' => out.push_str("%20"),
-            _ => out.push(b as char),
+        if (0x21..=0x7E).contains(&b) && b != b'%' {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write;
+            // Uppercase hex per RFC 3986 §2.1 (and what we tested in the
+            // status path snapshot, so existing snapshots still match).
+            let _ = write!(out, "%{b:02X}");
         }
     }
     out
 }
 
-/// Reverse of `percent_encode`. Accepts only `%25` and `%20`; any other
-/// percent-escape is rejected with `Malformed`. We deliberately don't
-/// implement full RFC 3986 — the protocol's alphabet is intentionally small.
+/// Reverse of [`percent_encode`]. Accepts any well-formed `%XX` (broader
+/// than what the encoder emits, so future encoder changes stay
+/// wire-compatible) and rebuilds the original byte sequence. The result
+/// must be valid UTF-8; bytes that escape to invalid UTF-8 are rejected
+/// as `Malformed` rather than silently lossily reinterpreted.
 fn percent_decode(s: &str) -> Result<String, ProtoError> {
     let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
             if i + 2 >= bytes.len() {
                 return Err(ProtoError::Malformed("truncated percent escape"));
             }
-            let hi = bytes[i + 1];
-            let lo = bytes[i + 2];
-            match (hi, lo) {
-                (b'2', b'5') => out.push('%'),
-                (b'2', b'0') => out.push(' '),
-                _ => return Err(ProtoError::Malformed("unsupported percent escape")),
-            }
+            let hi = hex_nibble(bytes[i + 1])?;
+            let lo = hex_nibble(bytes[i + 2])?;
+            out.push((hi << 4) | lo);
             i += 3;
         } else {
-            out.push(bytes[i] as char);
+            out.push(bytes[i]);
             i += 1;
         }
     }
-    Ok(out)
+    String::from_utf8(out).map_err(|_| ProtoError::Malformed("decoded bytes are not valid UTF-8"))
+}
+
+fn hex_nibble(b: u8) -> Result<u8, ProtoError> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(ProtoError::Malformed("invalid hex in percent escape")),
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -427,12 +599,58 @@ mod tests {
     }
 
     #[test]
-    fn percent_decode_rejects_unsupported_escape() {
-        // RFC 3986 normally allows %41 → 'A', but our alphabet is tighter.
+    fn percent_decode_accepts_any_hex_pair() {
+        // Decoder is intentionally more permissive than the encoder — it
+        // accepts any `%XX` so future encoder changes that escape more
+        // bytes (e.g. `%7F` for DEL) stay wire-compatible with older
+        // decoders that don't escape those bytes.
+        assert_eq!(percent_decode("%41").unwrap(), "A");
+        assert_eq!(percent_decode("%7F").unwrap(), "\x7f");
+        assert_eq!(percent_decode("%0a").unwrap(), "\n");
+    }
+
+    #[test]
+    fn percent_decode_rejects_non_hex_escape() {
+        // The two bytes following `%` must be hex digits — `%XY` is not.
         assert!(matches!(
-            percent_decode("%41"),
+            percent_decode("%XY"),
             Err(ProtoError::Malformed(_))
         ));
+        assert!(matches!(
+            percent_decode("%2G"),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn percent_encode_escapes_control_bytes() {
+        // Control bytes — tab, newline, CR — are escaped so they don't
+        // break the line-oriented kv parser when used in `cmd` values.
+        assert_eq!(percent_encode("\n"), "%0A");
+        assert_eq!(percent_encode("\t"), "%09");
+        assert_eq!(percent_encode("\r"), "%0D");
+        // Printable ASCII (above space) passes through untouched.
+        assert_eq!(percent_encode("git status"), "git%20status");
+        assert_eq!(percent_encode("ls -la"), "ls%20-la");
+    }
+
+    #[test]
+    fn percent_round_trips_command_with_specials() {
+        // A cmd line with shell metacharacters, percent, tab, newline —
+        // must survive encode/decode untouched.
+        let cmd = "echo 'hello\tworld'\n# 50%";
+        assert_eq!(percent_decode(&percent_encode(cmd)).unwrap(), cmd);
+    }
+
+    #[test]
+    fn percent_round_trips_utf8() {
+        // Multi-byte UTF-8 strings must round-trip byte-for-byte.
+        // The original implementation pushed each byte as a char, which
+        // reinterpreted high-bit bytes as Latin-1 and corrupted them when
+        // re-encoded as UTF-8 by the String builder.
+        for s in ["café", "プロジェクト", "naïve résumé", "✨🦀"] {
+            assert_eq!(percent_decode(&percent_encode(s)).unwrap(), s);
+        }
     }
 
     // ── Request encoding ────────────────────────────────────────────────
@@ -521,6 +739,145 @@ mod tests {
     fn decode_request_rejects_quit_with_args() {
         assert!(matches!(
             decode_request("QUIT now"),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    // ── Lifecycle event requests ────────────────────────────────────────
+
+    fn fixture_cmd_start() -> CmdStartEvent {
+        CmdStartEvent {
+            id: "01HW4ZAB12CDEFGHJKMNPQRSTV".to_string(),
+            session_id: "01HW4ZAA00000000000000SESS".to_string(),
+            hostname: "matt-mbp".to_string(),
+            cwd: PathBuf::from("/Users/mim/src/chevron"),
+            cmd: "cargo test".to_string(),
+            started_at_ms: 1_716_350_000_123,
+        }
+    }
+
+    fn fixture_cmd_end() -> CmdEndEvent {
+        CmdEndEvent {
+            id: "01HW4ZAB12CDEFGHJKMNPQRSTV".to_string(),
+            finished_at_ms: 1_716_350_001_456,
+            duration_ms: 1333,
+            exit_status: 0,
+        }
+    }
+
+    #[test]
+    fn encode_decode_cmd_start_simple() {
+        let req = Request::CmdStart(fixture_cmd_start());
+        let line = encode_request(&req);
+        // Snapshot the exact wire format. Key order is fixed: id,
+        // session, host, cwd, started_at, cmd (cmd last so wide values
+        // sit at the right edge of socat dumps).
+        assert_eq!(
+            line,
+            "CMD_START id=01HW4ZAB12CDEFGHJKMNPQRSTV session=01HW4ZAA00000000000000SESS \
+             host=matt-mbp cwd=/Users/mim/src/chevron started_at=1716350000123 cmd=cargo%20test"
+        );
+        assert_eq!(decode_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn encode_decode_cmd_start_with_specials_in_cmd() {
+        // Tabs, newlines, and non-ASCII bytes in the cmd must survive
+        // the kv parser and round-trip cleanly.
+        let req = Request::CmdStart(CmdStartEvent {
+            cmd: "echo 'naïve résumé'\n# 50% off".to_string(),
+            ..fixture_cmd_start()
+        });
+        let line = encode_request(&req);
+        assert!(
+            !line.contains('\n')
+                && !line.contains('\t')
+                && line.split_ascii_whitespace().count() == 7,
+            "encoded line must contain exactly the opcode + 6 kv tokens, no raw whitespace in cmd: {line}"
+        );
+        assert_eq!(decode_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn encode_decode_cmd_start_with_spaces_in_cwd() {
+        let req = Request::CmdStart(CmdStartEvent {
+            cwd: PathBuf::from("/Users/mim/My Project"),
+            ..fixture_cmd_start()
+        });
+        let line = encode_request(&req);
+        assert!(
+            line.contains("cwd=/Users/mim/My%20Project"),
+            "cwd with space should be percent-encoded: {line}"
+        );
+        assert_eq!(decode_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn encode_decode_cmd_end_simple() {
+        let req = Request::CmdEnd(fixture_cmd_end());
+        let line = encode_request(&req);
+        assert_eq!(
+            line,
+            "CMD_END id=01HW4ZAB12CDEFGHJKMNPQRSTV finished_at=1716350001456 \
+             duration_ms=1333 exit=0"
+        );
+        assert_eq!(decode_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn encode_decode_cmd_end_negative_exit() {
+        // Shells map signal-killed processes to exit codes 128 + signum
+        // (positive), but some history layers report negative for
+        // signal kills. We use i32 to accept either convention.
+        let req = Request::CmdEnd(CmdEndEvent {
+            exit_status: -15,
+            ..fixture_cmd_end()
+        });
+        let line = encode_request(&req);
+        assert!(line.contains("exit=-15"), "expected negative exit: {line}");
+        assert_eq!(decode_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn decode_cmd_start_ignores_unknown_keys() {
+        // Forward-compat: a phase-2 or phase-3 server might add fields.
+        // Older parsers must keep working.
+        let line = "CMD_START id=A session=B host=h cwd=/ started_at=0 \
+                    cmd=ls future_field=42 user=mim";
+        let Request::CmdStart(e) = decode_request(line).unwrap() else {
+            panic!("expected CmdStart");
+        };
+        assert_eq!(e.id, "A");
+        assert_eq!(e.cmd, "ls");
+    }
+
+    #[test]
+    fn decode_cmd_start_tolerates_reordering() {
+        let line = "CMD_START cmd=ls started_at=42 cwd=/ host=h session=B id=A";
+        let Request::CmdStart(e) = decode_request(line).unwrap() else {
+            panic!("expected CmdStart");
+        };
+        assert_eq!(e.id, "A");
+        assert_eq!(e.session_id, "B");
+        assert_eq!(e.cmd, "ls");
+        assert_eq!(e.started_at_ms, 42);
+    }
+
+    #[test]
+    fn decode_cmd_start_rejects_missing_required_field() {
+        // Drop `id`.
+        let line = "CMD_START session=B host=h cwd=/ started_at=0 cmd=ls";
+        assert!(matches!(
+            decode_request(line),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn decode_cmd_end_rejects_bad_numeric() {
+        let line = "CMD_END id=A finished_at=notanumber duration_ms=1 exit=0";
+        assert!(matches!(
+            decode_request(line),
             Err(ProtoError::Malformed(_))
         ));
     }
@@ -678,6 +1035,21 @@ mod tests {
     fn decode_none_rejects_args() {
         assert!(matches!(
             decode_response("NONE extra"),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn encode_decode_ack_response() {
+        let line = encode_response(&Response::Ack);
+        assert_eq!(line, "ACK");
+        assert_eq!(decode_response(&line).unwrap(), Response::Ack);
+    }
+
+    #[test]
+    fn decode_ack_rejects_args() {
+        assert!(matches!(
+            decode_response("ACK extra"),
             Err(ProtoError::Malformed(_))
         ));
     }

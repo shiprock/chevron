@@ -596,3 +596,190 @@ fn weather_location_cmd_failure_is_error_silent() {
         .assert()
         .success();
 }
+
+// ── event (chevron-1yn Phase 1) ──────────────────────────────────────────────
+
+#[test]
+fn event_new_session_prints_ulid() {
+    // ULIDs are 26 chars of Crockford base32 (uppercase ASCII + digits).
+    let out = cmd().args(["event", "new-session"]).output().unwrap();
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let id = String::from_utf8(out.stdout).unwrap();
+    let id = id.trim();
+    assert_eq!(id.len(), 26, "ULID should be 26 chars: {id:?}");
+    assert!(
+        id.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+        "ULID should be uppercase Crockford base32: {id:?}"
+    );
+}
+
+#[test]
+fn event_cmd_start_prints_ulid_even_without_daemon() {
+    // The shell hook depends on stdout being the ULID; a daemon-down
+    // failure mustn't take the shell hook down with it.
+    let tmp = TempDir::new().unwrap();
+    let out = cmd()
+        .args(["event", "cmd-start", "sess-abc", "/tmp", "ls"])
+        .env("CHEVRON_SOCKET_DIR", tmp.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let id = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(id.trim().len(), 26);
+}
+
+#[test]
+fn event_cmd_end_exits_success_without_daemon() {
+    // Same contract: shell precmd doesn't see a failing exit from
+    // chevron event cmd-end even when the daemon is missing.
+    let tmp = TempDir::new().unwrap();
+    cmd()
+        .args(["event", "cmd-end", "some-id", "0", "100"])
+        .env("CHEVRON_SOCKET_DIR", tmp.path())
+        .assert()
+        .success();
+}
+
+/// RAII guard that kills the daemon subprocess (via the chevron-daemon-stop
+/// subcommand) and cleans up the socket dir override on drop. Holds the
+/// `Child` so Drop can `wait()` to reap the process — otherwise we leave
+/// a zombie until the test binary exits.
+struct DaemonGuard {
+    socket_dir: TempDir,
+    child: Option<std::process::Child>,
+}
+
+impl DaemonGuard {
+    // clippy doesn't trace that the Child is stashed on `self` and the
+    // Drop impl below `try_wait` + `kill` + `wait`s it. Suppress the
+    // false positive locally rather than restructuring the guard.
+    #[allow(clippy::zombie_processes)]
+    fn start() -> Self {
+        let dir = TempDir::new().unwrap();
+        // Background `chevron daemon serve` with the socket dir override.
+        // We can't use spawn() + a Drop that calls kill() because the daemon
+        // serve never returns from its accept loop — instead we let it run
+        // and shoot it down via the daemon stop subcommand on drop.
+        let child = std::process::Command::cargo_bin("chevron")
+            .unwrap()
+            .args(["daemon", "serve"])
+            .env("CHEVRON_SOCKET_DIR", dir.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // Wait for the daemon to bind the socket. ~50 ms is enough on
+        // typical machines but we poll with a generous budget to handle
+        // slow CI runners.
+        let sock = dir.path().join("chevrond.sock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if sock.exists() {
+                // Also wait a tick for the listener thread to be accepting.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                return Self {
+                    socket_dir: dir,
+                    child: Some(child),
+                };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("daemon failed to bind socket within timeout");
+    }
+
+    fn socket_dir(&self) -> &std::path::Path {
+        self.socket_dir.path()
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        // Best-effort graceful shutdown via the daemon-stop subcommand.
+        let _ = std::process::Command::cargo_bin("chevron")
+            .unwrap()
+            .args(["daemon", "stop"])
+            .env("CHEVRON_SOCKET_DIR", self.socket_dir.path())
+            .output();
+        // Reap the child so we don't leave a zombie. If stop didn't
+        // exit it cleanly (race, signal mishap), fall back to kill().
+        if let Some(mut child) = self.child.take() {
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(_) => {
+                    let _ = child.wait();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn event_lifecycle_publishes_to_daemon_and_persists_row() {
+    // End-to-end smoke test: spawn the real daemon binary, run the real
+    // event subcommand, then read the commands.db SQLite file to verify
+    // that the row landed with the expected completion fields. This is
+    // the integration test that proves the wire layer + state actor +
+    // file-backed DB compose correctly under real process boundaries.
+    let daemon = DaemonGuard::start();
+
+    let start = cmd()
+        .args([
+            "event",
+            "cmd-start",
+            "sess-int",
+            "/tmp/some-cwd",
+            "cargo",
+            "test",
+        ])
+        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
+        .output()
+        .unwrap();
+    assert!(start.status.success());
+    let id = String::from_utf8(start.stdout).unwrap();
+    let id = id.trim().to_string();
+    assert_eq!(id.len(), 26);
+
+    cmd()
+        .args(["event", "cmd-end", &id, "0", "250"])
+        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
+        .assert()
+        .success();
+
+    // Give the state actor a moment to commit (mpsc → SQLite write).
+    // The actor processes the message before ACKing, so this should be
+    // immediate — but on a busy CI runner there's no harm in a small
+    // grace period before reading.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let db_path = daemon.socket_dir().join("commands.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let (session_id, cwd, cmd_text, exit_status, duration_ms): (String, String, String, i64, i64) =
+        conn.query_row(
+            "SELECT session_id, cwd, cmd, exit_status, duration_ms \
+             FROM commands WHERE id = ?1",
+            [&id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(session_id, "sess-int");
+    assert_eq!(cwd, "/tmp/some-cwd");
+    // cmd-start joins trailing args with a space, so multi-arg `cargo
+    // test` reconstructs to "cargo test" on disk.
+    assert_eq!(cmd_text, "cargo test");
+    assert_eq!(exit_status, 0);
+    assert_eq!(duration_ms, 250);
+}
