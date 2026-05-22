@@ -331,20 +331,22 @@ PROMPT_COMMAND=_chevron_precmd
 #[must_use]
 pub fn init_fish() -> &'static str {
     r#"function fish_prompt
-    # Transient branch: short prompt with exit-coloured chevron. Triggered
-    # when the user hits Enter — _chevron_transient_enter sets the flag and
-    # forces a repaint before executing the command. We unset the flag here
-    # so the next full prompt (after the command runs) renders normally.
+    # Transient branch: short prompt fired when the user hits Enter.
+    # _chevron_transient_enter sets the flag and forces a repaint
+    # before executing the command. We unset the flag here so the next
+    # full prompt (after the command runs) renders normally.
+    #
+    # By design, the fish transient chevron stays neutral (no
+    # green/red exit-status colour). The about-to-run command's exit
+    # status is unknowable at collapse time, and fish lacks a
+    # timeout-capable `read` builtin to safely query DSR for the
+    # post-exec cursor-rewrite that zsh uses. We prefer an honest
+    # neutral chevron over a coloured guess that might lie.
     if set -q _chevron_transient_show
         set -e _chevron_transient_show
-        # Neutral chevron — the colour gets corrected in fish_postexec
-        # once the exit status is actually known. See chevron-4xq.
-        # Cursor save for the postexec rewrite happens in fish_preexec
-        # below, after the transient is actually painted.
         test "$CHEVRON_OSC133" != "0"; and printf '\e]133;A\a'
         echo -n '❯ '
         test "$CHEVRON_OSC133" != "0"; and printf '\e]133;B\a'
-        set -g _chevron_transient_pending 1
         return
     end
 
@@ -373,19 +375,11 @@ end
 
 # Post-execution duration tag: fish exposes $CMD_DURATION directly, so we
 # can hook fish_postexec without the timestamp arithmetic zsh needs.
-#
-# Note: the transient chevron stays neutral (no exit-status colour) in
-# fish — see chevron-4xq follow-on. Implementing the cursor-rewrite that
-# zsh uses requires a timeout-capable DSR read which fish's builtin
-# `read` doesn't expose. Tracked separately.
 function _chevron_postexec --on-event fish_postexec
     # Capture $status FIRST — every later command resets it.
     set -l exit_status $status
     # OSC 133 D: previous command finished.
     test "$CHEVRON_OSC133" != "0"; and printf '\e]133;D;%d\a' $exit_status
-    # Clear the pending flag — fish_prompt's transient branch set it
-    # but we don't act on it here (see comment above).
-    set -q _chevron_transient_pending; and set -e _chevron_transient_pending
     test "$CHEVRON_TRANSIENT" = "0"; and return
     set -l threshold $CHEVRON_TRANSIENT_DURATION_MS
     test -z "$threshold"; and set threshold 2000
@@ -939,25 +933,22 @@ mod tests {
     }
 
     #[test]
-    fn fish_transient_stays_neutral_pending_dsr_support() {
-        // fish doesn't yet do the precmd cursor-rewrite — implementing
-        // it requires timeout-capable DSR reads which fish's builtin
-        // `read` doesn't expose. Until then, the transient chevron in
-        // fish stays neutral (no green/red colour) — honest, no glitch.
+    fn fish_transient_stays_neutral_by_design() {
+        // fish's transient chevron is intentionally never colour-
+        // corrected post-hoc. The about-to-run command's exit status
+        // is unknowable at collapse time, and fish lacks a timeout-
+        // capable `read` builtin for the DSR-based cursor rewrite zsh
+        // uses. Rather than risk a hung prompt or a misleading guess,
+        // fish stays neutral. (See the comment block in the fish
+        // transient branch.)
         let out = init_fish();
         assert!(
-            out.contains("set -g _chevron_transient_pending 1"),
-            "fish_prompt's transient branch should still set the pending flag"
-        );
-        // The postexec should clear the flag (so it doesn't accumulate
-        // forever) but should NOT do a cursor rewrite.
-        assert!(
-            out.contains("set -e _chevron_transient_pending"),
-            "fish_postexec should clear the pending flag"
+            !out.contains("_chevron_transient_pending"),
+            "fish no longer tracks a pending flag — there's no rewrite to wait for"
         );
         assert!(
-            !out.contains(r"\e[s\e8\e[A\r\e[2K"),
-            "fish should NOT do the cursor-rewrite (deferred to follow-on)"
+            !out.contains(r"\e[%d;1H\e[2K"),
+            "fish must not do any cursor-rewrite — guard against accidental copies from zsh"
         );
     }
 
