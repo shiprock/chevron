@@ -1,6 +1,6 @@
 [package]
 name = "chevron"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 license = "MIT"
 description = "Configurable powerline prompt segments and tmux window titles for zsh, bash, and fish"
