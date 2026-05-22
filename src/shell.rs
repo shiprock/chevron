@@ -20,33 +20,26 @@ pub fn init_zsh() -> &'static str {
         _chevron_transient_save_row="$REPLY"
     fi
 }
-# Query the current cursor row via DSR (\e[6n). Stores the row number
-# in REPLY; empty on failure. The reader is careful with user typeahead:
-# bytes arriving on /dev/tty before the ESC[<row>;<col>R response are
-# stashed and re-injected via `print -z`, so a fast-typing user doesn't
-# lose keystrokes to a backgrounded DSR exchange.
+# Query the current cursor row via DSR (\e[6n). Stores the row in REPLY
+# (empty on failure). One `read -d 'R'` call instead of a per-byte loop
+# — fewer dispatch overheads, and the 300 ms timeout covers tmux/SSH
+# round-trip latency that a tight 50 ms-per-byte budget can't.
+#
+# The DSR response shape is `\e[<row>;<col>R`. `read -d 'R'` reads up
+# to (but not including) the R terminator, so resp ends up containing
+# `\e[<row>;<col>`. Anything in resp BEFORE the ESC is user typeahead;
+# we strip it out and re-inject via `print -z` so a fast-typing user
+# doesn't lose keystrokes to the DSR exchange.
 _chevron_query_row() {
     REPLY=""
     printf '\e[6n' > /dev/tty 2>/dev/null
-    local char buffer="" pre_esc="" count=0 in_esc=0
-    while (( count < 32 )); do
-        IFS= read -k 1 -s -t 0.05 char < /dev/tty 2>/dev/null
-        [[ -z "$char" ]] && break
-        (( count++ ))
-        if (( in_esc )); then
-            buffer+="$char"
-            [[ "$char" == "R" ]] && break
-        elif [[ "$char" == $'\e' ]]; then
-            in_esc=1
-            buffer="$char"
-        else
-            pre_esc+="$char"
-        fi
-    done
-    [[ -n "$pre_esc" ]] && print -z -- "$pre_esc" 2>/dev/null
-    if [[ "$buffer" == *'['*';'*'R' ]]; then
-        local stripped="${buffer#*\[}"
-        REPLY="${stripped%%;*}"
+    local resp
+    IFS= read -d 'R' -s -t 0.3 resp < /dev/tty 2>/dev/null
+    if [[ "$resp" == *$'\e['* ]]; then
+        local pre_esc="${resp%%$'\e['*}"
+        local payload="${resp#*$'\e['}"
+        REPLY="${payload%%;*}"
+        [[ -n "$pre_esc" ]] && print -z -- "$pre_esc" 2>/dev/null
     fi
 }
 _chevron_precmd() {
