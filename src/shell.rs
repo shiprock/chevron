@@ -10,13 +10,15 @@ pub fn init_zsh() -> &'static str {
     # navigation, grouping, and "copy output only". Older terminals
     # silently ignore unknown OSC sequences.
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;C\a'
-    # DECSC: save cursor at this position (one line below the just-
-    # painted transient prompt) for the precmd transient-colour
-    # rewrite. The transient has actually been painted by now —
-    # ZLE flushed the redraw when the accept-line widget unwound,
-    # then emitted the newline that landed us here.
-    printf '\e7' > /dev/tty 2>/dev/null
-    _chevron_transient_pending=1
+    # Save the cursor's absolute row (via DSR) for the precmd transient-
+    # colour rewrite. preexec fires AFTER ZLE's accept-line newline,
+    # so the cursor is on the row just below the painted transient.
+    # We use DSR + absolute positioning rather than DECSC/DECRC because
+    # some terminals (especially under tmux) silently drop \e8.
+    if [[ "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
+        _chevron_query_row
+        _chevron_transient_save_row="$REPLY"
+    fi
 }
 # Query the current cursor row via DSR (\e[6n). Stores the row number
 # in REPLY; empty on failure. The reader is careful with user typeahead:
@@ -53,57 +55,58 @@ _chevron_precmd() {
     # Emitted first so it closes out the previous command region before
     # we print the duration tag and next prompt's A marker.
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;D;%d\a' $exit_status
-    # Color-correct the transient prompt (chevron-4xq). preexec saved
-    # the cursor via DECSC at the line BELOW the painted transient;
-    # this rewrites the transient line itself with the now-known
-    # exit-status colour.
-    #   query R_current via DSR (where zsh will draw the next PROMPT)
-    #   \e8     DECRC to preexec's save (one line below transient)
-    #   \e[A\r  step UP onto the transient line, col 0
-    #   \e[2K   erase it
-    #   <coloured chevron + cmd>
-    #   \e[<R_current>;1H absolute move back to the next-prompt row
-    # Why DSR + absolute, not SCOSC \e[s + SCORC \e[u: many terminals
-    # (iTerm2, Terminal.app, others) alias the SCO save with DECSC's
-    # slot, so \e[s in here would CLOBBER preexec's save and \e8
-    # would then land at the current row instead of the line below
-    # the transient — putting the rewrite mid-output. DSR-and-absolute
-    # avoids that aliasing entirely.
+    # Color-correct the transient prompt (chevron-4xq). preexec captured
+    # the absolute row of the line below the painted transient (via
+    # DSR). Now we query R_current and absolute-position to (R_saved-1)
+    # to land on the transient line itself, erase it, write the
+    # exit-coloured chevron + cmd, then absolute-position back to
+    # R_current so zsh's main loop draws the next PROMPT where it
+    # belongs.
+    #
+    # Pure DSR + absolute positioning — no DECSC/DECRC and no SCOSC.
+    # The earlier attempts using \e7/\e8 were silently dropped on some
+    # terminals (notably under tmux), causing the rewrite to land on
+    # the command output row instead of the transient row.
+    #
     # Known limitations:
-    #   - Commands that themselves do DECSC/DECRC (vim, less, man, any
-    #     alt-screen app) overwrite preexec's save; the \e8 then lands
-    #     wherever they parked it, and the rewrite glitches. Less
-    #     common than the SCOSC clobber but still a real edge case.
-    #   - Commands whose output scrolls the screen past the transient
-    #     line: the saved row is no longer visible; \e8 + \e[A still
-    #     fires but on the wrong row. Glitch.
-    #   - Multi-line input or wrapped input: only the last visible row
-    #     of the transient gets rewritten.
-    if [[ -n "$_chevron_transient_pending" && "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
+    #   - Output that scrolled the saved row off-screen: the rewrite
+    #     lands somewhere off-visible. Bounded by the `delta < 200`
+    #     sanity check.
+    #   - Multi-line input or wrapped input: we only erase one row;
+    #     other rows of the multi-line transient remain.
+    #   - Terminals that don't support DSR: query returns empty,
+    #     rewrite is skipped, the transient stays neutral grey.
+    if [[ -n "$_chevron_transient_save_row" && "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
         _chevron_query_row
         if [[ -n "$REPLY" ]]; then
             local _chevron_R_current="$REPLY"
-            local _chevron_color_code
-            if (( exit_status == 0 )); then
-                _chevron_color_code=2
-            else
-                _chevron_color_code=1
+            local _chevron_R_saved="$_chevron_transient_save_row"
+            local _chevron_R_transient=$(( _chevron_R_saved - 1 ))
+            local _chevron_delta=$(( _chevron_R_current - _chevron_R_saved ))
+            if (( _chevron_R_transient > 0 && _chevron_delta >= 0 && _chevron_delta < 200 )); then
+                local _chevron_color_code
+                if (( exit_status == 0 )); then
+                    _chevron_color_code=2
+                else
+                    _chevron_color_code=1
+                fi
+                # Cmd may be multi-line; only write its first line so we
+                # don't run past the column we landed on.
+                local _chevron_rewrite_cmd="${_chevron_cmd_title%%$'\n'*}"
+                local _chevron_osc_a=""
+                local _chevron_osc_b=""
+                if [[ "${CHEVRON_OSC133:-1}" != "0" ]]; then
+                    _chevron_osc_a=$'\e]133;A\a'
+                    _chevron_osc_b=$'\e]133;B\a'
+                fi
+                printf '\e[%d;1H\e[2K%s\e[3%dm❯\e[0m %s%s\e[%d;1H' \
+                    "$_chevron_R_transient" \
+                    "$_chevron_osc_a" "$_chevron_color_code" \
+                    "$_chevron_osc_b" "$_chevron_rewrite_cmd" \
+                    "$_chevron_R_current" > /dev/tty 2>/dev/null
             fi
-            # Cmd may be multi-line; rewrite only the first line so we
-            # don't write past the column we landed on.
-            local _chevron_rewrite_cmd="${_chevron_cmd_title%%$'\n'*}"
-            local _chevron_osc_a=""
-            local _chevron_osc_b=""
-            if [[ "${CHEVRON_OSC133:-1}" != "0" ]]; then
-                _chevron_osc_a=$'\e]133;A\a'
-                _chevron_osc_b=$'\e]133;B\a'
-            fi
-            printf '\e8\e[A\r\e[2K%s\e[3%dm❯\e[0m %s%s\e[%d;1H' \
-                "$_chevron_osc_a" "$_chevron_color_code" \
-                "$_chevron_osc_b" "$_chevron_rewrite_cmd" \
-                "$_chevron_R_current" > /dev/tty 2>/dev/null
         fi
-        unset _chevron_transient_pending
+        unset _chevron_transient_save_row
     fi
     local duration_ms=0
     if [[ -n "$_chevron_cmd_start" ]]; then
@@ -470,65 +473,97 @@ mod tests {
     }
 
     #[test]
-    fn zsh_preexec_saves_cursor_for_precmd_rewrite() {
-        // The save MUST be in preexec, not the accept-line widget.
-        // Saving inside the widget runs before ZLE actually paints
-        // the transient (the redraw is buffered until the widget
-        // unwinds), so the save lands at the pre-collapse position
-        // and DECRC later restores to the wrong line.
+    fn zsh_preexec_captures_cursor_row_via_dsr() {
+        // preexec captures the cursor row (one line below the painted
+        // transient) so precmd can absolute-position back. Must be in
+        // preexec, NOT in the accept-line widget — saving inside the
+        // widget runs before ZLE has actually painted the transient.
         let out = init_zsh();
+        let preexec_start = out.find("_chevron_preexec() {").unwrap();
+        let preexec_end = out[preexec_start..]
+            .find("\n}\n")
+            .map(|i| preexec_start + i)
+            .unwrap();
+        let preexec_body = &out[preexec_start..preexec_end];
         assert!(
-            out.contains(r"printf '\e7' > /dev/tty 2>/dev/null"),
-            "preexec must DECSC-save cursor so precmd can rewrite later"
+            preexec_body.contains("_chevron_query_row"),
+            "preexec must call the DSR helper to capture cursor row"
         );
         assert!(
-            out.contains("_chevron_transient_pending=1"),
-            "should set pending flag so precmd knows to rewrite"
+            preexec_body.contains("_chevron_transient_save_row"),
+            "preexec must store the saved row for precmd to read"
         );
-        // And it should NOT be inside _chevron_accept_line.
+        // No DECSC inside the accept-line widget.
         let widget_start = out.find("_chevron_accept_line() {").unwrap();
         let widget_end = out[widget_start..]
             .find("\n}\n")
             .map(|i| widget_start + i)
             .unwrap();
-        let widget_body = &out[widget_start..widget_end];
         assert!(
-            !widget_body.contains("printf '\\e7'"),
-            "save must NOT be in the accept-line widget — ZLE buffers the redraw"
+            !out[widget_start..widget_end].contains(r"printf '\e7'"),
+            "save must NOT be in the accept-line widget"
         );
     }
 
     #[test]
-    fn zsh_precmd_color_corrects_via_cursor_rewrite() {
+    fn zsh_precmd_color_corrects_via_absolute_positioning() {
         let out = init_zsh();
-        // DECRC + up-one + CR + erase + colored chevron + absolute move.
-        // We deliberately do NOT use SCOSC (\e[s) — many terminals alias
-        // its save slot with DECSC, which would clobber preexec's save.
-        // Instead we query R_current via DSR and absolute-move back via
-        // \e[<R>;1H after the rewrite.
+        // Pure DSR + absolute positioning. No DECSC/DECRC anywhere
+        // in the rewrite block — some terminals (notably under tmux)
+        // silently drop \e8.
         assert!(
-            out.contains(r"_chevron_query_row"),
-            "should query cursor row via DSR before the rewrite"
+            out.contains("_chevron_R_transient"),
+            "should compute the transient row from saved row - 1"
         );
         assert!(
-            out.contains(r"\e8\e[A\r\e[2K"),
-            "precmd should DECRC, cursor-up, CR, erase line"
+            out.contains(r"\e[%d;1H\e[2K"),
+            "should absolute-move to transient row and erase"
         );
         assert!(
             out.contains(r"\e[3%dm❯\e[0m"),
             "should emit colour code + chevron + reset"
         );
+        // The format string MUST contain two `\e[%d;1H` — one to land
+        // on the transient line, one to land back on the next-prompt
+        // row after the rewrite.
+        let format_str_count = out.matches(r"\e[%d;1H").count();
         assert!(
-            out.contains(r"\e[%d;1H"),
-            "should absolute-move to R_current (col 1) after rewrite"
+            format_str_count >= 2,
+            "should absolute-position twice (transient then next-prompt), got {format_str_count}"
         );
-        // Reject the SCOSC+DECRC combo (\e[s immediately followed by \e8)
-        // — that's the pattern the first cut used and which broke on
-        // terminals that alias the two save slots. Searches the printf
-        // format strings, not the explanatory prose comments above.
+    }
+
+    #[test]
+    fn zsh_rewrite_does_not_rely_on_decrc_or_scosc() {
+        // Both DECRC (\e8) and SCOSC (\e[s) have known portability
+        // problems: DECRC silently dropped under tmux on some setups,
+        // SCOSC aliased with DECSC's save slot on many terminals.
+        // Search the actual printf format strings, not the explanatory
+        // comments above the rewrite block.
+        let out = init_zsh();
+        let rewrite_start = out
+            .find("Color-correct the transient prompt")
+            .expect("rewrite block exists");
+        // Skip the prose-comment lines; locate the printf invocation.
+        let printf_start = out[rewrite_start..]
+            .find("printf '")
+            .map(|i| rewrite_start + i)
+            .expect("rewrite printf exists");
+        let printf_end = out[printf_start..]
+            .find("' \\\n")
+            .map_or(out.len(), |i| printf_start + i);
+        let printf_fmt = &out[printf_start..printf_end];
         assert!(
-            !out.contains(r"\e[s\e8"),
-            "should NOT pair SCOSC with DECRC (clobbers preexec's save)"
+            !printf_fmt.contains(r"\e8"),
+            "rewrite printf must not use DECRC: {printf_fmt}"
+        );
+        assert!(
+            !printf_fmt.contains(r"\e[s"),
+            "rewrite printf must not use SCOSC: {printf_fmt}"
+        );
+        assert!(
+            !printf_fmt.contains(r"\e[u"),
+            "rewrite printf must not use SCORC: {printf_fmt}"
         );
     }
 
