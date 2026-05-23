@@ -77,6 +77,84 @@ fn write_line(mut conn: &UnixStream, line: &str) -> std::io::Result<()> {
     conn.write_all(buf.as_bytes())
 }
 
+/// Ask the running daemon for its binary / proto / schema versions.
+/// Returns `None` if the daemon isn't reachable or replies with an
+/// unexpected response — callers should treat that as "no daemon"
+/// rather than an error.
+#[must_use]
+pub fn try_version() -> Option<proto::DaemonVersion> {
+    let conn = UnixStream::connect(paths::socket_path()).ok()?;
+    conn.set_read_timeout(Some(QUERY_TIMEOUT)).ok()?;
+    conn.set_write_timeout(Some(QUERY_TIMEOUT)).ok()?;
+
+    let mut reader = BufReader::new(&conn);
+    let mut line = String::new();
+
+    write_line(
+        &conn,
+        &proto::encode_request(&proto::Request::Hello(proto::PROTO_VERSION)),
+    )
+    .ok()?;
+    reader.read_line(&mut line).ok()?;
+    match proto::decode_response(&line).ok()? {
+        proto::Response::Hello(v) if v == proto::PROTO_VERSION => {}
+        _ => return None,
+    }
+
+    line.clear();
+    write_line(&conn, &proto::encode_request(&proto::Request::Version)).ok()?;
+    reader.read_line(&mut line).ok()?;
+    match proto::decode_response(&line).ok()? {
+        proto::Response::Version(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// `chevron daemon version`: print the running daemon's versions and
+/// compare against the CLI's own `CARGO_PKG_VERSION`. Returns 0 if
+/// everything matches or if no daemon is running (informational
+/// — not a failure mode); 1 on a version mismatch the user should
+/// resolve by restarting the daemon.
+#[must_use]
+pub fn print_version() -> i32 {
+    let cli_binary = env!("CARGO_PKG_VERSION");
+    let cli_proto = proto::PROTO_VERSION;
+
+    println!("chevron cli:    {cli_binary} (proto={cli_proto})");
+
+    let Some(v) = try_version() else {
+        println!("chevron daemon: not running");
+        return 0;
+    };
+    println!(
+        "chevron daemon: {} (proto={}, schema={})",
+        v.binary, v.proto, v.schema
+    );
+
+    let mut mismatch = false;
+    if v.binary != cli_binary {
+        eprintln!();
+        eprintln!(
+            "WARNING: daemon binary ({}) differs from CLI ({}).",
+            v.binary, cli_binary
+        );
+        eprintln!("Run `chevron daemon stop && chevron daemon start` to upgrade.");
+        mismatch = true;
+    }
+    if v.proto != cli_proto {
+        eprintln!();
+        eprintln!(
+            "WARNING: daemon proto ({}) differs from CLI ({}) — protocol drift.",
+            v.proto, cli_proto
+        );
+        mismatch = true;
+    }
+    // Schema mismatch isn't necessarily a problem (forward-compat),
+    // but it's worth flagging since most schema bumps come with
+    // CLI-side reader changes too.
+    i32::from(mismatch)
+}
+
 /// Publish a lifecycle event (`CMD_START` or `CMD_END`) to the running
 /// daemon. Returns `true` if the daemon ack'd within [`PUBLISH_TIMEOUT`],
 /// `false` on any failure. The shell hooks treat both as success — a
@@ -225,6 +303,35 @@ mod tests {
         let _dir = spawn_daemon();
         let other = TempDir::new().unwrap();
         assert!(try_query(other.path()).is_none());
+        unsafe { std::env::remove_var("CHEVRON_SOCKET_DIR") };
+    }
+
+    #[test]
+    #[serial]
+    fn try_version_returns_none_when_no_daemon() {
+        let dir = TempDir::new().unwrap();
+        unsafe { std::env::set_var("CHEVRON_SOCKET_DIR", dir.path()) };
+        assert!(try_version().is_none());
+        unsafe { std::env::remove_var("CHEVRON_SOCKET_DIR") };
+    }
+
+    #[test]
+    #[serial]
+    fn try_version_reports_daemon_versions() {
+        // Against a live daemon, the VERSION query should report this
+        // crate's CARGO_PKG_VERSION, the current proto, and the
+        // current schema version. The CLI's print_version() uses the
+        // same source of truth, so a clean upgrade-restart always
+        // shows matching binaries.
+        let _dir = spawn_daemon();
+        let v = try_version().expect("expected a VERSION response");
+        assert_eq!(v.binary, env!("CARGO_PKG_VERSION"));
+        assert_eq!(v.proto, proto::PROTO_VERSION);
+        // Schema is a string; just assert it parses as a positive
+        // integer rather than hardcoding "2" (which would have to
+        // be updated on every schema bump).
+        let schema_n: u32 = v.schema.parse().expect("schema should be numeric");
+        assert!(schema_n >= 1);
         unsafe { std::env::remove_var("CHEVRON_SOCKET_DIR") };
     }
 

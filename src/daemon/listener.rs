@@ -52,7 +52,9 @@ const MAX_LINE_BYTES: usize = 8 * 1024;
 /// and fall back to inline compute.
 ///
 /// Takes `conn` by value so the socket closes on return.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+// Long but linear: one arm per opcode, no nested control flow. Splitting
+// it would hide the simple "match request, send response" shape.
 pub fn handle_connection(conn: UnixStream, state_tx: &Sender<StateMsg>) {
     let _ = conn.set_read_timeout(Some(CONN_TIMEOUT));
     let _ = conn.set_write_timeout(Some(CONN_TIMEOUT));
@@ -124,6 +126,16 @@ pub fn handle_connection(conn: UnixStream, state_tx: &Sender<StateMsg>) {
             Request::CmdEnd(event) => {
                 let _ = state_tx.send(StateMsg::CmdEnd(event));
                 if send_resp(&conn, &Response::Ack).is_err() {
+                    return;
+                }
+            }
+            Request::Version => {
+                let resp = Response::Version(proto::DaemonVersion {
+                    binary: env!("CARGO_PKG_VERSION").to_string(),
+                    proto: proto::PROTO_VERSION,
+                    schema: crate::daemon::state::CURRENT_SCHEMA_VERSION.to_string(),
+                });
+                if send_resp(&conn, &resp).is_err() {
                     return;
                 }
             }

@@ -1214,6 +1214,55 @@ fn history_schema_mismatch_exits_two() {
 use std::io::{BufRead as _, Read};
 use std::os::unix::io::AsRawFd;
 
+// ── daemon version check ─────────────────────────────────────────────────────
+
+#[test]
+fn daemon_version_no_daemon_prints_cli_info_and_exits_zero() {
+    // Without a running daemon, `chevron daemon version` should
+    // still print the CLI's own version + "not running" and exit
+    // cleanly. Not a failure.
+    let dir = TempDir::new().unwrap();
+    let out = cmd()
+        .args(["daemon", "version"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("chevron cli:"),
+        "missing cli line: {stdout}"
+    );
+    assert!(
+        stdout.contains("not running"),
+        "missing 'not running': {stdout}"
+    );
+}
+
+#[test]
+fn daemon_version_against_live_daemon_reports_matching_versions() {
+    // Against a daemon spawned by the same binary, all three
+    // version dimensions (binary, proto, schema) should agree —
+    // and no WARNING lines should appear on stderr.
+    let daemon = DaemonGuard::start();
+    let out = cmd()
+        .args(["daemon", "version"])
+        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("chevron cli:"));
+    assert!(stdout.contains("chevron daemon:"));
+    assert!(
+        !stderr.contains("WARNING"),
+        "matching versions should not warn: {stderr}"
+    );
+}
+
 // ── capture (chevron-1yn.4 Phase 4) ──────────────────────────────────────────
 
 /// Seed an outputs directory + commands.db so we can test the

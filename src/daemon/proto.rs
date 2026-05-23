@@ -12,6 +12,7 @@
 //!   CMD_START id=<ulid> session=<ulid> host=<host> cwd=<path> started_at=<ms> cmd=<cmd>
 //!   CMD_END id=<ulid> finished_at=<ms> duration_ms=<u64> exit=<i32>
 //!   SUBSCRIBE [cwd=<path>]
+//!   VERSION
 //!   QUIT
 //!
 //! Responses (server → client):
@@ -21,6 +22,7 @@
 //!   NONE
 //!   EVENT type=<topic> [cwd=<path>] [id=<ulid>]
 //!   PING <unix-ms>
+//!   VERSION binary=<x.y.z> proto=<u32> schema=<n>
 //!   ERR <reason>
 //! ```
 //!
@@ -130,6 +132,25 @@ pub struct EventPayload {
     pub id: Option<String>,
 }
 
+/// `VERSION` response payload. Reports the daemon's three version
+/// dimensions so a CLI can detect a stale running daemon (binary
+/// older than the on-disk CLI), an incompatible wire protocol, or
+/// an unexpected DB schema. All three default to "matches the CLI"
+/// after a clean upgrade-and-restart cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonVersion {
+    /// `CARGO_PKG_VERSION` of the binary actually running as the daemon.
+    pub binary: String,
+    /// Wire-protocol version the daemon speaks. Distinct from `binary`
+    /// because the protocol stays stable across binary releases when
+    /// possible (forward-compat via unknown-key ignore).
+    pub proto: u32,
+    /// `meta.schema_version` the daemon writes to `commands.db`.
+    /// Distinct from `proto` because schema bumps don't always need
+    /// wire bumps and vice versa.
+    pub schema: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     Hello(u32),
@@ -137,6 +158,9 @@ pub enum Request {
     CmdStart(CmdStartEvent),
     CmdEnd(CmdEndEvent),
     Subscribe(SubscribeSpec),
+    /// Query the running daemon's binary / proto / schema versions.
+    /// Cheap one-shot; returns [`Response::Version`].
+    Version,
     Quit,
 }
 
@@ -155,6 +179,10 @@ pub enum Response {
     /// the subscriber can use to detect daemon-side clock skew or
     /// stuck broadcast pipelines (otherwise just ignored).
     Ping(i64),
+    /// Reply to a `VERSION` request. Lets a CLI detect that the
+    /// running daemon is older than the on-disk binary (most common
+    /// post-upgrade footgun).
+    Version(DaemonVersion),
     Err(String),
 }
 
@@ -191,6 +219,7 @@ pub fn encode_request(req: &Request) -> String {
         Request::CmdStart(e) => encode_cmd_start(e),
         Request::CmdEnd(e) => encode_cmd_end(e),
         Request::Subscribe(s) => encode_subscribe(s),
+        Request::Version => "VERSION".to_string(),
         Request::Quit => "QUIT".to_string(),
     }
 }
@@ -204,8 +233,18 @@ pub fn encode_response(resp: &Response) -> String {
         Response::Ack => "ACK".to_string(),
         Response::Event(e) => encode_event(e),
         Response::Ping(ts) => format!("PING {ts}"),
+        Response::Version(v) => encode_version(v),
         Response::Err(reason) => format!("ERR {}", percent_encode(reason)),
     }
+}
+
+fn encode_version(v: &DaemonVersion) -> String {
+    let mut out = String::with_capacity(48);
+    out.push_str("VERSION");
+    write_kv_str(&mut out, "binary", &v.binary);
+    write_kv_num(&mut out, "proto", v.proto);
+    write_kv_str(&mut out, "schema", &v.schema);
+    out
 }
 
 fn encode_subscribe(s: &SubscribeSpec) -> String {
@@ -370,6 +409,12 @@ pub fn decode_request(line: &str) -> Result<Request, ProtoError> {
         "CMD_START" => decode_cmd_start(rest).map(Request::CmdStart),
         "CMD_END" => decode_cmd_end(rest).map(Request::CmdEnd),
         "SUBSCRIBE" => decode_subscribe(rest).map(Request::Subscribe),
+        "VERSION" => {
+            if !rest.trim().is_empty() {
+                return Err(ProtoError::Malformed("VERSION takes no arguments"));
+            }
+            Ok(Request::Version)
+        }
         "QUIT" => {
             if !rest.trim().is_empty() {
                 return Err(ProtoError::Malformed("QUIT takes no arguments"));
@@ -502,6 +547,7 @@ pub fn decode_response(line: &str) -> Result<Response, ProtoError> {
                 .map_err(|_| ProtoError::Malformed("PING timestamp not an i64"))?;
             Ok(Response::Ping(ts))
         }
+        "VERSION" => decode_version(rest).map(Response::Version),
         "OK" => decode_status_ok(rest).map(|s| Response::Status(Some(s))),
         "ERR" => {
             let reason = percent_decode(rest.trim())?;
@@ -509,6 +555,30 @@ pub fn decode_response(line: &str) -> Result<Response, ProtoError> {
         }
         other => Err(ProtoError::UnknownOpcode(other.to_string())),
     }
+}
+
+fn decode_version(rest: &str) -> Result<DaemonVersion, ProtoError> {
+    let mut binary: Option<String> = None;
+    let mut proto: Option<u32> = None;
+    let mut schema: Option<String> = None;
+    for tok in rest.split_ascii_whitespace() {
+        let (k, v) = tok
+            .split_once('=')
+            .ok_or(ProtoError::Malformed("VERSION kv missing '='"))?;
+        match k {
+            "binary" => binary = Some(percent_decode(v)?),
+            "proto" => proto = Some(parse_u32(v)?),
+            "schema" => schema = Some(percent_decode(v)?),
+            // Forward-compat: future fields (git_rev, build_date, …)
+            // can land without breaking older parsers.
+            _ => {}
+        }
+    }
+    Ok(DaemonVersion {
+        binary: binary.ok_or(ProtoError::Malformed("VERSION missing binary"))?,
+        proto: proto.ok_or(ProtoError::Malformed("VERSION missing proto"))?,
+        schema: schema.ok_or(ProtoError::Malformed("VERSION missing schema"))?,
+    })
 }
 
 fn decode_event(rest: &str) -> Result<EventPayload, ProtoError> {
@@ -1339,5 +1409,59 @@ mod tests {
             decode_response("PING notanumber"),
             Err(ProtoError::Malformed(_))
         ));
+    }
+
+    // ── VERSION (daemon ↔ CLI version check) ────────────────────────────
+
+    #[test]
+    fn encode_decode_version_request() {
+        let req = Request::Version;
+        let line = encode_request(&req);
+        assert_eq!(line, "VERSION");
+        assert_eq!(decode_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn decode_version_request_rejects_args() {
+        assert!(matches!(
+            decode_request("VERSION 0.6.0"),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn encode_decode_version_response() {
+        let resp = Response::Version(DaemonVersion {
+            binary: "0.6.0".to_string(),
+            proto: 1,
+            schema: "2".to_string(),
+        });
+        let line = encode_response(&resp);
+        assert_eq!(line, "VERSION binary=0.6.0 proto=1 schema=2");
+        assert_eq!(decode_response(&line).unwrap(), resp);
+    }
+
+    #[test]
+    fn decode_version_response_rejects_missing_fields() {
+        // Missing schema.
+        assert!(matches!(
+            decode_response("VERSION binary=0.6.0 proto=1"),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn decode_version_response_ignores_unknown_keys() {
+        // Forward-compat: a future daemon could add git_rev= or
+        // build_date= — older parsers must keep working.
+        let resp =
+            decode_response("VERSION binary=0.7.1 proto=1 schema=2 git_rev=abc build_date=2026-05")
+                .unwrap();
+        let Response::Version(v) = resp else {
+            panic!("expected Version");
+        };
+        assert_eq!(v.binary, "0.7.1");
+        assert_eq!(v.proto, 1);
+        assert_eq!(v.schema, "2");
     }
 }

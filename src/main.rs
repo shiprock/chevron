@@ -95,8 +95,9 @@ fn main() {
             }
             Some("stop") => std::process::exit(chevron::daemon::lifecycle::stop()),
             Some("status") => std::process::exit(chevron::daemon::lifecycle::status()),
+            Some("version") => std::process::exit(chevron::daemon::client::print_version()),
             _ => {
-                eprintln!("Usage: chevron daemon <serve|start|stop|status>");
+                eprintln!("Usage: chevron daemon <serve|start|stop|status|version>");
                 std::process::exit(1);
             }
         },
