@@ -273,6 +273,16 @@ mod tests {
         };
         assert!(try_publish_event(&proto::Request::CmdEnd(end)));
 
+        // The listener ACKs lifecycle events as soon as they're queued
+        // for the state actor — actual SQLite commit happens
+        // asynchronously on the state thread. Flush by issuing a
+        // STATUS request: the actor processes messages in mpsc order,
+        // so once the STATUS reply lands, the earlier CmdStart and
+        // CmdEnd have been processed. More robust than a sleep under
+        // load (the original Phase 1 test was flaky in 5x-stress
+        // pre-push runs).
+        let _ = try_query(dir.path());
+
         // Use a fresh read-only connection so the actor's writer-side
         // WAL state still flushes our row to readers. WAL allows
         // concurrent reads against an open writer.
