@@ -25,6 +25,8 @@ pub mod daemon;
 #[cfg(feature = "daemon")]
 pub mod event;
 pub mod health;
+#[cfg(feature = "daemon")]
+pub mod history;
 pub mod repo_status;
 pub mod segments;
 pub mod shell;

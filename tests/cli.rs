@@ -783,3 +783,416 @@ fn event_lifecycle_publishes_to_daemon_and_persists_row() {
     assert_eq!(exit_status, 0);
     assert_eq!(duration_ms, 250);
 }
+
+// ── history (chevron-1yn.2) ─────────────────────────────────────────────────
+
+/// Pre-populate a commands.db with rows for the history-CLI tests. We
+/// bypass the daemon entirely — the wire-layer integration is already
+/// covered by `event_lifecycle_publishes_to_daemon_and_persists_row` —
+/// and instead drive direct rusqlite writes so each test gets a known
+/// fixture set without spawning processes.
+fn seed_commands_db(dir: &std::path::Path) {
+    let conn = rusqlite::Connection::open(dir.join("commands.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '1');
+         CREATE TABLE IF NOT EXISTS commands (
+             id TEXT PRIMARY KEY, session_id TEXT NOT NULL, hostname TEXT NOT NULL,
+             cwd TEXT NOT NULL, cmd TEXT NOT NULL,
+             started_at INTEGER NOT NULL, finished_at INTEGER,
+             duration_ms INTEGER, exit_status INTEGER);",
+    )
+    .unwrap();
+    // Seed five rows with predictable values. Use absolute milli
+    // timestamps so --since-ms tests are deterministic.
+    let rows: &[(&str, &str, &str, i64, Option<i64>)] = &[
+        (
+            "a",
+            "/repo",
+            "cargo test --features daemon",
+            1_716_350_000_000,
+            Some(0),
+        ),
+        ("b", "/repo", "cargo check", 1_716_350_001_000, Some(1)),
+        ("c", "/repo/sub", "git status", 1_716_350_002_000, Some(0)),
+        ("d", "/other", "ls -la", 1_716_350_003_000, Some(0)),
+        ("e", "/repo", "cargo build", 1_716_350_004_000, None), // still running
+    ];
+    for (id, cwd, cmdtxt, started, exit) in rows {
+        let finished = exit.map(|_| started + 100);
+        let dur = exit.map(|_| 100i64);
+        conn.execute(
+            "INSERT OR REPLACE INTO commands \
+             (id, session_id, hostname, cwd, cmd, started_at, finished_at, duration_ms, exit_status) \
+             VALUES (?1, 'sess-test', 'host-test', ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![id, cwd, cmdtxt, started, finished, dur, exit],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn history_no_db_exits_quietly() {
+    let dir = TempDir::new().unwrap();
+    // No commands.db exists in this tempdir.
+    let out = cmd()
+        .arg("history")
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR") // avoid leaking a real db in
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    assert!(
+        out.stdout.is_empty(),
+        "stdout should be empty: {:?}",
+        out.stdout
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no commands.db"),
+        "stderr should explain missing db: {stderr}"
+    );
+}
+
+#[test]
+fn history_default_prints_all_rows() {
+    let dir = TempDir::new().unwrap();
+    seed_commands_db(dir.path());
+    let out = cmd()
+        .arg("history")
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // All 5 rows should appear.
+    for cmd_text in [
+        "cargo test --features daemon",
+        "cargo check",
+        "git status",
+        "ls -la",
+        "cargo build",
+    ] {
+        assert!(
+            stdout.contains(cmd_text),
+            "missing {cmd_text:?} in: {stdout}"
+        );
+    }
+    // Default order is oldest-at-top for human format → the LAST line
+    // should be the most-recent row.
+    let last_line = stdout.lines().last().unwrap_or("");
+    assert!(
+        last_line.contains("cargo build"),
+        "newest row should be at the bottom: {stdout}"
+    );
+}
+
+#[test]
+fn history_grep_filters_substring() {
+    let dir = TempDir::new().unwrap();
+    seed_commands_db(dir.path());
+    let out = cmd()
+        .args(["history", "--grep", "cargo"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("cargo test"));
+    assert!(stdout.contains("cargo check"));
+    assert!(stdout.contains("cargo build"));
+    assert!(!stdout.contains("git status"));
+    assert!(!stdout.contains("ls -la"));
+}
+
+#[test]
+fn history_positional_is_grep_shortcut() {
+    let dir = TempDir::new().unwrap();
+    seed_commands_db(dir.path());
+    let out = cmd()
+        .args(["history", "git"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("git status"));
+    assert!(!stdout.contains("cargo"));
+}
+
+#[test]
+fn history_failed_excludes_zero_and_running() {
+    let dir = TempDir::new().unwrap();
+    seed_commands_db(dir.path());
+    let out = cmd()
+        .args(["history", "--failed"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Only `cargo check` (exit 1) should show.
+    assert!(stdout.contains("cargo check"));
+    assert!(!stdout.contains("cargo test"));
+    assert!(!stdout.contains("cargo build")); // running, NULL exit
+    assert!(!stdout.contains("git status"));
+}
+
+#[test]
+fn history_cwd_filter_exact_match() {
+    let dir = TempDir::new().unwrap();
+    seed_commands_db(dir.path());
+    let out = cmd()
+        .args(["history", "--cwd", "/repo"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // /repo matches but /repo/sub doesn't (exact-match, not prefix).
+    assert!(stdout.contains("cargo test"));
+    assert!(stdout.contains("cargo check"));
+    assert!(stdout.contains("cargo build"));
+    assert!(!stdout.contains("git status")); // /repo/sub
+    assert!(!stdout.contains("ls -la")); // /other
+}
+
+#[test]
+fn history_json_format_is_valid_ndjson() {
+    let dir = TempDir::new().unwrap();
+    seed_commands_db(dir.path());
+    let out = cmd()
+        .args(["history", "--format", "json"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Each line should parse via a minimal shape check: starts with {
+    // and ends with }, contains the required keys.
+    for line in stdout.lines() {
+        assert!(
+            line.starts_with('{') && line.ends_with('}'),
+            "bad NDJSON line: {line:?}"
+        );
+        for key in ["\"id\":", "\"cwd\":", "\"cmd\":", "\"started_at\":"] {
+            assert!(line.contains(key), "missing {key} in {line:?}");
+        }
+    }
+    // NDJSON is newest-first by design (matches SQL ORDER BY).
+    let first = stdout.lines().next().unwrap_or("");
+    assert!(
+        first.contains("cargo build"),
+        "newest row should be first: {first}"
+    );
+}
+
+#[test]
+fn history_cmds_format_one_per_line() {
+    let dir = TempDir::new().unwrap();
+    seed_commands_db(dir.path());
+    let out = cmd()
+        .args(["history", "--format", "cmds", "--grep", "cargo"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "expected 3 cargo cmds, got {lines:?}");
+    assert!(lines.contains(&"cargo build"));
+}
+
+#[test]
+fn history_unique_collapses_duplicates() {
+    let dir = TempDir::new().unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("commands.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '1');
+         CREATE TABLE IF NOT EXISTS commands (
+             id TEXT PRIMARY KEY, session_id TEXT NOT NULL, hostname TEXT NOT NULL,
+             cwd TEXT NOT NULL, cmd TEXT NOT NULL,
+             started_at INTEGER NOT NULL, finished_at INTEGER,
+             duration_ms INTEGER, exit_status INTEGER);",
+    )
+    .unwrap();
+    // Three `ls` rows, two `ps` rows.
+    for (id, cmd_text, started) in [
+        ("a", "ls", 1_000),
+        ("b", "ls", 2_000),
+        ("c", "ls", 3_000),
+        ("d", "ps", 4_000),
+        ("e", "ps", 5_000),
+    ] {
+        conn.execute(
+            "INSERT INTO commands (id, session_id, hostname, cwd, cmd, started_at, finished_at, duration_ms, exit_status) \
+             VALUES (?1, 's', 'h', '/', ?2, ?3, ?3 + 50, 50, 0)",
+            rusqlite::params![id, cmd_text, started],
+        )
+        .unwrap();
+    }
+    let out = cmd()
+        .args(["history", "--unique", "--format", "cmds"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines.len(), 2, "expected 2 unique cmds, got {lines:?}");
+}
+
+#[test]
+fn history_since_ms_filters_time_window() {
+    let dir = TempDir::new().unwrap();
+    seed_commands_db(dir.path());
+    let out = cmd()
+        .args(["history", "--since-ms", "1716350002500", "--format", "cmds"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Only rows started_at >= 1716350002500 should remain: 'ls -la'
+    // (1716350003000) and 'cargo build' (1716350004000).
+    let cmds: Vec<&str> = stdout.lines().collect();
+    assert_eq!(cmds.len(), 2, "expected 2 cmds in window: {cmds:?}");
+    assert!(cmds.contains(&"cargo build"));
+    assert!(cmds.contains(&"ls -la"));
+}
+
+#[test]
+fn history_template_format_substitutes_fields() {
+    let dir = TempDir::new().unwrap();
+    seed_commands_db(dir.path());
+    let out = cmd()
+        .args([
+            "history",
+            "--grep",
+            "git",
+            "--format",
+            "{cmd} :: {cwd} :: {exit}",
+        ])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("git status :: /repo/sub :: 0"),
+        "template substitution failed: {stdout}"
+    );
+}
+
+#[test]
+fn history_exclude_cwd_drops_rows() {
+    let dir = TempDir::new().unwrap();
+    seed_commands_db(dir.path());
+    let out = cmd()
+        .args(["history", "--exclude-cwd", "/repo", "--format", "cmds"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let cmds: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    // /repo/sub and /other remain; /repo dropped.
+    assert!(cmds.contains(&"git status".to_string()));
+    assert!(cmds.contains(&"ls -la".to_string()));
+    assert!(!cmds.iter().any(|c| c.starts_with("cargo")));
+}
+
+#[test]
+fn history_reverse_flips_order() {
+    let dir = TempDir::new().unwrap();
+    seed_commands_db(dir.path());
+    let out = cmd()
+        .args(["history", "--reverse", "--format", "cmds"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let cmds: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    // cmds format default order is newest-first; --reverse flips to
+    // oldest-first.
+    assert_eq!(
+        cmds.first().map(String::as_str),
+        Some("cargo test --features daemon")
+    );
+}
+
+#[test]
+fn history_help_lists_filters() {
+    let out = cmd().args(["history", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for needle in ["--cwd", "--failed", "--since", "--limit", "--format"] {
+        assert!(
+            stdout.contains(needle),
+            "help should list {needle}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn history_bad_arg_exits_two() {
+    let out = cmd().args(["history", "--mystery-flag"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn history_conflicting_filters_exit_two() {
+    let out = cmd()
+        .args(["history", "--failed", "--success"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn history_schema_mismatch_exits_two() {
+    let dir = TempDir::new().unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("commands.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta(key, value) VALUES('schema_version', '999');",
+    )
+    .unwrap();
+    let out = cmd()
+        .arg("history")
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("999"),
+        "stderr should mention bad version: {stderr}"
+    );
+}
