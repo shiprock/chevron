@@ -270,6 +270,8 @@ mod tests {
             finished_at_ms: 250,
             duration_ms: 150,
             exit_status: 0,
+            output_bytes: None,
+            output_truncated: None,
         };
         assert!(try_publish_event(&proto::Request::CmdEnd(end)));
 

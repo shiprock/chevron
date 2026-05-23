@@ -25,6 +25,8 @@
 //!   --until-ms MS           unix-epoch-ms upper bound (escape hatch)
 //!   --workspace             current git work-tree (path prefix)
 //!   --grep PATTERN, -g      substring match in cmd
+//!   --grep-output PAT, -G   substring match in captured output (Phase 4)
+//!   --show-output ID        dump captured bytes for one cmd id (Phase 4)
 //!   PATTERN                 positional shortcut for --grep
 //!
 //! Filters (negative):
@@ -54,6 +56,7 @@
 //! the row counter. Atuin compat.
 
 use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::types::Value;
@@ -70,7 +73,7 @@ const DEFAULT_LIMIT: usize = 25;
 /// Schema version this CLI understands. Bumping the daemon's
 /// `schema_version` requires a coordinated CLI update; older history
 /// builds error out rather than silently misinterpreting columns.
-const SUPPORTED_SCHEMA: &str = "1";
+const SUPPORTED_SCHEMA: &str = "2";
 
 #[derive(Debug, Clone, Default)]
 enum Format {
@@ -99,6 +102,15 @@ struct Filters {
     until_ms: Option<i64>,
     workspace_prefix: Option<String>,
     grep: Option<String>,
+    /// Phase 4 (chevron-1yn.4): match against captured output files
+    /// instead of the cmd column. Implemented post-SQL by scanning
+    /// the per-command output file with ANSI-stripped substring
+    /// search.
+    grep_output: Option<String>,
+    /// Phase 4: short-circuit the normal listing and dump the
+    /// captured output of one specific command id to stdout. Returns
+    /// 1 if no row exists for that id or no output was captured.
+    show_output: Option<String>,
     exclude_cwd: Option<String>,
     exclude_host: Option<String>,
     exclude_exit: Option<i32>,
@@ -149,6 +161,13 @@ pub fn run(args: &[String]) -> i32 {
         return 2;
     }
 
+    // Phase 4 (chevron-1yn.4): --show-output short-circuits the
+    // normal listing. Dump the captured bytes (ANSI intact) for the
+    // given command id directly to stdout.
+    if let Some(id) = &filters.show_output {
+        return show_output(&db_path, id);
+    }
+
     let (sql, params) = build_query(&filters);
     let now_ms = now_unix_ms();
     let use_color = stdout_is_color_tty();
@@ -160,6 +179,20 @@ pub fn run(args: &[String]) -> i32 {
             eprintln!("chevron history: query: {e}");
             return 2;
         }
+    };
+
+    // Phase 4: post-filter by output content if --grep-output set.
+    // Implemented as a post-SQL step rather than a SQL JOIN because
+    // the output lives on disk (per-id files), not in a table. We
+    // scan only candidate rows that survived the SQL filters — the
+    // bigger the cmd/cwd filter, the cheaper this gets.
+    let rows: Vec<Row> = if let Some(pat) = &filters.grep_output {
+        let outputs_dir = paths::socket_dir().join("outputs");
+        rows.into_iter()
+            .filter(|r| output_contains(&outputs_dir, &r.id, pat))
+            .collect()
+    } else {
+        rows
     };
 
     // SQL returns newest-first (ORDER BY started_at DESC). For human
@@ -253,6 +286,14 @@ fn parse_args(args: &[String]) -> Result<Filters, ParseOutcome> {
             }
             "--grep" | "-g" => {
                 f.grep = Some(take_val(i, "--grep")?);
+                i += 1;
+            }
+            "--grep-output" | "-G" => {
+                f.grep_output = Some(take_val(i, "--grep-output")?);
+                i += 1;
+            }
+            "--show-output" => {
+                f.show_output = Some(take_val(i, "--show-output")?);
                 i += 1;
             }
             "--exclude-cwd" => {
@@ -598,6 +639,122 @@ fn execute(conn: &Connection, sql: &str, params: &[Value]) -> rusqlite::Result<V
     Ok(rows)
 }
 
+// ── output capture support (Phase 4) ────────────────────────────────────────
+
+/// Per-file scan cap for `--grep-output`. A `find /` capture
+/// shouldn't pin a query for tens of seconds — bail at 50 MB. Real
+/// captures cap at 10 MB by default (`CHEVRON_CAPTURE_MAX_MB`) so
+/// this is mostly a guard against pathological
+/// `CHEVRON_CAPTURE_MAX_MB` values that escaped the per-write cap.
+const MAX_GREP_OUTPUT_SCAN_BYTES: u64 = 50 * 1024 * 1024;
+
+fn output_path_for(outputs_dir: &Path, id: &str) -> PathBuf {
+    outputs_dir.join(format!("{id}.log"))
+}
+
+/// `true` if the output file for `id` contains `pattern` (substring,
+/// after ANSI stripping). Returns `false` for missing files or files
+/// over the scan cap.
+fn output_contains(outputs_dir: &Path, id: &str, pattern: &str) -> bool {
+    let path = output_path_for(outputs_dir, id);
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return false;
+    };
+    if meta.len() > MAX_GREP_OUTPUT_SCAN_BYTES {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(&path) else {
+        return false;
+    };
+    // Strip ANSI escapes so colored "error" still matches a plain
+    // "error" search. Lossy-utf8 first so we can use str search; the
+    // alternative would be a byte-level memmem over stripped bytes,
+    // but typical output is mostly ASCII anyway.
+    let text = String::from_utf8_lossy(&bytes);
+    let stripped = strip_ansi(&text);
+    stripped.contains(pattern)
+}
+
+/// `chevron history --show-output <id>`: dump the captured bytes
+/// (ANSI intact) to stdout. Returns 0 on success, 1 if no row or no
+/// capture, 2 on I/O error.
+fn show_output(db_path: &Path, id: &str) -> i32 {
+    let Some(outputs_dir) = db_path.parent().map(|p| p.join("outputs")) else {
+        eprintln!("chevron history: --show-output: can't resolve outputs dir");
+        return 2;
+    };
+    let path = output_path_for(&outputs_dir, id);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("chevron history: no captured output for {id}");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("chevron history: reading {}: {e}", path.display());
+            return 2;
+        }
+    };
+    let mut stdout = std::io::stdout().lock();
+    if stdout.write_all(&bytes).is_err() {
+        return 0; // EPIPE — downstream closed; not an error.
+    }
+    let _ = stdout.flush();
+    0
+}
+
+/// Strip ANSI control sequences (CSI: `ESC [ … letter`) and OSC
+/// (`ESC ] … BEL` or `… ST`) so substring search isn't fooled by
+/// color escapes around the user's literal text. Hand-rolled because
+/// pulling in a dep for this would be silly — the grammar is tiny.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'[' => {
+                    // CSI: skip until a final byte in @–~ (0x40–0x7E).
+                    i += 2;
+                    while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1; // consume the final byte
+                    }
+                    continue;
+                }
+                b']' => {
+                    // OSC: skip until BEL (0x07) or ST (ESC \).
+                    i += 2;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                _ => {
+                    // Other ESC sequence (e.g. ESC = for keypad mode).
+                    // Skip ESC + next byte and keep going.
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 // ── output formatting ───────────────────────────────────────────────────────
 
 fn format_row(row: &Row, idx: usize, fmt: &Format, color: bool, now_ms: i64) -> String {
@@ -917,6 +1074,8 @@ Filters:
   --until-ms MS            unix-epoch-ms upper bound
   --workspace              limit to the current git work-tree
   --grep PATTERN, -g       substring match against cmd
+  --grep-output PAT, -G    substring match against captured output
+  --show-output ID         dump captured bytes for one command id
   PATTERN                  positional shortcut for --grep
 
 Exclusions:
@@ -1138,7 +1297,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta(key, value) VALUES('schema_version', '1');
+             INSERT INTO meta(key, value) VALUES('schema_version', '2');
              CREATE TABLE commands (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -1148,7 +1307,9 @@ mod tests {
                 started_at INTEGER NOT NULL,
                 finished_at INTEGER,
                 duration_ms INTEGER,
-                exit_status INTEGER);",
+                exit_status INTEGER,
+                output_bytes INTEGER,
+                output_truncated INTEGER NOT NULL DEFAULT 0);",
         )
         .unwrap();
         conn
@@ -1407,7 +1568,7 @@ mod tests {
     // ── schema check ────────────────────────────────────────────────────
 
     #[test]
-    fn schema_check_passes_for_version_1() {
+    fn schema_check_passes_for_current_version() {
         let conn = fixture_conn();
         assert!(check_schema(&conn).is_ok());
     }
@@ -1422,5 +1583,75 @@ mod tests {
         .unwrap();
         let err = check_schema(&conn).unwrap_err();
         assert!(err.contains("999"), "err: {err}");
+    }
+
+    // ── Phase 4 (chevron-1yn.4): output capture support ─────────────────
+
+    #[test]
+    fn strip_ansi_removes_csi_color_codes() {
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(strip_ansi("\x1b[1;33mboldyellow\x1b[m"), "boldyellow");
+        assert_eq!(
+            strip_ansi("error: \x1b[1;31mpanic\x1b[0m at line 5"),
+            "error: panic at line 5"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_sequences() {
+        // OSC 0 (window title) terminated by BEL.
+        assert_eq!(strip_ansi("\x1b]0;title\x07after"), "after");
+        // OSC 8 (hyperlink) terminated by ST (ESC \\).
+        assert_eq!(
+            strip_ansi("\x1b]8;;url\x1b\\link\x1b]8;;\x1b\\done"),
+            "linkdone"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_passes_through_plain_text() {
+        let plain = "hello world\nno escapes here\t1 + 2 = 3";
+        assert_eq!(strip_ansi(plain), plain);
+    }
+
+    #[test]
+    fn output_contains_finds_pattern_after_ansi_strip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Write a file with a color-wrapped "error" in it.
+        std::fs::write(
+            tmp.path().join("id-1.log"),
+            b"build ok\n\x1b[1;31merror:\x1b[0m linker failed\n",
+        )
+        .unwrap();
+        assert!(output_contains(tmp.path(), "id-1", "error"));
+        assert!(output_contains(tmp.path(), "id-1", "linker"));
+        assert!(!output_contains(tmp.path(), "id-1", "nope"));
+    }
+
+    #[test]
+    fn output_contains_handles_missing_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Just don't create any file.
+        assert!(!output_contains(tmp.path(), "missing-id", "anything"));
+    }
+
+    #[test]
+    fn output_contains_skips_files_over_cap() {
+        use std::io::{Seek as _, SeekFrom};
+
+        // Manually exercise the cap branch: write a file with a known
+        // sentinel content but size exceeding the cap. (The cap is
+        // 50 MB so this test only runs if MAX_GREP_OUTPUT_SCAN_BYTES
+        // is reasonable; skip if it'd be slow.)
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("huge.log");
+        // Use sparse-file semantics so we don't actually allocate
+        // 51 MB of disk. seek-and-write is fast.
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.seek(SeekFrom::Start(MAX_GREP_OUTPUT_SCAN_BYTES + 1))
+            .unwrap();
+        f.write_all(b"x").unwrap();
+        drop(f);
+        assert!(!output_contains(tmp.path(), "huge", "x"));
     }
 }

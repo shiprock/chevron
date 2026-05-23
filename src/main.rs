@@ -75,6 +75,8 @@ fn main() {
         Some("status") => repo_status::run(),
         Some("health") => std::process::exit(health::run(&args[2..])),
         #[cfg(feature = "daemon")]
+        Some("capture") => std::process::exit(chevron::capture::run(&args[2..])),
+        #[cfg(feature = "daemon")]
         Some("event") => std::process::exit(chevron::event::run(&args[2..])),
         #[cfg(feature = "daemon")]
         Some("history") => std::process::exit(chevron::history::run(&args[2..])),
@@ -124,6 +126,8 @@ fn main() {
                 "health",
                 #[cfg(feature = "daemon")]
                 "daemon",
+                #[cfg(feature = "daemon")]
+                "capture",
                 #[cfg(feature = "daemon")]
                 "event",
                 #[cfg(feature = "daemon")]

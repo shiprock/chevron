@@ -801,14 +801,19 @@ fn event_lifecycle_publishes_to_daemon_and_persists_row() {
 /// fixture set without spawning processes.
 fn seed_commands_db(dir: &std::path::Path) {
     let conn = rusqlite::Connection::open(dir.join("commands.db")).unwrap();
+    // Seed the v2 schema directly (matches what production daemons
+    // write after chevron-1yn.4 lands). The Phase 4 output_* columns
+    // are nullable so existing fixture rows don't need them.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '1');
+         INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '2');
          CREATE TABLE IF NOT EXISTS commands (
              id TEXT PRIMARY KEY, session_id TEXT NOT NULL, hostname TEXT NOT NULL,
              cwd TEXT NOT NULL, cmd TEXT NOT NULL,
              started_at INTEGER NOT NULL, finished_at INTEGER,
-             duration_ms INTEGER, exit_status INTEGER);",
+             duration_ms INTEGER, exit_status INTEGER,
+             output_bytes INTEGER,
+             output_truncated INTEGER NOT NULL DEFAULT 0);",
     )
     .unwrap();
     // Seed five rows with predictable values. Use absolute milli
@@ -1029,12 +1034,13 @@ fn history_unique_collapses_duplicates() {
     let conn = rusqlite::Connection::open(dir.path().join("commands.db")).unwrap();
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '1');
+         INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '2');
          CREATE TABLE IF NOT EXISTS commands (
              id TEXT PRIMARY KEY, session_id TEXT NOT NULL, hostname TEXT NOT NULL,
              cwd TEXT NOT NULL, cmd TEXT NOT NULL,
              started_at INTEGER NOT NULL, finished_at INTEGER,
-             duration_ms INTEGER, exit_status INTEGER);",
+             duration_ms INTEGER, exit_status INTEGER,
+             output_bytes INTEGER, output_truncated INTEGER NOT NULL DEFAULT 0);",
     )
     .unwrap();
     // Three `ls` rows, two `ps` rows.
@@ -1207,6 +1213,207 @@ fn history_schema_mismatch_exits_two() {
 
 use std::io::{BufRead as _, Read};
 use std::os::unix::io::AsRawFd;
+
+// ── capture (chevron-1yn.4 Phase 4) ──────────────────────────────────────────
+
+/// Seed an outputs directory + commands.db so we can test the
+/// post-SQL `--grep-output` / `--show-output` paths without spinning
+/// up the real `chevron capture` binary (PTY-using; covered in unit
+/// tests).
+fn seed_outputs(dir: &std::path::Path) {
+    seed_commands_db(dir);
+    let outputs = dir.join("outputs");
+    std::fs::create_dir_all(&outputs).unwrap();
+    // Attach an output file to row "b" (cargo check, exit 1) with a
+    // color-wrapped error in it.
+    std::fs::write(
+        outputs.join("b.log"),
+        b"checking project...\n\x1b[1;31merror:\x1b[0m unused variable `x`\n",
+    )
+    .unwrap();
+    // Row "d" (ls -la) gets innocuous output, no match for "error".
+    std::fs::write(
+        outputs.join("d.log"),
+        b"total 0\ndrwxr-xr-x 2 mim staff 64\n",
+    )
+    .unwrap();
+    // Mark the rows as having captured output.
+    let conn = rusqlite::Connection::open(dir.join("commands.db")).unwrap();
+    conn.execute(
+        "UPDATE commands SET output_bytes = ?1 WHERE id = 'b'",
+        rusqlite::params![
+            i64::try_from(std::fs::metadata(outputs.join("b.log")).unwrap().len()).unwrap()
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE commands SET output_bytes = ?1 WHERE id = 'd'",
+        rusqlite::params![
+            i64::try_from(std::fs::metadata(outputs.join("d.log")).unwrap().len()).unwrap()
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn capture_no_args_exits_one_with_usage() {
+    let out = cmd().arg("capture").output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Usage"), "stderr: {stderr}");
+}
+
+#[test]
+fn capture_help_exits_zero() {
+    let out = cmd().args(["capture", "--help"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn capture_runs_command_and_creates_output_file() {
+    // End-to-end: spawn daemon, run `chevron capture echo hi`, verify
+    // the output file lands in $SOCKET_DIR/outputs and the DB row
+    // records output_bytes.
+    let daemon = DaemonGuard::start();
+    let out = cmd()
+        .args(["capture", "echo", "phase-4-echo-test"])
+        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "capture exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("phase-4-echo-test"),
+        "stdout should still show the echo output: {stdout}"
+    );
+
+    // Flush actor before reading the DB (same trick as Phase 1's
+    // lifecycle e2e test).
+    cmd()
+        .arg("git")
+        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
+        .assert()
+        .success();
+
+    let db = rusqlite::Connection::open(daemon.socket_dir().join("commands.db")).unwrap();
+    let (cmd_text, output_bytes, output_truncated): (String, i64, i64) = db
+        .query_row(
+            "SELECT cmd, output_bytes, output_truncated FROM commands \
+             WHERE cmd LIKE 'echo phase-4-echo-test%' \
+             ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("expected a row");
+    assert_eq!(cmd_text, "echo phase-4-echo-test");
+    // Echo's output is "phase-4-echo-test\r\n" (18 bytes after PTY
+    // adds \r). Allow some slack for terminal noise.
+    assert!(
+        (17..=32).contains(&output_bytes),
+        "unexpected output_bytes: {output_bytes}"
+    );
+    assert_eq!(output_truncated, 0);
+
+    // Look up the id and verify the file exists.
+    let id: String = db
+        .query_row(
+            "SELECT id FROM commands WHERE cmd = 'echo phase-4-echo-test' ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let log_path = daemon
+        .socket_dir()
+        .join("outputs")
+        .join(format!("{id}.log"));
+    let bytes = std::fs::read(&log_path).expect("output file should exist");
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("phase-4-echo-test"),
+        "log content: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
+
+#[test]
+fn history_grep_output_finds_color_wrapped_match() {
+    let dir = TempDir::new().unwrap();
+    seed_outputs(dir.path());
+    let out = cmd()
+        .args(["history", "--grep-output", "error", "--format", "cmds"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Only row "b" has "error" in its output (color-wrapped).
+    assert!(
+        stdout.lines().any(|l| l == "cargo check"),
+        "expected `cargo check` row, got: {stdout}"
+    );
+    // Row "d" has no "error" in its captured output.
+    assert!(!stdout.contains("ls -la"));
+}
+
+#[test]
+fn history_grep_output_skips_rows_with_no_capture() {
+    // Only rows "b" and "d" have output files; the other seed rows
+    // don't. --grep-output for a pattern not in either file returns
+    // nothing.
+    let dir = TempDir::new().unwrap();
+    seed_outputs(dir.path());
+    let out = cmd()
+        .args([
+            "history",
+            "--grep-output",
+            "nope-not-here",
+            "--format",
+            "cmds",
+        ])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "expected empty stdout, got: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn history_show_output_dumps_captured_bytes() {
+    let dir = TempDir::new().unwrap();
+    seed_outputs(dir.path());
+    let out = cmd()
+        .args(["history", "--show-output", "b"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // ANSI escapes preserved (we only strip for SEARCH, not display).
+    let bytes = out.stdout;
+    assert!(bytes.windows(7).any(|w| w == b"\x1b[1;31m"));
+    assert!(String::from_utf8_lossy(&bytes).contains("error:"));
+}
+
+#[test]
+fn history_show_output_missing_id_exits_one() {
+    let dir = TempDir::new().unwrap();
+    seed_outputs(dir.path());
+    let out = cmd()
+        .args(["history", "--show-output", "no-such-id"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no captured output"), "stderr: {stderr}");
+}
 
 // ── subscribe (chevron-1yn.3 Phase 3) ────────────────────────────────────────
 

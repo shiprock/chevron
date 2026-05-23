@@ -19,6 +19,8 @@
 
 #[cfg(feature = "banner")]
 pub mod banner;
+#[cfg(feature = "daemon")]
+pub mod capture;
 pub mod color;
 pub mod config;
 pub mod daemon;

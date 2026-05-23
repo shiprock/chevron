@@ -78,6 +78,10 @@ pub fn run(args: &[String]) -> i32 {
                 finished_at_ms: now_ms(),
                 duration_ms,
                 exit_status,
+                // Regular cmd-end (no chcap wrapping) leaves the
+                // Phase-4 output fields unset on the wire.
+                output_bytes: None,
+                output_truncated: None,
             });
             let _ = client::try_publish_event(&req);
             0

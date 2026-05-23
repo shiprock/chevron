@@ -90,12 +90,22 @@ pub struct CmdStartEvent {
 /// `CMD_END` payload. `id` refers to a previously-published
 /// [`CmdStartEvent`]; if the daemon never saw the start (e.g. the shell
 /// hook fired into a then-dead daemon), the update is a silent no-op.
+///
+/// `output_bytes` and `output_truncated` are Phase 4 additions
+/// (chevron-1yn.4). When `chevron capture` wraps a command, it sets
+/// `output_bytes` to the number of bytes written to the capture file
+/// and `output_truncated` to true if the file hit the size cap.
+/// Regular (non-wrapped) `CMD_END` events leave both fields `None`,
+/// which serialises to "omit the kv on the wire" — older daemons
+/// just ignore the unknown keys and never read them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CmdEndEvent {
     pub id: String,
     pub finished_at_ms: i64,
     pub duration_ms: u64,
     pub exit_status: i32,
+    pub output_bytes: Option<i64>,
+    pub output_truncated: Option<bool>,
 }
 
 /// `SUBSCRIBE` payload. Phase 3 (chevron-1yn.3): a long-lived
@@ -235,12 +245,22 @@ fn encode_cmd_start(e: &CmdStartEvent) -> String {
 }
 
 fn encode_cmd_end(e: &CmdEndEvent) -> String {
-    let mut out = String::with_capacity(80);
+    let mut out = String::with_capacity(96);
     out.push_str("CMD_END");
     write_kv_str(&mut out, "id", &e.id);
     write_kv_num(&mut out, "finished_at", e.finished_at_ms);
     write_kv_num(&mut out, "duration_ms", e.duration_ms);
     write_kv_num(&mut out, "exit", e.exit_status);
+    if let Some(n) = e.output_bytes {
+        write_kv_num(&mut out, "output_bytes", n);
+    }
+    if let Some(t) = e.output_truncated {
+        write_kv_raw(
+            &mut out,
+            "output_truncated",
+            if t { "true" } else { "false" },
+        );
+    }
     out
 }
 
@@ -415,6 +435,8 @@ fn decode_cmd_end(rest: &str) -> Result<CmdEndEvent, ProtoError> {
     let mut finished_at: Option<i64> = None;
     let mut duration_ms: Option<u64> = None;
     let mut exit: Option<i32> = None;
+    let mut output_bytes: Option<i64> = None;
+    let mut output_truncated: Option<bool> = None;
     for tok in rest.split_ascii_whitespace() {
         let (k, v) = tok
             .split_once('=')
@@ -424,6 +446,8 @@ fn decode_cmd_end(rest: &str) -> Result<CmdEndEvent, ProtoError> {
             "finished_at" => finished_at = Some(parse_i64(v)?),
             "duration_ms" => duration_ms = Some(parse_u64(v)?),
             "exit" => exit = Some(parse_i32(v)?),
+            "output_bytes" => output_bytes = Some(parse_i64(v)?),
+            "output_truncated" => output_truncated = Some(parse_bool(v)?),
             _ => {}
         }
     }
@@ -432,6 +456,8 @@ fn decode_cmd_end(rest: &str) -> Result<CmdEndEvent, ProtoError> {
         finished_at_ms: finished_at.ok_or(ProtoError::Malformed("CMD_END missing finished_at"))?,
         duration_ms: duration_ms.ok_or(ProtoError::Malformed("CMD_END missing duration_ms"))?,
         exit_status: exit.ok_or(ProtoError::Malformed("CMD_END missing exit"))?,
+        output_bytes,
+        output_truncated,
     })
 }
 
@@ -888,6 +914,8 @@ mod tests {
             finished_at_ms: 1_716_350_001_456,
             duration_ms: 1333,
             exit_status: 0,
+            output_bytes: None,
+            output_truncated: None,
         }
     }
 
@@ -948,6 +976,35 @@ mod tests {
              duration_ms=1333 exit=0"
         );
         assert_eq!(decode_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn encode_decode_cmd_end_with_capture_metadata() {
+        // Phase 4 (chevron-1yn.4): chcap-wrapped commands carry
+        // output_bytes + output_truncated. Regular cmd-end leaves them
+        // None, which serialises to "omit the keys".
+        let req = Request::CmdEnd(CmdEndEvent {
+            output_bytes: Some(42_000),
+            output_truncated: Some(true),
+            ..fixture_cmd_end()
+        });
+        let line = encode_request(&req);
+        assert!(line.contains("output_bytes=42000"), "got: {line}");
+        assert!(line.contains("output_truncated=true"), "got: {line}");
+        assert_eq!(decode_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn encode_cmd_end_omits_capture_keys_when_none() {
+        // Backward-compat: pre-Phase-4 daemons don't know about
+        // output_bytes / output_truncated. The encoder must omit the
+        // keys entirely when they're None so a v1 daemon receiving a
+        // v2-encoded CMD_END from a v2 chevron event still parses
+        // correctly (the unknown-key forward-compat path).
+        let req = Request::CmdEnd(fixture_cmd_end());
+        let line = encode_request(&req);
+        assert!(!line.contains("output_bytes"), "got: {line}");
+        assert!(!line.contains("output_truncated"), "got: {line}");
     }
 
     #[test]

@@ -281,11 +281,27 @@ impl State {
         // between start and end, or end arrived for an event we never
         // saw). Phase 2's history query just won't see this row's
         // completion fields; it's still in the table.
+        //
+        // output_bytes and output_truncated default to None on the
+        // wire when the command wasn't wrapped by `chevron capture`.
+        // COALESCE preserves prior values (in case CMD_END is replayed
+        // — currently never happens but the protocol allows it).
         let _ = self.db.execute(
-            "UPDATE commands \
-             SET finished_at = ?2, duration_ms = ?3, exit_status = ?4 \
+            "UPDATE commands SET \
+                finished_at = ?2, \
+                duration_ms = ?3, \
+                exit_status = ?4, \
+                output_bytes = COALESCE(?5, output_bytes), \
+                output_truncated = COALESCE(?6, output_truncated) \
              WHERE id = ?1",
-            rusqlite::params![e.id, e.finished_at_ms, e.duration_ms, e.exit_status,],
+            rusqlite::params![
+                e.id,
+                e.finished_at_ms,
+                e.duration_ms,
+                e.exit_status,
+                e.output_bytes,
+                e.output_truncated.map(i64::from),
+            ],
         );
     }
 
@@ -492,6 +508,13 @@ pub fn open_memory_db() -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// Current commands-db schema version. Bumped whenever the on-disk
+/// shape changes incompatibly enough that older history-CLI builds
+/// might misinterpret rows. v1 → v2 added Phase 4 output-capture
+/// columns; the migration is metadata-only (ALTER TABLE ADD COLUMN
+/// with defaults) so existing rows preserve their original meaning.
+pub const CURRENT_SCHEMA_VERSION: &str = "2";
+
 fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
     // WAL gives concurrent readers + one writer with no journal-file
     // contention; synchronous=NORMAL gives durability up to the last
@@ -521,6 +544,38 @@ fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_commands_cwd          ON commands(cwd);
         CREATE INDEX IF NOT EXISTS idx_commands_started_at   ON commands(started_at);
         CREATE INDEX IF NOT EXISTS idx_commands_exit_status  ON commands(exit_status);",
+    )?;
+    migrate_v1_to_v2(conn)?;
+    Ok(())
+}
+
+/// Add the Phase 4 output-capture columns and bump `schema_version`
+/// to `'2'`. Idempotent — re-running on a v2 DB is a no-op because
+/// we detect the stored version FIRST rather than try/catch the
+/// `ALTER TABLE` statements (older `rusqlite` versions surface
+/// column-already-exists as a `SqliteFailure` that's awkward to
+/// filter cleanly).
+fn migrate_v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
+    let version: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "1".to_string());
+    if version == CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+    // SQLite ALTER TABLE ADD COLUMN is metadata-only (no table
+    // rewrite) so this is fast even on large commands tables.
+    // `output_bytes` is NULL for rows captured pre-Phase-4 or
+    // commands run without `chcap` — meaning "no output captured".
+    // `output_truncated` defaults to 0 (i.e. "not truncated") so
+    // existing rows have well-defined values for the new column.
+    conn.execute_batch(
+        "ALTER TABLE commands ADD COLUMN output_bytes INTEGER;
+         ALTER TABLE commands ADD COLUMN output_truncated INTEGER NOT NULL DEFAULT 0;
+         UPDATE meta SET value = '2' WHERE key = 'schema_version';",
     )?;
     Ok(())
 }
@@ -703,15 +758,17 @@ mod tests {
 
     #[test]
     fn fs_event_invalidates_matching_workdir() {
-        // Drive an Insert via a real .git tempdir so the state thread can
-        // actually register a watch; then synthesise an FsEvent for a
-        // child of that gitdir and verify the cache entry is dropped.
+        // We synthesise FsEvents via tx.send() rather than relying on
+        // the real notify watcher, so spawn_no_watcher is sufficient
+        // — and avoids the FSEventStream init latency on macOS that
+        // can push the test past its recv_timeout budget under
+        // parallel test stress.
         let tmp = tempfile::TempDir::new().unwrap();
         let workdir = tmp.path().to_path_buf();
         let git_dir = workdir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
 
-        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap());
         insert(&tx, &workdir, &git_dir, "master");
         assert!(query(&tx, workdir.clone()).is_some());
 
@@ -730,13 +787,14 @@ mod tests {
     #[test]
     fn fs_event_for_unrelated_path_is_ignored() {
         // FS event for a path nowhere near a registered gitdir must not
-        // disturb existing cache entries.
+        // disturb existing cache entries. spawn_no_watcher avoids
+        // FSEventStream init latency (see fs_event_invalidates_matching_workdir).
         let tmp = tempfile::TempDir::new().unwrap();
         let workdir = tmp.path().to_path_buf();
         let git_dir = workdir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
 
-        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap());
         insert(&tx, &workdir, &git_dir, "master");
 
         tx.send(StateMsg::FsEvent(vec![PathBuf::from("/var/log/something")]))
@@ -795,6 +853,8 @@ mod tests {
             finished_at_ms: 2_500,
             duration_ms: 1_500,
             exit_status: 0,
+            output_bytes: None,
+            output_truncated: None,
         }
     }
 
@@ -912,7 +972,7 @@ mod tests {
     fn open_db_seeds_schema_version_and_is_idempotent() {
         // Opening twice on the same dir must succeed (CREATE TABLE IF
         // NOT EXISTS + INSERT OR IGNORE keep things deterministic) and
-        // the schema_version row must read back as '1'.
+        // the schema_version row must read back as the current version.
         let tmp = tempfile::TempDir::new().unwrap();
         let _ = open_db(tmp.path()).unwrap();
         let conn = open_db(tmp.path()).unwrap();
@@ -923,7 +983,75 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "1");
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_adds_output_columns_and_preserves_rows() {
+        // Hand-craft a v1-shaped DB with one row, then call open_db.
+        // After migration: schema_version bumps to '2', the row still
+        // exists, and the new columns are queryable with sensible
+        // defaults (NULL for output_bytes, 0 for output_truncated).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("commands.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta(key, value) VALUES('schema_version', '1');
+                 CREATE TABLE commands (
+                     id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                     hostname TEXT NOT NULL, cwd TEXT NOT NULL, cmd TEXT NOT NULL,
+                     started_at INTEGER NOT NULL, finished_at INTEGER,
+                     duration_ms INTEGER, exit_status INTEGER);
+                 INSERT INTO commands(id, session_id, hostname, cwd, cmd, started_at)
+                     VALUES('legacy-1', 's', 'h', '/', 'echo hi', 100);",
+            )
+            .unwrap();
+        }
+
+        // Open via the production path — triggers the migration.
+        let conn = open_db(tmp.path()).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2");
+
+        let (cmd, output_bytes, output_truncated): (String, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT cmd, output_bytes, output_truncated FROM commands WHERE id = ?1",
+                ["legacy-1"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(cmd, "echo hi");
+        assert!(
+            output_bytes.is_none(),
+            "legacy row should have NULL output_bytes"
+        );
+        assert_eq!(output_truncated, 0);
+    }
+
+    #[test]
+    fn migrate_idempotent_on_v2_db() {
+        // Opening a v2 DB twice should be a no-op the second time.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _ = open_db(tmp.path()).unwrap();
+        // Second open should not fail (the ALTER TABLE would error on
+        // a re-add but we short-circuit on version match).
+        let conn = open_db(tmp.path()).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2");
     }
 
     // ── Phase 3 (chevron-1yn.3): subscriber broadcast ───────────────────
@@ -965,14 +1093,15 @@ mod tests {
 
     #[test]
     fn fs_event_broadcasts_to_subscribers() {
-        // Drive a real .git tempdir + Insert so the workdir is in the
-        // watches map (FsEvent only fires for known watches).
+        // Drive an Insert to register the workdir in the watches
+        // map; spawn_no_watcher's logical-watch tracking is enough
+        // since we synthesise the FsEvent ourselves.
         let tmp = tempfile::TempDir::new().unwrap();
         let workdir = tmp.path().to_path_buf();
         let git_dir = workdir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
 
-        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap());
         insert(&tx, &workdir, &git_dir, "master");
         let (event_rx, _id) = subscribe(&tx);
 
@@ -993,13 +1122,14 @@ mod tests {
     fn fs_event_coalesces_multiple_paths_per_workdir() {
         // A real git operation fires N events per logical change
         // (HEAD, refs, index, …). The broadcaster should emit ONE
-        // event per affected workdir, not N.
+        // event per affected workdir, not N. We synthesise the
+        // events via tx.send() so spawn_no_watcher is sufficient.
         let tmp = tempfile::TempDir::new().unwrap();
         let workdir = tmp.path().to_path_buf();
         let git_dir = workdir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
 
-        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap());
         insert(&tx, &workdir, &git_dir, "master");
         let (event_rx, _id) = subscribe(&tx);
 
@@ -1022,6 +1152,8 @@ mod tests {
 
     #[test]
     fn subscriber_cwd_filter_skips_other_workdirs() {
+        // spawn_no_watcher to avoid FSEventStream init latency
+        // (synthetic FsEvents drive this test).
         let tmp_a = tempfile::TempDir::new().unwrap();
         let tmp_b = tempfile::TempDir::new().unwrap();
         let workdir_a = tmp_a.path().to_path_buf();
@@ -1031,7 +1163,7 @@ mod tests {
         std::fs::create_dir_all(&git_a).unwrap();
         std::fs::create_dir_all(&git_b).unwrap();
 
-        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap());
         insert(&tx, &workdir_a, &git_a, "master");
         insert(&tx, &workdir_b, &git_b, "master");
 
@@ -1063,12 +1195,13 @@ mod tests {
 
     #[test]
     fn disconnected_subscriber_pruned_on_next_broadcast() {
+        // spawn_no_watcher: synthetic FsEvent.
         let tmp = tempfile::TempDir::new().unwrap();
         let workdir = tmp.path().to_path_buf();
         let git_dir = workdir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
 
-        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap());
         insert(&tx, &workdir, &git_dir, "master");
 
         let (event_tx, event_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAP);
