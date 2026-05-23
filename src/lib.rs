@@ -30,6 +30,8 @@ pub mod history;
 pub mod repo_status;
 pub mod segments;
 pub mod shell;
+#[cfg(feature = "daemon")]
+pub mod subscribe;
 pub mod sysinfo;
 #[cfg(feature = "weather")]
 pub mod weather;

@@ -215,6 +215,11 @@ _chevron_precmd() {
         fi
     fi
     unset _chevron_cmd_title
+    # Phase 3 (chevron-1yn.3): stash exit_status + duration_ms so the
+    # live subscriber callback (which fires between prompts, not from
+    # precmd) can call _chevron_start_async with realistic args.
+    _chevron_last_exit=$exit_status
+    _chevron_last_duration=$duration_ms
 }
 # Async fast-path machinery (chevron-7fs.5). Off by default; enable with
 # CHEVRON_ASYNC=1. The background process renders a fresh prompt and
@@ -303,6 +308,54 @@ fi
 # bookkeeping short-circuits without forking.
 if [[ "${CHEVRON_HISTORY:-1}" != "0" && -z "$_chevron_session_id" ]]; then
     _chevron_session_id=$(chevron event new-session 2>/dev/null)
+fi
+# Live subscriber callback (chevron-1yn.3 Phase 3). Fires from zle
+# context when `chevron subscribe`'s background pipe becomes readable
+# — i.e., when chevrond saw a state change (FS-watched .git/ event,
+# command finished elsewhere, etc.). Reads one EVENT line, debounces
+# bursts, and kicks the existing async render path so the prompt
+# redraws with fresh state.
+_chevron_live_callback() {
+    local fd=$1
+    local line
+    # Read available input. On EOF (chevron subscribe died, daemon
+    # restarted, etc.) unregister + close the fd; the user can
+    # re-enable Phase 3 by opening a new shell.
+    if ! IFS= read -r line <&$fd; then
+        zle -F "$fd" 2>/dev/null
+        exec {fd}<&- 2>/dev/null
+        unset _chevron_live_fd
+        return
+    fi
+    # The subscriber filters PINGs out, so we should only see EVENT
+    # lines here — but guard defensively in case of future changes.
+    [[ "$line" != EVENT* ]] && return
+    # Debounce. A single `git commit` fires several FS events that the
+    # daemon coalesces per workdir, but bursts from `git rebase` etc.
+    # can still produce a handful within ms of each other. One redraw
+    # per 100 ms is plenty for human-perceptible liveness.
+    local now_ms=$(( EPOCHREALTIME * 1000 ))
+    now_ms=${now_ms%.*}
+    local last_ms=${_chevron_live_last_ms:-0}
+    if (( now_ms - last_ms < 100 )); then
+        return
+    fi
+    _chevron_live_last_ms=$now_ms
+    # Spawn a background render using the existing async pipeline.
+    # The completion callback (_chevron_async_callback) sets PROMPT
+    # and calls zle reset-prompt, redrawing the prompt in place.
+    local _exit=${_chevron_last_exit:-0}
+    local _dur=${_chevron_last_duration:-0}
+    local _jobs=${(%):-%j}
+    _chevron_start_async "$_exit" "$_dur" "$_jobs"
+}
+# Spawn the subscriber helper and register the zle -F handler when
+# CHEVRON_LIVE=1. Off by default until shaken out across terminals.
+# The subscriber inherits SIGHUP from this shell on exit, so its
+# lifecycle is bounded — no need to track a PID for cleanup.
+if [[ "${CHEVRON_LIVE:-0}" != "0" ]]; then
+    exec {_chevron_live_fd}< <(chevron subscribe 2>/dev/null)
+    zle -F "$_chevron_live_fd" _chevron_live_callback
 fi
 "#
 }
@@ -1186,6 +1239,102 @@ mod tests {
         assert!(
             out.contains(r#"string match -q ' *' -- "$argv[1]""#),
             "fish lifecycle hook must skip leading-space (ignorespace) commands"
+        );
+    }
+
+    // ── chevron-1yn.3 Phase 3: live prompt subscriber ───────────────────
+
+    #[test]
+    fn zsh_live_subscriber_off_by_default() {
+        let out = init_zsh();
+        // The spawn block is gated on CHEVRON_LIVE != 0; default value
+        // is 0, so out-of-the-box behavior is identical to pre-Phase-3.
+        assert!(
+            out.contains("${CHEVRON_LIVE:-0}"),
+            "live subscriber should be gated on CHEVRON_LIVE env var"
+        );
+    }
+
+    #[test]
+    fn zsh_live_subscriber_spawns_chevron_subscribe() {
+        let out = init_zsh();
+        assert!(
+            out.contains("exec {_chevron_live_fd}< <(chevron subscribe"),
+            "live mode should spawn `chevron subscribe` via process substitution"
+        );
+        assert!(
+            out.contains(r#"zle -F "$_chevron_live_fd" _chevron_live_callback"#),
+            "live mode should register a zle -F callback on the subscriber's stdout fd"
+        );
+    }
+
+    #[test]
+    fn zsh_live_callback_uses_async_pipeline() {
+        // The live callback reuses the existing async render
+        // pipeline so we don't duplicate prompt-render logic. It
+        // should call _chevron_start_async with stashed exit + duration.
+        let out = init_zsh();
+        let cb_start = out.find("_chevron_live_callback() {").unwrap();
+        let cb_end = out[cb_start..].find("\n}\n").map(|i| cb_start + i).unwrap();
+        let body = &out[cb_start..cb_end];
+        assert!(
+            body.contains("_chevron_start_async"),
+            "live callback should kick the async render path"
+        );
+        assert!(
+            body.contains("_chevron_last_exit"),
+            "live callback should use the precmd-stashed last exit"
+        );
+    }
+
+    #[test]
+    fn zsh_live_callback_debounces_event_bursts() {
+        // A burst of FS events (git rebase, fetch + merge) shouldn't
+        // trigger N renders. The callback should compare timestamps
+        // and bail if within the debounce window.
+        let out = init_zsh();
+        let cb_start = out.find("_chevron_live_callback() {").unwrap();
+        let cb_end = out[cb_start..].find("\n}\n").map(|i| cb_start + i).unwrap();
+        let body = &out[cb_start..cb_end];
+        assert!(
+            body.contains("_chevron_live_last_ms"),
+            "callback should compare against a stashed last-event timestamp"
+        );
+        assert!(
+            body.contains("< 100"),
+            "callback should debounce within 100ms"
+        );
+    }
+
+    #[test]
+    fn zsh_live_callback_unregisters_on_eof() {
+        // When the subscriber pipe closes (daemon restart, helper
+        // died), the callback should unregister itself so we don't
+        // burn CPU on a busy-empty fd.
+        let out = init_zsh();
+        let cb_start = out.find("_chevron_live_callback() {").unwrap();
+        let cb_end = out[cb_start..].find("\n}\n").map(|i| cb_start + i).unwrap();
+        let body = &out[cb_start..cb_end];
+        assert!(
+            body.contains("zle -F \"$fd\""),
+            "callback should call `zle -F fd` (no handler) on EOF to unregister"
+        );
+    }
+
+    #[test]
+    fn zsh_precmd_stashes_last_exit_and_duration() {
+        // The live callback needs realistic args for _chevron_start_async.
+        // precmd is the only place that knows the last command's exit
+        // status and duration, so it must stash them globally for the
+        // callback to read between prompts.
+        let out = init_zsh();
+        assert!(
+            out.contains("_chevron_last_exit=$exit_status"),
+            "precmd should stash exit_status into a module-scope var"
+        );
+        assert!(
+            out.contains("_chevron_last_duration=$duration_ms"),
+            "precmd should stash duration_ms into a module-scope var"
         );
     }
 }

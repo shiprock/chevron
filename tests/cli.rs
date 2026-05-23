@@ -1204,3 +1204,172 @@ fn history_schema_mismatch_exits_two() {
         "stderr should mention bad version: {stderr}"
     );
 }
+
+use std::io::{BufRead as _, Read};
+use std::os::unix::io::AsRawFd;
+
+// ── subscribe (chevron-1yn.3 Phase 3) ────────────────────────────────────────
+
+#[test]
+fn subscribe_no_daemon_exits_two() {
+    let dir = TempDir::new().unwrap();
+    let out = cmd()
+        .arg("subscribe")
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("daemon not running"),
+        "stderr should explain: {stderr}"
+    );
+}
+
+#[test]
+fn subscribe_help_exits_one_with_usage() {
+    // The current arg parser treats `--help` as an error and prints
+    // usage to stderr. That's fine for the helper subcommand — users
+    // don't typically discover it via `--help`; the shell init wires
+    // it up automatically.
+    let out = cmd().args(["subscribe", "--help"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--cwd"),
+        "usage should mention --cwd: {stderr}"
+    );
+}
+
+#[test]
+fn subscribe_bad_arg_exits_one() {
+    let out = cmd().args(["subscribe", "--mystery"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn subscribe_receives_git_event_from_real_daemon() {
+    // End-to-end: spawn a real daemon, spawn `chevron subscribe` as
+    // a child capturing its stdout, drive an FS event by writing
+    // inside the watched gitdir via a STATUS request first (to
+    // register the watch) and then a synthetic file touch.
+    //
+    // We test the SHELL-OBSERVED contract: lines of `EVENT type=git
+    // cwd=…` appear on the subscriber's stdout when a watched
+    // gitdir changes. This is the linchpin of Phase 3 — if this
+    // test passes, the shell can wire up reset-prompt with confidence.
+    let daemon = DaemonGuard::start();
+
+    // Make a real git repo in a tempdir so the daemon registers an
+    // FS watch when we STATUS it.
+    let repo_dir = TempDir::new().unwrap();
+    init_repo(repo_dir.path());
+    let repo_path = repo_dir.path().canonicalize().unwrap();
+
+    // STATUS once to make the daemon discover + watch the repo.
+    // We do this through `chevron git` (which calls status_for_cwd).
+    cmd()
+        .arg("git")
+        .current_dir(&repo_path)
+        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
+        .assert()
+        .success();
+
+    // Spawn the subscriber as a child; capture its stdout.
+    let mut sub_child = std::process::Command::cargo_bin("chevron")
+        .unwrap()
+        .arg("subscribe")
+        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let sub_stdout = sub_child.stdout.take().unwrap();
+
+    // Give the subscriber a moment to complete its handshake. Until
+    // its SUBSCRIBE is registered, events would be missed.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // Fire a synthetic gitdir event: touch a file under .git/. The
+    // notify watcher should pick this up on macOS and Linux.
+    let head_path = repo_path.join(".git").join("HEAD");
+    // Append a byte rather than replace — keeps git happy enough.
+    std::fs::write(&head_path, std::fs::read(&head_path).unwrap()).unwrap();
+
+    // Read one line from the subscriber's stdout within a generous
+    // timeout. Use a separate thread + channel so the test can
+    // bound the wait.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(sub_stdout);
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_ok() {
+            let _ = tx.send(line);
+        }
+    });
+
+    let line = rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("expected EVENT line within timeout");
+    assert!(
+        line.starts_with("EVENT type=git"),
+        "unexpected line: {line:?}"
+    );
+    assert!(line.contains("cwd="), "EVENT missing cwd: {line:?}");
+
+    // Clean up the subscriber. Killing it triggers the daemon's
+    // disconnected-subscriber pruning on next broadcast.
+    let _ = sub_child.kill();
+    let _ = sub_child.wait();
+}
+
+#[test]
+fn subscribe_filters_out_ping_heartbeats() {
+    // PING lines from the daemon should be consumed silently by the
+    // subscriber helper. The shell's zle -F handler wakes on stdout
+    // readability, so a PING that leaked through would cause a
+    // spurious prompt redraw every 60s.
+    //
+    // We test by spawning a daemon with a SHORT heartbeat (50ms via
+    // a test-only entry point would be ideal, but we don't expose
+    // that). Instead we verify the indirect contract: when no real
+    // events fire, the subscriber's stdout stays empty.
+    let daemon = DaemonGuard::start();
+    let mut sub_child = std::process::Command::cargo_bin("chevron")
+        .unwrap()
+        .arg("subscribe")
+        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let sub_stdout = sub_child.stdout.take().unwrap();
+
+    // 100ms is enough to confirm no immediate spurious output (the
+    // daemon's default 60s heartbeat is far longer than this). We're
+    // testing that the subscriber doesn't echo its own PING noise to
+    // stdout — not the heartbeat cadence itself (covered in
+    // unit-level relay_loop tests).
+    let fd = sub_stdout.as_raw_fd();
+    // SAFETY: fcntl with F_GETFL / F_SETFL on a stdout fd we own is
+    // documented-safe; the value of `flags | O_NONBLOCK` is a valid
+    // file-status-flags bitmask.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let mut buf = [0u8; 256];
+    let mut reader = sub_stdout;
+    let n = reader.read(&mut buf).unwrap_or(0);
+    assert_eq!(
+        n,
+        0,
+        "subscriber should not emit anything when no events fire, got {:?}",
+        std::str::from_utf8(&buf[..n]).unwrap_or("<binary>")
+    );
+
+    let _ = sub_child.kill();
+    let _ = sub_child.wait();
+}

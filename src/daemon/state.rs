@@ -29,14 +29,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::Connection;
 
-use super::proto::{CmdEndEvent, CmdStartEvent};
+use super::proto::{CmdEndEvent, CmdStartEvent, EventPayload};
 use crate::segments::git::RepoStatus;
 
 /// Cache freshness window. Tight enough that working-tree edits not
@@ -61,6 +61,24 @@ impl CacheEntry {
     fn is_fresh(&self, now: Instant, ttl: Duration) -> bool {
         now.duration_since(self.computed_at) < ttl
     }
+}
+
+/// Per-subscriber bounded mailbox depth. Slow subscribers (their
+/// relay thread blocked on socket write because the peer's read end
+/// is wedged) shed events past this cap rather than growing daemon
+/// memory unboundedly. 32 is generous for the prompt-refresh use
+/// case — bursts of FS events from `git rebase` etc. coalesce in
+/// the broadcaster's mind anyway, and a single redraw catches up.
+pub const SUBSCRIBER_CHANNEL_CAP: usize = 32;
+
+/// Per-subscriber registration. `sender` is the actor's end of a
+/// bounded channel; the listener-side relay thread owns the receiver
+/// and writes each message to the socket. `cwd_filter` narrows
+/// broadcasts; `None` means "all events". The id is opaque, just for
+/// debugging logs and the actor's bookkeeping.
+pub struct Subscriber {
+    pub sender: SyncSender<EventPayload>,
+    pub cwd_filter: Option<PathBuf>,
 }
 
 pub enum StateMsg {
@@ -92,6 +110,15 @@ pub enum StateMsg {
     /// keyed by `id`. Silent no-op if no matching row exists (e.g. the
     /// daemon was restarted between start and end).
     CmdEnd(CmdEndEvent),
+    /// Register a Phase 3 subscriber. The actor adds it to the
+    /// broadcast list and replies with its assigned id on `reply` so
+    /// the listener can ACK back to the client only after the
+    /// registration is durable (no events lost between ACK and
+    /// register).
+    Subscribe {
+        subscriber: Subscriber,
+        reply: Sender<u64>,
+    },
     /// Stop the actor. Mainly for tests; production exits via signal.
     Shutdown,
 }
@@ -111,6 +138,14 @@ struct State {
     /// queries against this file (Phase 2's `chevron history`) will
     /// open separate read-only connections under WAL.
     db: Connection,
+    /// Phase 3 (chevron-1yn.3): live-prompt subscribers. Each entry
+    /// is one connected `chevron subscribe` helper; the actor pushes
+    /// `EventPayload`s into the channel when state changes, and the
+    /// per-connection relay thread on the listener side drains them
+    /// to its socket. Disconnected channels are pruned lazily on the
+    /// next broadcast attempt.
+    subscribers: HashMap<u64, Subscriber>,
+    next_subscriber_id: u64,
 }
 
 impl State {
@@ -121,6 +156,8 @@ impl State {
             last_query: HashMap::new(),
             watcher,
             db,
+            subscribers: HashMap::new(),
+            next_subscriber_id: 1,
         }
     }
 
@@ -152,11 +189,28 @@ impl State {
     }
 
     fn invalidate_for_event_paths(&mut self, paths: &[PathBuf]) {
+        // Coalesce: a single git operation often fires many FS events
+        // (HEAD, refs, index, ORIG_HEAD, …). Collect the distinct
+        // workdirs affected and broadcast once per workdir instead of
+        // once per path. The cache invalidation itself is per-path
+        // (and idempotent) but the subscriber notification benefits
+        // from deduping.
+        let mut affected: Vec<PathBuf> = Vec::new();
         for p in paths {
             if let Some(workdir) = resolve_workdir(&self.watches, p) {
                 let workdir = workdir.clone();
                 self.cache.remove(&workdir);
+                if !affected.contains(&workdir) {
+                    affected.push(workdir);
+                }
             }
+        }
+        for workdir in affected {
+            self.broadcast(&EventPayload {
+                topic: "git".to_string(),
+                cwd: Some(workdir),
+                id: None,
+            });
         }
     }
 
@@ -234,6 +288,66 @@ impl State {
             rusqlite::params![e.id, e.finished_at_ms, e.duration_ms, e.exit_status,],
         );
     }
+
+    /// Look up the cwd of a recorded command. Used when broadcasting
+    /// `cmd` events because `CmdEndEvent` doesn't carry cwd (it's
+    /// small on purpose — completions are matched to starts by id).
+    /// Returns `None` if the row isn't present, which happens if
+    /// Phase 1's `CmdStart` never landed for this id.
+    fn cmd_cwd(&self, id: &str) -> Option<PathBuf> {
+        self.db
+            .query_row("SELECT cwd FROM commands WHERE id = ?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()
+            .map(PathBuf::from)
+    }
+
+    fn add_subscriber(&mut self, subscriber: Subscriber) -> u64 {
+        let id = self.next_subscriber_id;
+        self.next_subscriber_id = self.next_subscriber_id.wrapping_add(1);
+        self.subscribers.insert(id, subscriber);
+        id
+    }
+
+    /// Broadcast `payload` to subscribers whose `cwd_filter` matches
+    /// (or is None). Lazy-prunes subscribers whose receiver has been
+    /// dropped (relay thread exited because the socket closed). Full
+    /// mailboxes drop the event for that subscriber but keep them
+    /// registered — slow consumers shed events rather than growing
+    /// daemon memory.
+    fn broadcast(&mut self, payload: &EventPayload) {
+        let mut dead: Vec<u64> = Vec::new();
+        for (id, sub) in &self.subscribers {
+            if !subscriber_matches(sub, payload) {
+                continue;
+            }
+            // Full mailbox: slow subscriber; drop this event. Their
+            // next successful delivery still triggers a redraw which
+            // pulls the current state from the cache. So `Ok(())`
+            // and `Err(Full)` are intentionally identical-bodied
+            // here — both mean "this subscriber stays registered".
+            #[allow(clippy::match_same_arms)]
+            match sub.sender.try_send(payload.clone()) {
+                Ok(()) => {}
+                Err(TrySendError::Disconnected(_)) => dead.push(*id),
+                Err(TrySendError::Full(_)) => {}
+            }
+        }
+        for id in dead {
+            self.subscribers.remove(&id);
+        }
+    }
+}
+
+fn subscriber_matches(sub: &Subscriber, payload: &EventPayload) -> bool {
+    match (&sub.cwd_filter, &payload.cwd) {
+        (None, _) => true,
+        (Some(filter), Some(cwd)) => filter == cwd,
+        // Subscriber asked for a specific cwd but this event has no
+        // cwd (rare — cmd events for ids we don't have rows for).
+        (Some(_), None) => false,
+    }
 }
 
 /// Walk `path`'s ancestors looking for a gitdir registered in `watches`.
@@ -285,7 +399,30 @@ fn run_inner(
                 state.invalidate_for_event_paths(&paths);
             }
             StateMsg::CmdStart(e) => state.record_cmd_start(&e),
-            StateMsg::CmdEnd(e) => state.record_cmd_end(&e),
+            StateMsg::CmdEnd(e) => {
+                // Persist first so the broadcast's cmd_cwd() lookup
+                // sees the row. CmdEnd-without-prior-CmdStart already
+                // no-ops in record_cmd_end; we still emit the event
+                // with the id (cwd will be None) so subscribers can
+                // act on the signal even if persistence races. The
+                // shell-prompt subscriber only cares about the signal
+                // itself anyway.
+                state.record_cmd_end(&e);
+                let cwd = state.cmd_cwd(&e.id);
+                state.broadcast(&EventPayload {
+                    topic: "cmd".to_string(),
+                    cwd,
+                    id: Some(e.id),
+                });
+            }
+            StateMsg::Subscribe { subscriber, reply } => {
+                let id = state.add_subscriber(subscriber);
+                // Confirm registration *before* the listener ACKs the
+                // client. If reply fails (peer gone), the subscriber
+                // is harmlessly left in the map until the next
+                // broadcast prunes it as Disconnected.
+                let _ = reply.send(id);
+            }
             StateMsg::Shutdown => break,
         }
     }
@@ -787,6 +924,206 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, "1");
+    }
+
+    // ── Phase 3 (chevron-1yn.3): subscriber broadcast ───────────────────
+
+    fn subscribe(tx: &Sender<StateMsg>) -> (Receiver<EventPayload>, u64) {
+        let (event_tx, event_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAP);
+        subscribe_with(
+            tx,
+            Subscriber {
+                sender: event_tx,
+                cwd_filter: None,
+            },
+        )
+        .map(|id| (event_rx, id))
+        .unwrap()
+    }
+
+    fn subscribe_with(tx: &Sender<StateMsg>, subscriber: Subscriber) -> Result<u64, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(StateMsg::Subscribe {
+            subscriber,
+            reply: reply_tx,
+        })
+        .map_err(|e| e.to_string())?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn subscribe_returns_distinct_ids() {
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
+        let (_rx1, id1) = subscribe(&tx);
+        let (_rx2, id2) = subscribe(&tx);
+        assert_ne!(id1, id2);
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fs_event_broadcasts_to_subscribers() {
+        // Drive a real .git tempdir + Insert so the workdir is in the
+        // watches map (FsEvent only fires for known watches).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let git_dir = workdir.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
+        insert(&tx, &workdir, &git_dir, "master");
+        let (event_rx, _id) = subscribe(&tx);
+
+        tx.send(StateMsg::FsEvent(vec![git_dir.join("HEAD")]))
+            .unwrap();
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("expected a broadcast event");
+        assert_eq!(event.topic, "git");
+        assert_eq!(event.cwd, Some(workdir));
+
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fs_event_coalesces_multiple_paths_per_workdir() {
+        // A real git operation fires N events per logical change
+        // (HEAD, refs, index, …). The broadcaster should emit ONE
+        // event per affected workdir, not N.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let git_dir = workdir.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
+        insert(&tx, &workdir, &git_dir, "master");
+        let (event_rx, _id) = subscribe(&tx);
+
+        tx.send(StateMsg::FsEvent(vec![
+            git_dir.join("HEAD"),
+            git_dir.join("index"),
+            git_dir.join("refs/heads/master"),
+        ]))
+        .unwrap();
+
+        // Exactly one event.
+        let first = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(first.topic, "git");
+        let second = event_rx.recv_timeout(Duration::from_millis(100));
+        assert!(second.is_err(), "expected coalescing but got: {second:?}");
+
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn subscriber_cwd_filter_skips_other_workdirs() {
+        let tmp_a = tempfile::TempDir::new().unwrap();
+        let tmp_b = tempfile::TempDir::new().unwrap();
+        let workdir_a = tmp_a.path().to_path_buf();
+        let workdir_b = tmp_b.path().to_path_buf();
+        let git_a = workdir_a.join(".git");
+        let git_b = workdir_b.join(".git");
+        std::fs::create_dir_all(&git_a).unwrap();
+        std::fs::create_dir_all(&git_b).unwrap();
+
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
+        insert(&tx, &workdir_a, &git_a, "master");
+        insert(&tx, &workdir_b, &git_b, "master");
+
+        let (event_tx, event_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAP);
+        let _id = subscribe_with(
+            &tx,
+            Subscriber {
+                sender: event_tx,
+                cwd_filter: Some(workdir_a.clone()),
+            },
+        )
+        .unwrap();
+
+        // Event for B should be filtered out.
+        tx.send(StateMsg::FsEvent(vec![git_b.join("HEAD")]))
+            .unwrap();
+        let no_event = event_rx.recv_timeout(Duration::from_millis(200));
+        assert!(no_event.is_err(), "got unexpected: {no_event:?}");
+
+        // Event for A should reach the subscriber.
+        tx.send(StateMsg::FsEvent(vec![git_a.join("HEAD")]))
+            .unwrap();
+        let event = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event.cwd, Some(workdir_a));
+
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn disconnected_subscriber_pruned_on_next_broadcast() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let git_dir = workdir.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
+        insert(&tx, &workdir, &git_dir, "master");
+
+        let (event_tx, event_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAP);
+        let _id = subscribe_with(
+            &tx,
+            Subscriber {
+                sender: event_tx,
+                cwd_filter: None,
+            },
+        )
+        .unwrap();
+        // Drop the receiver — actor's next try_send fails with Disconnected.
+        drop(event_rx);
+
+        // First broadcast surfaces Disconnected and prunes. Second
+        // would no longer reach this subscriber. We can't easily
+        // observe pruning from outside the actor, but we can verify
+        // a fresh subscription works after the dead one churned.
+        tx.send(StateMsg::FsEvent(vec![git_dir.join("HEAD")]))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let (event_rx2, _) = subscribe(&tx);
+        tx.send(StateMsg::FsEvent(vec![git_dir.join("HEAD")]))
+            .unwrap();
+        let event = event_rx2.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event.topic, "git");
+
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn cmd_end_broadcasts_cmd_event_with_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = open_db(tmp.path()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), db).unwrap();
+
+        let (event_rx, _) = subscribe(&tx);
+
+        // Start then end a command; verify a cmd event lands with the
+        // cwd we recorded at start.
+        tx.send(StateMsg::CmdStart(fixture_cmd_start("cmd-evt-1")))
+            .unwrap();
+        tx.send(StateMsg::CmdEnd(fixture_cmd_end("cmd-evt-1")))
+            .unwrap();
+
+        // Drain: the CmdStart triggers no broadcast; the CmdEnd does.
+        let event = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event.topic, "cmd");
+        assert_eq!(event.id.as_deref(), Some("cmd-evt-1"));
+        assert!(event.cwd.is_some());
+
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
     }
 
     #[test]

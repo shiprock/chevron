@@ -11,6 +11,7 @@
 //!   STATUS <path>
 //!   CMD_START id=<ulid> session=<ulid> host=<host> cwd=<path> started_at=<ms> cmd=<cmd>
 //!   CMD_END id=<ulid> finished_at=<ms> duration_ms=<u64> exit=<i32>
+//!   SUBSCRIBE [cwd=<path>]
 //!   QUIT
 //!
 //! Responses (server → client):
@@ -18,8 +19,27 @@
 //!   OK key=value key=value ...
 //!   ACK
 //!   NONE
+//!   EVENT type=<topic> [cwd=<path>] [id=<ulid>]
+//!   PING <unix-ms>
 //!   ERR <reason>
 //! ```
+//!
+//! ## Connection states
+//!
+//! A connection lives in one of two states after the HELLO handshake:
+//!
+//! 1. **Request/response** (default): client sends a request, daemon sends
+//!    one response, repeat. Used for `STATUS`, `CMD_START`, `CMD_END`.
+//! 2. **Subscriber-relay** (terminal — entered via `SUBSCRIBE`): the daemon
+//!    writes `EVENT` lines on state changes and `PING` lines for keepalive;
+//!    the client only reads. The client cannot return to request/response
+//!    mode — to issue queries, open a separate connection. To leave the
+//!    relay state, close the connection.
+//!
+//! `PING` is a typed opcode (not a magic comment) so subscribers can parse
+//! it through the normal response decoder and discard. Heartbeat cadence is
+//! a per-connection daemon choice (~60s); subscribers should not depend on
+//! a specific interval.
 //!
 //! ## Encoding
 //!
@@ -78,12 +98,35 @@ pub struct CmdEndEvent {
     pub exit_status: i32,
 }
 
+/// `SUBSCRIBE` payload. Phase 3 (chevron-1yn.3): a long-lived
+/// subscriber connection that the daemon writes `EVENT` and `PING`
+/// lines to as state changes. The optional cwd filter narrows
+/// broadcasts to a single workdir; omitted means "all events the
+/// daemon emits".
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SubscribeSpec {
+    pub cwd: Option<PathBuf>,
+}
+
+/// `EVENT` payload. Topic is intentionally a free-form string
+/// (currently `"git"` or `"cmd"`) so we can grow the topic set
+/// without bumping the protocol version. cwd is set for `git`
+/// events (the workdir whose state changed); id is set for `cmd`
+/// events (the ULID of the command that fired).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventPayload {
+    pub topic: String,
+    pub cwd: Option<PathBuf>,
+    pub id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     Hello(u32),
     Status(PathBuf),
     CmdStart(CmdStartEvent),
     CmdEnd(CmdEndEvent),
+    Subscribe(SubscribeSpec),
     Quit,
 }
 
@@ -93,9 +136,15 @@ pub enum Response {
     /// `Some` → `OK …`; `None` → `NONE` (no repo discovered at the given path).
     Status(Option<RepoStatus>),
     /// Generic acknowledgement for fire-and-forget messages
-    /// (`CMD_START`, `CMD_END`). The daemon ACKs as soon as it has
-    /// queued the event for storage — durability is not guaranteed.
+    /// (`CMD_START`, `CMD_END`, `SUBSCRIBE`).
     Ack,
+    /// Push-direction event line sent during subscriber-relay mode.
+    Event(EventPayload),
+    /// Keepalive heartbeat sent during subscriber-relay mode when no
+    /// events have fired for ~60s. Carries a unix-epoch-ms timestamp
+    /// the subscriber can use to detect daemon-side clock skew or
+    /// stuck broadcast pipelines (otherwise just ignored).
+    Ping(i64),
     Err(String),
 }
 
@@ -131,6 +180,7 @@ pub fn encode_request(req: &Request) -> String {
         Request::Status(p) => format!("STATUS {}", percent_encode(&p.to_string_lossy())),
         Request::CmdStart(e) => encode_cmd_start(e),
         Request::CmdEnd(e) => encode_cmd_end(e),
+        Request::Subscribe(s) => encode_subscribe(s),
         Request::Quit => "QUIT".to_string(),
     }
 }
@@ -142,8 +192,32 @@ pub fn encode_response(resp: &Response) -> String {
         Response::Status(None) => "NONE".to_string(),
         Response::Status(Some(s)) => encode_status_ok(s),
         Response::Ack => "ACK".to_string(),
+        Response::Event(e) => encode_event(e),
+        Response::Ping(ts) => format!("PING {ts}"),
         Response::Err(reason) => format!("ERR {}", percent_encode(reason)),
     }
+}
+
+fn encode_subscribe(s: &SubscribeSpec) -> String {
+    let mut out = String::with_capacity(32);
+    out.push_str("SUBSCRIBE");
+    if let Some(cwd) = &s.cwd {
+        write_kv_str(&mut out, "cwd", &cwd.to_string_lossy());
+    }
+    out
+}
+
+fn encode_event(e: &EventPayload) -> String {
+    let mut out = String::with_capacity(64);
+    out.push_str("EVENT");
+    write_kv_str(&mut out, "type", &e.topic);
+    if let Some(cwd) = &e.cwd {
+        write_kv_str(&mut out, "cwd", &cwd.to_string_lossy());
+    }
+    if let Some(id) = &e.id {
+        write_kv_str(&mut out, "id", id);
+    }
+    out
 }
 
 fn encode_cmd_start(e: &CmdStartEvent) -> String {
@@ -275,6 +349,7 @@ pub fn decode_request(line: &str) -> Result<Request, ProtoError> {
         }
         "CMD_START" => decode_cmd_start(rest).map(Request::CmdStart),
         "CMD_END" => decode_cmd_end(rest).map(Request::CmdEnd),
+        "SUBSCRIBE" => decode_subscribe(rest).map(Request::Subscribe),
         "QUIT" => {
             if !rest.trim().is_empty() {
                 return Err(ProtoError::Malformed("QUIT takes no arguments"));
@@ -314,6 +389,24 @@ fn decode_cmd_start(rest: &str) -> Result<CmdStartEvent, ProtoError> {
         cwd: PathBuf::from(cwd.ok_or(ProtoError::Malformed("CMD_START missing cwd"))?),
         cmd: cmd.ok_or(ProtoError::Malformed("CMD_START missing cmd"))?,
         started_at_ms: started_at.ok_or(ProtoError::Malformed("CMD_START missing started_at"))?,
+    })
+}
+
+fn decode_subscribe(rest: &str) -> Result<SubscribeSpec, ProtoError> {
+    let mut cwd: Option<String> = None;
+    for tok in rest.split_ascii_whitespace() {
+        let (k, v) = tok
+            .split_once('=')
+            .ok_or(ProtoError::Malformed("SUBSCRIBE kv missing '='"))?;
+        // Forward-compat: ignore unknown keys so future filter axes
+        // (topics, session) can land without breaking older daemons
+        // that don't yet know them.
+        if k == "cwd" {
+            cwd = Some(percent_decode(v)?);
+        }
+    }
+    Ok(SubscribeSpec {
+        cwd: cwd.map(PathBuf::from),
     })
 }
 
@@ -375,6 +468,14 @@ pub fn decode_response(line: &str) -> Result<Response, ProtoError> {
             }
             Ok(Response::Ack)
         }
+        "EVENT" => decode_event(rest).map(Response::Event),
+        "PING" => {
+            let ts: i64 = rest
+                .trim()
+                .parse()
+                .map_err(|_| ProtoError::Malformed("PING timestamp not an i64"))?;
+            Ok(Response::Ping(ts))
+        }
         "OK" => decode_status_ok(rest).map(|s| Response::Status(Some(s))),
         "ERR" => {
             let reason = percent_decode(rest.trim())?;
@@ -382,6 +483,31 @@ pub fn decode_response(line: &str) -> Result<Response, ProtoError> {
         }
         other => Err(ProtoError::UnknownOpcode(other.to_string())),
     }
+}
+
+fn decode_event(rest: &str) -> Result<EventPayload, ProtoError> {
+    let mut topic: Option<String> = None;
+    let mut cwd: Option<String> = None;
+    let mut id: Option<String> = None;
+    for tok in rest.split_ascii_whitespace() {
+        let (k, v) = tok
+            .split_once('=')
+            .ok_or(ProtoError::Malformed("EVENT kv missing '='"))?;
+        match k {
+            "type" => topic = Some(percent_decode(v)?),
+            "cwd" => cwd = Some(percent_decode(v)?),
+            "id" => id = Some(percent_decode(v)?),
+            // Future event metadata (exit, duration, session, etc.) is
+            // silently ignored so older subscribers can read newer
+            // EVENT lines without erroring.
+            _ => {}
+        }
+    }
+    Ok(EventPayload {
+        topic: topic.ok_or(ProtoError::Malformed("EVENT missing type"))?,
+        cwd: cwd.map(PathBuf::from),
+        id,
+    })
 }
 
 fn decode_status_ok(rest: &str) -> Result<RepoStatus, ProtoError> {
@@ -1050,6 +1176,110 @@ mod tests {
     fn decode_ack_rejects_args() {
         assert!(matches!(
             decode_response("ACK extra"),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    // ── Phase 3 (chevron-1yn.3): SUBSCRIBE / EVENT / PING ───────────────
+
+    #[test]
+    fn encode_decode_subscribe_no_filter() {
+        let req = Request::Subscribe(SubscribeSpec { cwd: None });
+        let line = encode_request(&req);
+        assert_eq!(line, "SUBSCRIBE");
+        assert_eq!(decode_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn encode_decode_subscribe_with_cwd() {
+        let req = Request::Subscribe(SubscribeSpec {
+            cwd: Some(PathBuf::from("/Users/mim/src/chevron")),
+        });
+        let line = encode_request(&req);
+        assert_eq!(line, "SUBSCRIBE cwd=/Users/mim/src/chevron");
+        assert_eq!(decode_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn encode_decode_subscribe_with_space_in_cwd() {
+        let req = Request::Subscribe(SubscribeSpec {
+            cwd: Some(PathBuf::from("/Users/mim/My Project")),
+        });
+        let line = encode_request(&req);
+        assert!(line.contains("cwd=/Users/mim/My%20Project"));
+        assert_eq!(decode_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn decode_subscribe_ignores_unknown_keys() {
+        // Forward-compat: future filter axes (topics, session) drop
+        // through to None without erroring on this older daemon.
+        let req = decode_request("SUBSCRIBE cwd=/x topics=git,cmd session=01HW").unwrap();
+        let Request::Subscribe(spec) = req else {
+            panic!("expected Subscribe");
+        };
+        assert_eq!(spec.cwd, Some(PathBuf::from("/x")));
+    }
+
+    #[test]
+    fn encode_decode_event_git_topic() {
+        let resp = Response::Event(EventPayload {
+            topic: "git".to_string(),
+            cwd: Some(PathBuf::from("/repo")),
+            id: None,
+        });
+        let line = encode_response(&resp);
+        assert_eq!(line, "EVENT type=git cwd=/repo");
+        assert_eq!(decode_response(&line).unwrap(), resp);
+    }
+
+    #[test]
+    fn encode_decode_event_cmd_topic() {
+        let resp = Response::Event(EventPayload {
+            topic: "cmd".to_string(),
+            cwd: Some(PathBuf::from("/repo")),
+            id: Some("01HW4ZAB12CDEFGHJKMNPQRSTV".to_string()),
+        });
+        let line = encode_response(&resp);
+        assert_eq!(
+            line,
+            "EVENT type=cmd cwd=/repo id=01HW4ZAB12CDEFGHJKMNPQRSTV"
+        );
+        assert_eq!(decode_response(&line).unwrap(), resp);
+    }
+
+    #[test]
+    fn decode_event_rejects_missing_type() {
+        assert!(matches!(
+            decode_response("EVENT cwd=/x"),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn decode_event_ignores_unknown_keys() {
+        // Future event metadata (exit, duration, session, …) must be
+        // silently ignored so older subscribers can read newer events.
+        let resp = decode_response("EVENT type=cmd id=x exit=0 duration_ms=42").unwrap();
+        let Response::Event(e) = resp else {
+            panic!("expected Event");
+        };
+        assert_eq!(e.topic, "cmd");
+        assert_eq!(e.id.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn encode_decode_ping_response() {
+        let resp = Response::Ping(1_716_350_000_000);
+        let line = encode_response(&resp);
+        assert_eq!(line, "PING 1716350000000");
+        assert_eq!(decode_response(&line).unwrap(), resp);
+    }
+
+    #[test]
+    fn decode_ping_rejects_non_numeric() {
+        assert!(matches!(
+            decode_response("PING notanumber"),
             Err(ProtoError::Malformed(_))
         ));
     }
