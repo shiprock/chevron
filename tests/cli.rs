@@ -751,11 +751,19 @@ fn event_lifecycle_publishes_to_daemon_and_persists_row() {
         .assert()
         .success();
 
-    // Give the state actor a moment to commit (mpsc → SQLite write).
-    // The actor processes the message before ACKing, so this should be
-    // immediate — but on a busy CI runner there's no harm in a small
-    // grace period before reading.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // The daemon ACKs lifecycle events as soon as they're queued for
+    // the state actor; the actor commits to SQLite asynchronously.
+    // Flush by invoking `chevron git` here — that goes through
+    // try_query → STATUS → state-actor Get → reply. The actor
+    // processes mpsc messages in FIFO order, so once STATUS replies,
+    // the earlier CmdStart and CmdEnd have already been committed.
+    // More reliable than a fixed-duration sleep under CI load (the
+    // original 50ms wait flaked in the pre-push 5x stress run).
+    cmd()
+        .arg("git")
+        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
+        .assert()
+        .success();
 
     let db_path = daemon.socket_dir().join("commands.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
