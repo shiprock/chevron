@@ -652,23 +652,42 @@ mod tests {
 
     #[test]
     fn termios_guard_restores_mode_on_drop() {
-        // Skip on environments where stdin isn't a real TTY (CI
-        // containers). The Drop logic is exercised in real shell
-        // sessions; this test is just defensive.
-        if !is_tty(libc::STDIN_FILENO) {
-            return;
-        }
-        let mut before: libc::termios = unsafe { std::mem::zeroed() };
-        unsafe { libc::tcgetattr(libc::STDIN_FILENO, std::ptr::addr_of_mut!(before)) };
+        // Use a freshly-allocated PTY slave as the test target so we
+        // don't race with sibling tests or affect the process's real
+        // STDIN termios (cargo's parallel test runner caught the
+        // latter as a pre-push flake). We verify the PROPERTY that
+        // matters — raw mode clears ICANON, restored cooked mode
+        // sets it — rather than byte-exact c_lflag equality. macOS
+        // sets bits like PENDIN transiently around tcsetattr which
+        // makes literal equality flaky on PTY slaves.
+        let (_master, slave) = openpty_pair().unwrap();
+        let fd = slave.as_raw_fd();
+
+        let read_lflag = |fd: i32| -> libc::tcflag_t {
+            // SAFETY: tcgetattr writes a libc::termios via the out
+            // parameter on a valid PTY fd.
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            unsafe { libc::tcgetattr(fd, std::ptr::addr_of_mut!(t)) };
+            t.c_lflag
+        };
+
+        // Cooked-mode PTY slave should have ICANON set.
+        assert!(
+            read_lflag(fd) & libc::ICANON != 0,
+            "fresh PTY slave should be in cooked mode"
+        );
         {
-            let _guard = TermiosGuard::install_raw_mode(libc::STDIN_FILENO).unwrap();
-            // We're in raw mode here; the guard's Drop will restore.
+            let _guard = TermiosGuard::install_raw_mode(fd).unwrap();
+            // In raw mode now: ICANON must be clear.
+            assert!(
+                read_lflag(fd) & libc::ICANON == 0,
+                "raw mode should clear ICANON"
+            );
         }
-        let mut after: libc::termios = unsafe { std::mem::zeroed() };
-        unsafe { libc::tcgetattr(libc::STDIN_FILENO, std::ptr::addr_of_mut!(after)) };
-        assert_eq!(
-            before.c_lflag, after.c_lflag,
-            "termios c_lflag should be restored on guard drop"
+        // After drop the guard restored cooked mode.
+        assert!(
+            read_lflag(fd) & libc::ICANON != 0,
+            "guard's Drop should restore ICANON"
         );
     }
 
