@@ -24,6 +24,7 @@ pub mod capture;
 pub mod color;
 pub mod config;
 pub mod daemon;
+pub mod doctor;
 #[cfg(feature = "daemon")]
 pub mod event;
 pub mod health;

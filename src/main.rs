@@ -5,7 +5,7 @@ use std::path::Path;
 use chevron::banner;
 #[cfg(feature = "weather")]
 use chevron::weather;
-use chevron::{color, health, repo_status, segments, shell};
+use chevron::{color, doctor, health, repo_status, segments, shell};
 
 #[allow(clippy::too_many_lines)]
 fn main() {
@@ -74,6 +74,7 @@ fn main() {
         },
         Some("status") => repo_status::run(),
         Some("health") => std::process::exit(health::run(&args[2..])),
+        Some("doctor") => std::process::exit(doctor::run(&args[2..])),
         #[cfg(feature = "daemon")]
         Some("capture") => std::process::exit(chevron::capture::run(&args[2..])),
         #[cfg(feature = "daemon")]
@@ -125,6 +126,7 @@ fn main() {
                 "init",
                 "status",
                 "health",
+                "doctor",
                 #[cfg(feature = "daemon")]
                 "daemon",
                 #[cfg(feature = "daemon")]
