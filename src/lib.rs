@@ -23,6 +23,7 @@ pub mod banner;
 pub mod capture;
 pub mod color;
 pub mod config;
+pub mod configure;
 pub mod daemon;
 pub mod doctor;
 #[cfg(feature = "daemon")]

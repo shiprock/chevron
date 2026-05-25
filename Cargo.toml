@@ -25,6 +25,9 @@ daemon = ["dep:notify", "dep:rusqlite", "dep:ulid"]
 [dependencies]
 git2 = { version = "0.20", default-features = false }
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+# `chevron configure` wizard. Default-features pulls in the crossterm
+# backend, which is what we need for the interactive question flow.
+inquire = "0.7"
 libc = "0.2"
 notify = { version = "8", optional = true }
 rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
