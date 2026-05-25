@@ -63,15 +63,20 @@ fn main() {
                 .unwrap_or_default();
             println!("{}", segments::tmux_title::render(&home, &pwd));
         }
-        Some("init") => match args.get(2).map(String::as_str) {
-            Some("zsh") => print!("{}", shell::init_zsh()),
-            Some("bash") => print!("{}", shell::init_bash()),
-            Some("fish") => print!("{}", shell::init_fish()),
-            _ => {
-                eprintln!("Usage: chevron init <zsh|bash|fish>");
-                std::process::exit(1);
+        Some("init") => {
+            // Read config so the init script's `[shell]` defaults are
+            // baked in. Env vars set before sourcing still win.
+            let cfg = chevron::config::Config::load();
+            match args.get(2).map(String::as_str) {
+                Some("zsh") => print!("{}", shell::init_zsh_with(&cfg.shell)),
+                Some("bash") => print!("{}", shell::init_bash_with(&cfg.shell)),
+                Some("fish") => print!("{}", shell::init_fish_with(&cfg.shell)),
+                _ => {
+                    eprintln!("Usage: chevron init <zsh|bash|fish>");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         Some("status") => repo_status::run(),
         Some("health") => std::process::exit(health::run(&args[2..])),
         Some("doctor") => std::process::exit(doctor::run(&args[2..])),

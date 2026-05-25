@@ -18,6 +18,12 @@ pub struct Config {
     /// `[health]` TOML section (optional). All fields individually optional.
     #[serde(default)]
     pub health: HealthConfig,
+    /// `[shell]` TOML section — toggles consumed by `chevron init <shell>`
+    /// when emitting the shell init script. Each field's value becomes the
+    /// default for the corresponding CHEVRON_* env var; explicit env-var
+    /// exports still win (env > config > default).
+    #[serde(default)]
+    pub shell: ShellConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -42,6 +48,45 @@ pub struct SegmentConfig {
     pub cache_secs: Option<u64>,
     /// Command timeout in milliseconds (`custom_command` segment). Default: 500.
     pub timeout_ms: Option<u64>,
+    /// `[segment.path].repo_relative` — render paths relative to the
+    /// containing git repo's parent dir when inside a repo. Default: true.
+    /// Env override: `CHEVRON_REPO_RELATIVE_PATH=0` (env > config > default).
+    pub repo_relative: Option<bool>,
+}
+
+/// `[shell]` block — defaults for the env vars the init scripts read.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default)]
+// Five booleans plus a numeric — matches the surface of init-time toggles.
+// Splitting them into sub-structs adds indirection without clarity.
+#[allow(clippy::struct_excessive_bools)]
+pub struct ShellConfig {
+    /// `CHEVRON_OSC133` default. Emit OSC 133 prompt/output markers.
+    pub osc133: bool,
+    /// `CHEVRON_TRANSIENT` default. Collapse the previous prompt to a single chevron.
+    pub transient: bool,
+    /// `CHEVRON_TRANSIENT_DURATION_MS` default. Threshold above which a
+    /// dim "duration" tag is printed below command output.
+    pub transient_duration_ms: u64,
+    /// `CHEVRON_ASYNC` default. Async prompt-render fast path (zsh only).
+    pub async_render: bool,
+    /// `CHEVRON_HISTORY` default. Record command lifecycle to chevrond.
+    pub history: bool,
+    /// `CHEVRON_LIVE` default. Live prompt refresh on filesystem changes.
+    pub live: bool,
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            osc133: true,
+            transient: true,
+            transient_duration_ms: 2000,
+            async_render: false,
+            history: true,
+            live: false,
+        }
+    }
 }
 
 /// `[weather]` TOML section. All fields optional; CLI flags and env vars

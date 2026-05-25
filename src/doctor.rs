@@ -320,7 +320,72 @@ fn shell_integration_section() -> Vec<Check> {
         check_shell_init(&home, &shell_name, ShellTarget::Fish),
         check_starship(&home),
         check_tmux(&home),
+        check_legacy_env_vars(&home),
     ]
+}
+
+/// Scan the user's rc files for `export CHEVRON_*` (or fish `set -gx`)
+/// lines that overlap with toggles now living in `[shell]`. Info-level —
+/// these still work (env > config), but the user can migrate to keep
+/// things in one place.
+fn check_legacy_env_vars(home: &str) -> Check {
+    const MIGRATED_VARS: &[&str] = &[
+        "CHEVRON_OSC133",
+        "CHEVRON_TRANSIENT",
+        "CHEVRON_TRANSIENT_DURATION_MS",
+        "CHEVRON_ASYNC",
+        "CHEVRON_HISTORY",
+        "CHEVRON_LIVE",
+    ];
+    let candidates = [
+        ".zshrc",
+        ".zshenv",
+        ".zprofile",
+        ".bashrc",
+        ".bash_profile",
+        ".profile",
+        ".config/fish/config.fish",
+    ];
+    let mut found: Vec<(String, String)> = Vec::new(); // (file, var)
+    for c in &candidates {
+        let path = PathBuf::from(home).join(c);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let pretty = friendly_path(&path, home);
+        for line in contents.lines() {
+            let trimmed = line.trim_start();
+            // bash/zsh: `export CHEVRON_X=...`
+            // fish: `set -gx CHEVRON_X ...`
+            let var_substring = if let Some(rest) = trimmed.strip_prefix("export ") {
+                rest.split('=').next()
+            } else if let Some(rest) = trimmed.strip_prefix("set -gx ") {
+                rest.split_whitespace().next()
+            } else {
+                None
+            };
+            if let Some(name) = var_substring
+                && MIGRATED_VARS.contains(&name)
+            {
+                found.push((pretty.clone(), name.to_string()));
+            }
+        }
+    }
+    if found.is_empty() {
+        return Check::info("legacy_env", "legacy env", "no legacy `CHEVRON_*` exports");
+    }
+    let example = found
+        .iter()
+        .map(|(f, v)| format!("{v} in {f}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let value = format!("{} legacy export(s): {example}", found.len());
+    Check::info_hint(
+        "legacy_env",
+        "legacy env",
+        value,
+        "these still work (env > config), but can move to ~/.config/chevron/config.toml [shell]",
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -947,6 +1012,60 @@ mod tests {
         let home = tmp.path().to_string_lossy().into_owned();
         let c = check_tmux(&home);
         assert_eq!(c.severity, Severity::Info);
+    }
+
+    // ── legacy env-var detection ──────────────────────────────────────────
+
+    #[test]
+    fn legacy_env_info_when_nothing_to_migrate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_string_lossy().into_owned();
+        let c = check_legacy_env_vars(&home);
+        assert_eq!(c.severity, Severity::Info);
+        assert!(c.value.contains("no legacy"));
+        assert!(c.hint.is_none());
+    }
+
+    #[test]
+    fn legacy_env_detects_bash_exports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_string_lossy().into_owned();
+        write_temp(
+            &tmp.path().join(".zshrc"),
+            "export CHEVRON_TRANSIENT=0\nexport CHEVRON_ASYNC=1\n",
+        );
+        let c = check_legacy_env_vars(&home);
+        assert_eq!(c.severity, Severity::Info);
+        assert!(c.value.contains("2 legacy"));
+        assert!(c.value.contains("CHEVRON_TRANSIENT"));
+        assert!(c.value.contains("CHEVRON_ASYNC"));
+        assert!(c.hint.is_some(), "migration hint must be present");
+    }
+
+    #[test]
+    fn legacy_env_detects_fish_set_gx() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_string_lossy().into_owned();
+        write_temp(
+            &tmp.path().join(".config/fish/config.fish"),
+            "set -gx CHEVRON_LIVE 1\n",
+        );
+        let c = check_legacy_env_vars(&home);
+        assert_eq!(c.severity, Severity::Info);
+        assert!(c.value.contains("CHEVRON_LIVE"));
+    }
+
+    #[test]
+    fn legacy_env_ignores_non_migrated_vars() {
+        // CHEVRON_CAPTURE_HERE is NOT in the migrated list — it stays env-only.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_string_lossy().into_owned();
+        write_temp(
+            &tmp.path().join(".zshrc"),
+            "export CHEVRON_CAPTURE_HERE=per_cwd\n",
+        );
+        let c = check_legacy_env_vars(&home);
+        assert!(c.value.contains("no legacy"));
     }
 
     // ── chevron section ──────────────────────────────────────────────────
