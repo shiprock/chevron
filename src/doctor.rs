@@ -321,7 +321,58 @@ fn shell_integration_section() -> Vec<Check> {
         check_starship(&home),
         check_tmux(&home),
         check_legacy_env_vars(&home),
+        check_instant_prompt(&home, &shell_name),
     ]
+}
+
+/// Detect whether the user has pasted the instant-prompt snippet into
+/// their `.zshrc`. The snippet itself is gated on `-o interactive && -t 1`
+/// and on chevron's main init not yet being loaded, so a stray presence is
+/// harmless. We just surface its presence/absence so users discover the
+/// feature exists.
+fn check_instant_prompt(home: &str, current_shell: &str) -> Check {
+    // zsh-only feature. For non-zsh users this row is informational
+    // ("doesn't apply") to avoid implying they're missing something.
+    if current_shell != "zsh" {
+        return Check::info(
+            "instant_prompt",
+            "instant prompt",
+            "zsh only (not your current shell)",
+        );
+    }
+    let candidates = [".zshrc", ".zshenv", ".zprofile"];
+    let mut zshrc_has_chevron = false;
+    let mut marker_found_in: Option<String> = None;
+    for c in &candidates {
+        let path = PathBuf::from(home).join(c);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if contents.contains("chevron init") {
+            zshrc_has_chevron = true;
+        }
+        if contents.contains(crate::shell::INSTANT_PROMPT_MARKER) {
+            marker_found_in = Some(friendly_path(&path, home));
+        }
+    }
+    match (marker_found_in, zshrc_has_chevron) {
+        (Some(path), _) => Check::ok(
+            "instant_prompt",
+            "instant prompt",
+            format!("snippet present in {path}"),
+        ),
+        (None, true) => Check::info_hint(
+            "instant_prompt",
+            "instant prompt",
+            "available, not enabled",
+            "paste the output of `chevron init zsh --instant-prompt` at the TOP of ~/.zshrc",
+        ),
+        (None, false) => Check::info(
+            "instant_prompt",
+            "instant prompt",
+            "not configured (chevron init not in ~/.zshrc)",
+        ),
+    }
 }
 
 /// Scan the user's rc files for `export CHEVRON_*` (or fish `set -gx`)
@@ -1053,6 +1104,48 @@ mod tests {
         let c = check_legacy_env_vars(&home);
         assert_eq!(c.severity, Severity::Info);
         assert!(c.value.contains("CHEVRON_LIVE"));
+    }
+
+    #[test]
+    fn instant_prompt_info_when_not_zsh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_string_lossy().into_owned();
+        let c = check_instant_prompt(&home, "bash");
+        assert_eq!(c.severity, Severity::Info);
+        assert!(c.value.contains("zsh only"));
+    }
+
+    #[test]
+    fn instant_prompt_info_when_snippet_absent_and_chevron_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_string_lossy().into_owned();
+        write_temp(&tmp.path().join(".zshrc"), "eval \"$(chevron init zsh)\"\n");
+        let c = check_instant_prompt(&home, "zsh");
+        assert_eq!(c.severity, Severity::Info);
+        assert!(c.value.contains("available"));
+        assert!(c.hint.is_some(), "should hint at the --instant-prompt cmd");
+    }
+
+    #[test]
+    fn instant_prompt_ok_when_marker_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_string_lossy().into_owned();
+        write_temp(
+            &tmp.path().join(".zshrc"),
+            "# Marker: chevron-instant-prompt-v1\nstuff\neval \"$(chevron init zsh)\"\n",
+        );
+        let c = check_instant_prompt(&home, "zsh");
+        assert_eq!(c.severity, Severity::Ok);
+        assert!(c.value.contains("snippet present"));
+    }
+
+    #[test]
+    fn instant_prompt_info_when_nothing_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_string_lossy().into_owned();
+        let c = check_instant_prompt(&home, "zsh");
+        assert_eq!(c.severity, Severity::Info);
+        assert!(c.value.contains("not configured"));
     }
 
     #[test]

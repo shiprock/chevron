@@ -18,6 +18,70 @@ pub fn init_zsh_with(cfg: &ShellConfig) -> String {
     format!("{}{}", shell_preamble_posix(cfg), BODY_ZSH)
 }
 
+/// Returns the top-of-`.zshrc` snippet that paints the previously cached
+/// prompt before the rest of `.zshrc` finishes loading (chevron-nf8). The
+/// user pastes this verbatim at the very top of their `~/.zshrc`. Activates
+/// only when chevron's main init has not yet loaded, when stdin/stdout are
+/// a tty, and when the cache file looks zsh-shaped.
+#[must_use]
+pub fn init_zsh_instant_prompt() -> &'static str {
+    INSTANT_PROMPT_ZSH
+}
+
+/// Sentinel comment line — used by `chevron doctor` to detect whether the
+/// user has pasted the instant-prompt snippet into their .zshrc.
+pub const INSTANT_PROMPT_MARKER: &str = "chevron-instant-prompt-v1";
+
+const INSTANT_PROMPT_ZSH: &str = r#"# chevron instant prompt — paste this BLOCK at the TOP of ~/.zshrc.
+# Marker: chevron-instant-prompt-v1
+# Paints the previously-rendered prompt from cache in <50ms while .zshrc
+# loads. Any output .zshrc produces is buffered and replayed when the real
+# prompt takes over. To disable, comment out this block.
+if [[ -o interactive && -t 1 ]] \
+    && [[ -z "$_chevron_instant_active" ]] \
+    && ! typeset -f _chevron_make_prompt >/dev/null 2>&1; then
+    _chevron_cache_file="${XDG_RUNTIME_DIR:-/tmp}/chevron-${UID:-$(id -u)}/last-prompt"
+    if [[ -r "$_chevron_cache_file" ]]; then
+        # Pure zsh — no fork. `$(<file)` is the builtin equivalent of cat.
+        local _chevron_cfull="$(<"$_chevron_cache_file")"
+        local _chevron_cprompt="${_chevron_cfull#*$'\n'}"   # drop pwd line
+        _chevron_cprompt="${_chevron_cprompt%%$'\n'*}"       # drop tmux title
+        # Shell-shape heuristic: only paint if the cache looks like a
+        # zsh-bracketed prompt body. Skip bash-style `\[` brackets which
+        # would print as literal characters under `print -P`.
+        if [[ -n "$_chevron_cprompt" \
+            && "$_chevron_cprompt" == *'%{'* \
+            && "$_chevron_cprompt" != *'\['* ]]; then
+            _chevron_instant_buf="${TMPDIR:-/tmp}/chevron-instant-$$"
+            if : > "$_chevron_instant_buf" 2>/dev/null; then
+                _chevron_instant_active=1
+                # Paint the cached prompt. `-P` interprets %{...%} as
+                # zero-width markers so cursor tracking stays correct.
+                print -nP -- "$_chevron_cprompt"
+                # Save original fds, then capture all stdout/stderr from
+                # .zshrc into the buffer. Takeover (or zshexit) restores.
+                exec {_chevron_instant_orig_stdout}>&1 \
+                     {_chevron_instant_orig_stderr}>&2
+                exec >>"$_chevron_instant_buf" 2>&1
+                # Defensive: if .zshrc errors before precmd takes over,
+                # this hook restores fds and flushes the buffer so the
+                # user isn't stuck with a broken terminal.
+                _chevron_instant_zshexit() {
+                    [[ -z "$_chevron_instant_active" ]] && return
+                    exec >&"$_chevron_instant_orig_stdout" \
+                         2>&"$_chevron_instant_orig_stderr" 2>/dev/null
+                    [[ -s "$_chevron_instant_buf" ]] \
+                        && cat -- "$_chevron_instant_buf" >&2 2>/dev/null
+                    rm -f -- "$_chevron_instant_buf" 2>/dev/null
+                }
+                zshexit_functions+=(_chevron_instant_zshexit)
+            fi
+        fi
+        unset _chevron_cfull _chevron_cprompt
+    fi
+fi
+"#;
+
 #[allow(clippy::too_many_lines)]
 const BODY_ZSH: &str = r#"_chevron_preexec() {
     _chevron_cmd_start=$EPOCHREALTIME
@@ -82,6 +146,22 @@ _chevron_query_row() {
 }
 _chevron_precmd() {
     local exit_status=$?
+    # Instant-prompt takeover (chevron-nf8). If the top-of-rc snippet
+    # painted a cached prompt and redirected stdout/stderr to a buffer,
+    # restore the real fds, close the spurious OSC 133 prompt region we
+    # opened, clear the cached prompt line, then replay any output that
+    # .zshrc produced. No-op when the snippet wasn't activated.
+    if [[ -n "$_chevron_instant_active" ]]; then
+        exec >&"$_chevron_instant_orig_stdout" 2>&"$_chevron_instant_orig_stderr" 2>/dev/null
+        exec {_chevron_instant_orig_stdout}>&- {_chevron_instant_orig_stderr}>&- 2>/dev/null
+        [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;D;0\a'
+        print -n -- $'\r\e[2K'
+        [[ -s "$_chevron_instant_buf" ]] && cat -- "$_chevron_instant_buf"
+        rm -f -- "$_chevron_instant_buf" 2>/dev/null
+        unset _chevron_instant_active _chevron_instant_buf \
+              _chevron_instant_orig_stdout _chevron_instant_orig_stderr \
+              _chevron_cache_file
+    fi
     # OSC 133 D: the just-completed command finished with $exit_status.
     # Emitted first so it closes out the previous command region before
     # we print the duration tag and next prompt's A marker.
@@ -754,6 +834,127 @@ mod tests {
     #[test]
     fn init_fish_zero_arg_matches_default_with() {
         assert_eq!(init_fish(), init_fish_with(&ShellConfig::default()));
+    }
+
+    // ── instant prompt (chevron-nf8) ──────────────────────────────────────
+
+    #[test]
+    fn instant_prompt_snippet_has_detection_marker() {
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(
+            snippet.contains(super::INSTANT_PROMPT_MARKER),
+            "snippet must contain the marker so doctor can detect it"
+        );
+    }
+
+    #[test]
+    fn instant_prompt_snippet_reads_cache_file_without_forking() {
+        let snippet = super::init_zsh_instant_prompt();
+        // $(<file) is the zsh-builtin file-read — no fork.
+        assert!(
+            snippet.contains("$(<\"$_chevron_cache_file\")"),
+            "snippet must use $(<file) builtin, not sed/cat (perf)"
+        );
+        assert!(
+            !snippet.contains("sed -n"),
+            "snippet must not fork sed (perf)"
+        );
+    }
+
+    #[test]
+    fn instant_prompt_snippet_gates_on_interactive_tty() {
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(snippet.contains("-o interactive"));
+        assert!(snippet.contains("-t 1"));
+    }
+
+    #[test]
+    fn instant_prompt_snippet_skips_when_chevron_already_loaded() {
+        // The `! typeset -f _chevron_make_prompt` guard prevents re-firing
+        // when the user `source ~/.zshrc`s after the shell is up.
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(snippet.contains("typeset -f _chevron_make_prompt"));
+    }
+
+    #[test]
+    fn instant_prompt_snippet_only_paints_zsh_shaped_cache() {
+        // Multi-shell guard: only paint when zsh-style %{ brackets are
+        // present and bash-style square-bracket markers are absent.
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(snippet.contains("*'%{'*"));
+        assert!(snippet.contains("*'\\['*"));
+    }
+
+    #[test]
+    fn instant_prompt_snippet_registers_zshexit_cleanup() {
+        // Critical: if .zshrc errors before precmd fires, this hook must
+        // restore the fds so the user's terminal isn't broken.
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(snippet.contains("zshexit_functions+=(_chevron_instant_zshexit)"));
+        assert!(snippet.contains("_chevron_instant_zshexit()"));
+    }
+
+    #[test]
+    fn instant_prompt_snippet_uses_print_p_for_paint() {
+        // `-P` is essential so %{…%} markers are recognised as zero-width.
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(snippet.contains("print -nP -- \"$_chevron_cprompt\""));
+    }
+
+    #[test]
+    fn zsh_precmd_takeover_block_present_in_body() {
+        // Takeover block must be inside _chevron_precmd, before the OSC 133 D
+        // emission for the just-finished command.
+        let out = init_zsh();
+        assert!(
+            out.contains("Instant-prompt takeover"),
+            "takeover block must be present"
+        );
+        assert!(
+            out.contains("if [[ -n \"$_chevron_instant_active\" ]]"),
+            "takeover must gate on the activation flag"
+        );
+        // exit_status must be captured BEFORE takeover (cat in takeover
+        // would clobber $? otherwise).
+        let body = out;
+        let exit_idx = body
+            .find("local exit_status=$?")
+            .expect("exit_status capture");
+        let takeover_idx = body
+            .find("if [[ -n \"$_chevron_instant_active\" ]]")
+            .expect("takeover gate");
+        assert!(
+            exit_idx < takeover_idx,
+            "exit_status must be captured before the takeover clobbers $?"
+        );
+    }
+
+    #[test]
+    fn zsh_precmd_takeover_emits_osc133_d_under_gate() {
+        let out = init_zsh();
+        assert!(
+            out.contains("printf '\\e]133;D;0\\a'"),
+            "takeover must emit OSC 133 D to close the instant prompt region"
+        );
+    }
+
+    #[test]
+    fn zsh_precmd_takeover_clears_cached_paint() {
+        let out = init_zsh();
+        // \r\e[2K returns to col 1 and clears the cached prompt line.
+        assert!(
+            out.contains("print -n -- $'\\r\\e[2K'"),
+            "takeover must clear the cached prompt line"
+        );
+    }
+
+    #[test]
+    fn zsh_precmd_takeover_unsets_state_vars() {
+        let out = init_zsh();
+        assert!(out.contains("unset _chevron_instant_active"));
+        assert!(out.contains("_chevron_instant_buf"));
+        assert!(out.contains("_chevron_instant_orig_stdout"));
+        assert!(out.contains("_chevron_instant_orig_stderr"));
     }
 
     // ── original body assertions (preamble doesn't affect these) ──────────

@@ -64,16 +64,27 @@ fn main() {
             println!("{}", segments::tmux_title::render(&home, &pwd));
         }
         Some("init") => {
-            // Read config so the init script's `[shell]` defaults are
-            // baked in. Env vars set before sourcing still win.
-            let cfg = chevron::config::Config::load();
-            match args.get(2).map(String::as_str) {
-                Some("zsh") => print!("{}", shell::init_zsh_with(&cfg.shell)),
-                Some("bash") => print!("{}", shell::init_bash_with(&cfg.shell)),
-                Some("fish") => print!("{}", shell::init_fish_with(&cfg.shell)),
-                _ => {
-                    eprintln!("Usage: chevron init <zsh|bash|fish>");
+            // `--instant-prompt` short-circuits config loading — the snippet
+            // is pure shell with no config dependence.
+            if args.get(3).map(String::as_str) == Some("--instant-prompt") {
+                if args.get(2).map(String::as_str) == Some("zsh") {
+                    print!("{}", shell::init_zsh_instant_prompt());
+                } else {
+                    eprintln!("Usage: chevron init zsh --instant-prompt (zsh-only feature)");
                     std::process::exit(1);
+                }
+            } else {
+                // Read config so the init script's `[shell]` defaults are
+                // baked in. Env vars set before sourcing still win.
+                let cfg = chevron::config::Config::load();
+                match args.get(2).map(String::as_str) {
+                    Some("zsh") => print!("{}", shell::init_zsh_with(&cfg.shell)),
+                    Some("bash") => print!("{}", shell::init_bash_with(&cfg.shell)),
+                    Some("fish") => print!("{}", shell::init_fish_with(&cfg.shell)),
+                    _ => {
+                        eprintln!("Usage: chevron init <zsh|bash|fish>");
+                        std::process::exit(1);
+                    }
                 }
             }
         }
