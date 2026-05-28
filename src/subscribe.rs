@@ -183,6 +183,7 @@ fn write_line(mut conn: &UnixStream, line: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn args_default_no_cwd() {
@@ -208,6 +209,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn run_exits_2_when_no_daemon() {
         // Point at a definitely-missing socket dir to avoid any real
         // daemon on the dev box.

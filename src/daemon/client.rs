@@ -261,6 +261,104 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use tempfile::TempDir;
 
+    /// Test timeout — generous enough for sandbox builds where hundreds
+    /// of parallel tests compete for CPU. The production `QUERY_TIMEOUT`
+    /// (10 ms) is deliberately tight; tests must not depend on it.
+    const TEST_TIMEOUT: Duration = Duration::from_millis(500);
+
+    /// Like [`try_version`] but with [`TEST_TIMEOUT`].
+    fn try_version_patient() -> Option<proto::DaemonVersion> {
+        let conn = UnixStream::connect(paths::socket_path()).ok()?;
+        conn.set_read_timeout(Some(TEST_TIMEOUT)).ok()?;
+        conn.set_write_timeout(Some(TEST_TIMEOUT)).ok()?;
+        let mut reader = BufReader::new(&conn);
+        let mut line = String::new();
+        write_line(
+            &conn,
+            &proto::encode_request(&proto::Request::Hello(proto::PROTO_VERSION)),
+        )
+        .ok()?;
+        reader.read_line(&mut line).ok()?;
+        match proto::decode_response(&line).ok()? {
+            proto::Response::Hello(v) if v == proto::PROTO_VERSION => {}
+            _ => return None,
+        }
+        line.clear();
+        write_line(&conn, &proto::encode_request(&proto::Request::Version)).ok()?;
+        reader.read_line(&mut line).ok()?;
+        match proto::decode_response(&line).ok()? {
+            proto::Response::Version(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Like [`try_query`] but with [`TEST_TIMEOUT`].
+    fn try_query_patient(cwd: &Path) -> Option<RepoStatus> {
+        let conn = UnixStream::connect(paths::socket_path()).ok()?;
+        conn.set_read_timeout(Some(TEST_TIMEOUT)).ok()?;
+        conn.set_write_timeout(Some(TEST_TIMEOUT)).ok()?;
+        let mut reader = BufReader::new(&conn);
+        let mut line = String::new();
+        write_line(
+            &conn,
+            &proto::encode_request(&proto::Request::Hello(proto::PROTO_VERSION)),
+        )
+        .ok()?;
+        reader.read_line(&mut line).ok()?;
+        match proto::decode_response(&line).ok()? {
+            proto::Response::Hello(v) if v == proto::PROTO_VERSION => {}
+            _ => return None,
+        }
+        line.clear();
+        write_line(
+            &conn,
+            &proto::encode_request(&proto::Request::Status(cwd.to_path_buf())),
+        )
+        .ok()?;
+        reader.read_line(&mut line).ok()?;
+        match proto::decode_response(&line).ok()? {
+            proto::Response::Status(Some(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Like [`try_publish_event`] but with [`TEST_TIMEOUT`].
+    fn try_publish_event_patient(req: &proto::Request) -> bool {
+        let Ok(conn) = UnixStream::connect(paths::socket_path()) else {
+            return false;
+        };
+        if conn.set_read_timeout(Some(TEST_TIMEOUT)).is_err()
+            || conn.set_write_timeout(Some(TEST_TIMEOUT)).is_err()
+        {
+            return false;
+        }
+        let mut reader = BufReader::new(&conn);
+        let mut line = String::new();
+        if write_line(
+            &conn,
+            &proto::encode_request(&proto::Request::Hello(proto::PROTO_VERSION)),
+        )
+        .is_err()
+        {
+            return false;
+        }
+        if reader.read_line(&mut line).is_err() {
+            return false;
+        }
+        match proto::decode_response(&line) {
+            Ok(proto::Response::Hello(v)) if v == proto::PROTO_VERSION => {}
+            _ => return false,
+        }
+        line.clear();
+        if write_line(&conn, &proto::encode_request(req)).is_err() {
+            return false;
+        }
+        if reader.read_line(&mut line).is_err() {
+            return false;
+        }
+        matches!(proto::decode_response(&line), Ok(proto::Response::Ack))
+    }
+
     /// Spin up a one-off daemon bound to a tempdir socket and return its
     /// socket path. Sets `CHEVRON_SOCKET_DIR` so `try_query` picks it up.
     /// Returns the dir so it lives as long as the test.
@@ -272,7 +370,14 @@ mod tests {
         let db = state::open_db(dir.path()).unwrap();
         let (state_tx, _state_join) = state::spawn(state::TTL, db).unwrap();
         std::thread::spawn(move || listener::serve_loop(&listener_sock, &state_tx));
-        dir
+        // Block until the daemon is ready to serve requests.
+        for _ in 0..10 {
+            if try_version_patient().is_some() {
+                return dir;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("spawn_daemon: daemon did not become ready");
     }
 
     #[test]
@@ -291,7 +396,7 @@ mod tests {
         let repo_tmp = TempDir::new().unwrap();
         crate::segments::testutil::init_repo(repo_tmp.path());
         let cwd = repo_tmp.path().canonicalize().unwrap();
-        let status = try_query(&cwd).expect("expected daemon to return status");
+        let status = try_query_patient(&cwd).expect("expected daemon to return status");
         assert!(!status.branch.is_empty());
         assert!(!status.repo_name.is_empty());
         unsafe { std::env::remove_var("CHEVRON_SOCKET_DIR") };
@@ -324,7 +429,7 @@ mod tests {
         // same source of truth, so a clean upgrade-restart always
         // shows matching binaries.
         let _dir = spawn_daemon();
-        let v = try_version().expect("expected a VERSION response");
+        let v = try_version_patient().expect("expected a VERSION response");
         assert_eq!(v.binary, env!("CARGO_PKG_VERSION"));
         assert_eq!(v.proto, proto::PROTO_VERSION);
         // Schema is a string; just assert it parses as a positive
@@ -370,7 +475,9 @@ mod tests {
             cmd: "echo 'hi  there'".to_string(),
             started_at_ms: 100,
         };
-        assert!(try_publish_event(&proto::Request::CmdStart(start.clone())));
+        assert!(try_publish_event_patient(&proto::Request::CmdStart(
+            start.clone()
+        )));
 
         let end = proto::CmdEndEvent {
             id: "test-cmd-1".to_string(),
@@ -380,7 +487,7 @@ mod tests {
             output_bytes: None,
             output_truncated: None,
         };
-        assert!(try_publish_event(&proto::Request::CmdEnd(end)));
+        assert!(try_publish_event_patient(&proto::Request::CmdEnd(end)));
 
         // The listener ACKs lifecycle events as soon as they're queued
         // for the state actor — actual SQLite commit happens
@@ -390,7 +497,7 @@ mod tests {
         // CmdEnd have been processed. More robust than a sleep under
         // load (the original Phase 1 test was flaky in 5x-stress
         // pre-push runs).
-        let _ = try_query(dir.path());
+        let _ = try_query_patient(dir.path());
 
         // Use a fresh read-only connection so the actor's writer-side
         // WAL state still flushes our row to readers. WAL allows
@@ -435,7 +542,7 @@ mod tests {
 
         let cwd = repo_tmp.path().canonicalize().unwrap();
 
-        let daemon = try_query(&cwd).expect("daemon should return a status");
+        let daemon = try_query_patient(&cwd).expect("daemon should return a status");
         let mut inline_repo = git2::Repository::discover(&cwd).unwrap();
         let inline = RepoStatus::compute(&mut inline_repo);
 
