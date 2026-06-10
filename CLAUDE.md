@@ -93,6 +93,14 @@ verification):
   messages vanished and ncurses `reset`/`tset` (which reach the terminal
   via fd 2) exited 1 silently. Scope it instead:
   `{ exec {fd}< /dev/tty } 2>/dev/null`.
+- Flip raw mode BEFORE the pending-input probe: select on a canonical
+  tty reports readability only at line boundaries, so a cooked probe is
+  blind to partial-line input (paste leftovers after `read -rs`) and
+  the query races it. A CSI-less read buffer is typeahead truncated at
+  a typed `R` — re-inject it, never eat it. precmd's rewrite query must
+  linger (drain in its own raw window) on timeout: unlike preexec's
+  query there is no sweep behind it, and an unabsorbed straggler
+  kernel-echoes at the cursor as literal `^[[68;1R`.
 
 ## Testing
 
@@ -101,8 +109,9 @@ verification):
   in a pseudo-terminal with a hermetic `$HOME` and plays the terminal's role
   — a vt100 screen model interprets all output, and a responder answers DSR
   queries per a configurable mode (`Dsr::Immediate/Delayed/Silent/Fragmented/
-  FocusNoise/DoubleResponse`; `Render::Sync/Async/AsyncDelayed` controls
-  `CHEVRON_ASYNC` and an optional render-latency wrapper). Assertions run
+  FocusNoise/DoubleResponse/AlternateDelayed`;
+  `Render::Sync/SyncDelayed/Async/AsyncDelayed` controls `CHEVRON_ASYNC`
+  and an optional render-latency wrapper). Assertions run
   against the rendered grid (rows containing `❯`, glyph counts, cell colors);
   failures dump the numbered screen plus an ESC-escaped raw byte tail.
 - The harness requires `zsh` on PATH and skips loudly when absent (the nix
@@ -125,3 +134,9 @@ verification):
   (Enter-binding transient) integrations are untested end-to-end.
 - All PTY tests set `CHEVRON_NO_DAEMON=1` and run outside a git repo, so the
   daemon path and the git segment have no end-to-end coverage.
+- A preexec DSR response that arrives after the 300 ms budget while an
+  interactive `read` builtin owns the terminal is consumed as that
+  read's input (a pasted secret gets the response prepended). Chevron
+  cannot claw it back once the query is out; only skipping the preexec
+  query entirely would close this, at the cost of the transient
+  rewrite.

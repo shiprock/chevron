@@ -124,7 +124,11 @@ const BODY_ZSH: &str = r#"_chevron_preexec() {
 # (empty on failure or skip). One `read -d 'R'` call instead of a
 # per-byte loop — fewer dispatch overheads, and the 300 ms timeout
 # covers tmux/SSH round-trip latency that a tight 50 ms-per-byte budget
-# can't.
+# can't. An optional argument gives a linger window (zselect
+# hundredths): on timeout or truncation the helper then drains the
+# straggling response INSIDE its own raw window instead of flagging it
+# for a later sweep — for callers with no sweep point behind them
+# (precmd's rewrite query; the next stop is ZLE).
 #
 # Typeahead safety: `read -d 'R'` consumes every queued byte ahead of
 # the response. If the user has already typed the next command, the
@@ -137,6 +141,15 @@ const BODY_ZSH: &str = r#"_chevron_preexec() {
 # chevron beats racing the user's keystrokes. zselect ships with zsh;
 # if the module is somehow absent the probe fails closed into the old
 # always-query behaviour.
+#
+# The probe must run with the tty already RAW: select on a canonical
+# tty reports readability only at line boundaries, so a partial line —
+# paste leftovers past the newline an interactive `read -rs` consumed,
+# half a typed command — is invisible to a cooked-mode probe. The query
+# then races input the probe swore wasn't there: `read -d 'R'`
+# truncates at the first typed `R` (pasted API keys are full of them)
+# and the real response is left stranded to kernel-echo as literal
+# `^[[68;1R` once echo returns. Raw first makes partials visible.
 #
 # Tty state: -echo must flip BEFORE the query goes out — response bytes
 # arriving ahead of the read are otherwise kernel-echoed at the cursor
@@ -157,6 +170,10 @@ const BODY_ZSH: &str = r#"_chevron_preexec() {
 # instead of vanishing; anything carrying other control bytes — ESC
 # from arrow keys or stray reports, ^C from an interrupt racing the
 # exchange — is dropped rather than pushed into the buffer as garbage.
+# A buffer with NO CSI at all means a typed `R` ended the read before
+# the response existed: the whole buffer is typeahead. Re-inject it
+# (restoring the `R` the delimiter ate) and treat the response as still
+# in flight — silently eating those bytes loses user input.
 _chevron_query_row() {
     REPLY=""
     local fd
@@ -168,26 +185,36 @@ _chevron_query_row() {
     # silently: "reset stopped working". The brace group scopes the
     # suppression to the open; the fd allocated by exec persists anyway.
     { exec {fd}< /dev/tty } 2>/dev/null || return
+    local _chevron_stty=$(stty -g 2>/dev/null)
+    stty -echo -icanon min 0 time 0 2>/dev/null
     if zselect -t 0 -r $fd 2>/dev/null; then
+        [[ -n "$_chevron_stty" ]] && stty "$_chevron_stty" 2>/dev/null
         exec {fd}<&-
         return
     fi
-    local _chevron_stty=$(stty -g 2>/dev/null)
-    stty -echo -icanon min 0 time 0 2>/dev/null
     printf '\e[6n' > /dev/tty 2>/dev/null
     local resp
-    if IFS= read -u $fd -d 'R' -s -t 0.3 resp 2>/dev/null; then
+    if IFS= read -u $fd -d 'R' -s -t 0.3 resp 2>/dev/null \
+        && [[ "$resp" == *$'\e['* ]]; then
         _chevron_dsr_inflight=""
         # Double-reporting emulator stacks answer twice; absorb the
         # trailing duplicate now, while the tty is still raw.
         _chevron_drain_reports $fd
     else
-        # The response missed the budget and will land later — possibly
-        # while ZLE owns the terminal, where split arrival across
-        # KEYTIMEOUT lets its tail self-insert into the command line as
-        # literal text (`1R`). Flag it; precmd sweeps it out before the
-        # editor runs.
+        # Timed out, or truncated by a typed `R` before the response
+        # arrived — either way the answer lands later, possibly while
+        # ZLE owns the terminal, where split arrival across KEYTIMEOUT
+        # lets its tail self-insert into the command line as literal
+        # text (`1R`). Flag it; precmd sweeps it out before the editor
+        # runs.
         _chevron_dsr_inflight=1
+    fi
+    # Linger mode: this caller has no sweep point behind it, so absorb
+    # the straggler now, while -echo still holds. Restoring echo first
+    # would let the response kernel-echo at the cursor as `^[[68;1R`.
+    if [[ -n "$1" && -n "$_chevron_dsr_inflight" ]]; then
+        _chevron_drain_reports $fd "$1"
+        _chevron_dsr_inflight=""
     fi
     [[ -n "$_chevron_stty" ]] && stty "$_chevron_stty" 2>/dev/null
     exec {fd}<&-
@@ -197,6 +224,9 @@ _chevron_query_row() {
         REPLY="${payload%%;*}"
         [[ "$REPLY" == <-> ]] || REPLY=""
         [[ -n "$pre_esc" && "$pre_esc" != *[^[:print:]$'\t\r\n']* ]] && print -z -- "$pre_esc" 2>/dev/null
+    elif [[ -n "$resp" && "$resp" != *[^[:print:]$'\t\r\n']* ]]; then
+        # CSI-less buffer: pure typeahead, truncated at a typed `R`.
+        print -z -- "${resp}R" 2>/dev/null
     fi
 }
 # Absorb unsolicited ESC-led reports queued on the tty: duplicate DSR
@@ -311,7 +341,12 @@ _chevron_precmd() {
     if [[ -n "$_chevron_transient_save_row" && "${CHEVRON_TRANSIENT:-1}" != "0" \
           && "$_chevron_transient_save_geom" == "$COLUMNS:$LINES" \
           && "$_chevron_cmd_title" != *$'\n'* ]]; then
-        _chevron_query_row
+        # Linger 300 ms (30 hundredths) on timeout: unlike preexec's
+        # query — whose straggler the sweep above catches a cycle later
+        # — there is NO sweep between this query and ZLE taking the
+        # terminal. An unabsorbed response would kernel-echo as literal
+        # `^[[68;1R` the instant the helper restores echo.
+        _chevron_query_row 30
         if [[ -n "$REPLY" ]]; then
             local _chevron_R_current="$REPLY"
             local _chevron_R_saved="$_chevron_transient_save_row"
@@ -1175,6 +1210,33 @@ mod tests {
         assert!(
             !pre.contains("stty -") && !pre.contains("$(stty"),
             "preexec must not duplicate the tty dance outside the helper"
+        );
+    }
+
+    #[test]
+    fn zsh_query_row_probes_raw_and_lingers_for_precmd() {
+        let out = init_zsh();
+        let body = body_of(&out, "_chevron_query_row() {");
+        // Raw mode must precede the pending-input probe: select on a
+        // canonical tty reports readability only at line boundaries, so
+        // a cooked probe misses partial-line typeahead (paste leftovers
+        // after an interactive `read -rs`) and the query then races
+        // input the probe missed.
+        let raw = body.find("stty -echo -icanon").expect("raw flip");
+        let probe = body.find("zselect -t 0 -r").expect("probe");
+        assert!(raw < probe, "raw mode must precede the probe");
+        // A CSI-less read buffer is typeahead truncated at a typed `R`;
+        // it must be re-injected (with the eaten delimiter restored),
+        // never silently dropped.
+        assert!(
+            body.contains(r#"print -z -- "${resp}R""#),
+            "truncated typeahead must be re-injected"
+        );
+        // precmd's rewrite query must linger on timeout: no sweep runs
+        // between it and ZLE, so an unabsorbed straggler kernel-echoes.
+        assert!(
+            out.contains("_chevron_query_row 30"),
+            "precmd's query must pass a linger window"
         );
     }
 

@@ -60,6 +60,12 @@ enum Dsr {
     /// multiplexer/emulator stacks that double-report. The duplicate
     /// lingers in the input queue to poison the next exchange.
     DoubleResponse,
+    /// Answer odd-numbered queries (preexec's) immediately and
+    /// even-numbered ones (precmd's rewrite) after a delay past the
+    /// 300 ms read budget — an emulator whose load spikes mid-cycle.
+    /// Exercises the precmd-side straggler, which has no sweep point
+    /// behind it before ZLE takes the terminal.
+    AlternateDelayed(Duration),
 }
 
 /// Prompt-render mode for the spawned shell.
@@ -67,6 +73,10 @@ enum Dsr {
 enum Render {
     /// `CHEVRON_ASYNC` unset: every prompt renders synchronously.
     Sync,
+    /// Synchronous, plus a PATH wrapper delaying every render — holds
+    /// the post-precmd window (echo restored, ZLE not yet up) open so
+    /// straggler-arrival races become deterministic.
+    SyncDelayed(Duration),
     /// `CHEVRON_ASYNC=1`: cached prompt plus background refresh.
     Async,
     /// `CHEVRON_ASYNC=1` plus a PATH wrapper delaying every render —
@@ -167,6 +177,7 @@ fn pump_output(
 ) {
     let mut buf = [0u8; 8192];
     let mut pend: Vec<u8> = Vec::new();
+    let mut query_no: usize = 0;
     loop {
         let n = match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
@@ -182,6 +193,7 @@ fn pump_output(
                 let (row, col) = p.screen().cursor_position();
                 drop(p);
                 pend.drain(..end);
+                query_no += 1;
                 let resp = format!("\x1b[{};{}R", row + 1, col + 1).into_bytes();
                 match dsr {
                     Dsr::Silent => {}
@@ -208,6 +220,14 @@ fn pump_output(
                     Dsr::DoubleResponse => {
                         let _ = tx.send((Instant::now(), resp.clone()));
                         let _ = tx.send((Instant::now(), resp));
+                    }
+                    Dsr::AlternateDelayed(d) => {
+                        let due = if query_no % 2 == 1 {
+                            Instant::now()
+                        } else {
+                            Instant::now() + d
+                        };
+                        let _ = tx.send((due, resp));
                     }
                 }
             } else {
@@ -264,7 +284,7 @@ impl Term {
         // and sleeps before `prompt` renders, so a background refresh
         // reliably outlives the next prompt cycle.
         let mut path_dirs = bin_dir.display().to_string();
-        if let Render::AsyncDelayed(delay) = mode {
+        if let Render::AsyncDelayed(delay) | Render::SyncDelayed(delay) = mode {
             use std::os::unix::fs::PermissionsExt;
             let wrapper_dir = home_path.join("wrapper-bin");
             std::fs::create_dir_all(&wrapper_dir).unwrap();
@@ -329,7 +349,7 @@ impl Term {
         ] {
             cmd.env_remove(var);
         }
-        if !matches!(mode, Render::Sync) {
+        if matches!(mode, Render::Async | Render::AsyncDelayed(_)) {
             cmd.env("CHEVRON_ASYNC", "1");
         }
 
@@ -1684,6 +1704,99 @@ fn reset_command_reinitializes_cleanly() {
         t.with_screen(chevron_rows),
         vec!["\u{276f} /bin/echo after-reset"],
         "only the post-reset command's collapsed row should remain\n{}",
+        t.dump()
+    );
+}
+
+/// Interactive secret entry (`read -rs "VAR?prompt"`) with paste
+/// leftovers: the paste carries bytes past the newline the read
+/// consumed, with no trailing newline of their own. A cooked-mode
+/// pending-input probe cannot see a partial line (canonical select
+/// reports readability only at line boundaries), so precmd's query
+/// used to race the leftovers: `read -d 'R'` truncated at an `R`
+/// inside them, ate everything before it, and left the real DSR
+/// response stranded to surface as literal `^[[row;1R` garbage — the
+/// shape reported with an Ashby API key paste. The probe now runs raw
+/// (partials visible, query skipped) and truncated typeahead is
+/// re-injected instead of eaten.
+#[test]
+fn paste_leftovers_during_interactive_read_stay_clean() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.send_line("read -rs \"K?key: \"; echo len-${#K}");
+    t.wait_for("the read builtin's prompt", |s| {
+        lines(s).iter().any(|l| l == "key:")
+    });
+    // Paste: the secret, the newline that finishes the read, then a
+    // tail with an interior `R` that stays queued as a partial line.
+    t.send("SECRETKEY9\rTRAILR-MORE");
+    t.wait_for("read to finish with the key intact", |s| {
+        lines(s).iter().any(|l| l.contains("len-10"))
+    });
+    t.wait_settled(Duration::from_millis(400));
+
+    let all = t.with_screen(lines);
+    assert!(
+        all.iter().all(|l| !l.contains(";1") && !l.contains("^[")),
+        "no DSR response may leak as literal text\n{}",
+        t.dump()
+    );
+    let prompt_row = t.with_screen(last_nonempty);
+    assert!(
+        prompt_row.ends_with("TRAILR-MORE"),
+        "paste leftovers must reach the edit buffer intact, not be eaten\n{}",
+        t.dump()
+    );
+}
+
+/// An emulator that answers preexec's query instantly but precmd's
+/// rewrite query past the 300 ms read budget. preexec's stragglers are
+/// covered by the sweep at the top of the NEXT precmd — but behind
+/// precmd's own query there is no sweep, only ZLE: the response used to
+/// arrive just after the helper restored echo and kernel-echo at the
+/// cursor as literal `^[[row;1R` (or self-insert its tail into the
+/// edit buffer). The helper now lingers in its raw window on timeout
+/// and absorbs the straggler before echo returns.
+#[test]
+fn slow_precmd_dsr_response_never_leaks() {
+    if !zsh_available() {
+        return;
+    }
+    // The straggler lands at 400 ms: 100 ms past the read budget (the
+    // helper has definitely given up) and squarely inside the 300 ms
+    // render window the SyncDelayed wrapper holds open — echo is
+    // restored, ZLE is not yet up, so an unabsorbed response
+    // kernel-echoes. The helper's 300 ms linger covers arrivals
+    // through ~600 ms.
+    let t = Term::spawn_inner(
+        Dsr::AlternateDelayed(Duration::from_millis(400)),
+        ROWS,
+        COLS,
+        Render::SyncDelayed(Duration::from_millis(300)),
+    );
+    t.run("true");
+    t.wait_settled(Duration::from_millis(700));
+
+    // The leak is transient on screen (the next prompt can paint over
+    // it), so assert on the raw byte stream: a kernel-echoed response
+    // appears as caret-notation `^[[` — three printable bytes that
+    // never occur in chevron's legitimate output (real CSIs are ESC
+    // bytes, not caret text).
+    let echoed_caret = {
+        let raw = t.raw.lock().unwrap();
+        raw.windows(3).any(|w| w == b"^[[")
+    };
+    assert!(
+        !echoed_caret,
+        "straggling precmd response must never kernel-echo\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true"],
+        "{}",
         t.dump()
     );
 }
