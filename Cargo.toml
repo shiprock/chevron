@@ -1,6 +1,6 @@
 [package]
 name = "chevron"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 license = "MIT"
 description = "Configurable powerline prompt segments and tmux window titles for zsh, bash, and fish"
@@ -41,6 +41,7 @@ ureq = { version = "3", optional = true, default-features = false, features = ["
 assert_cmd = "2"
 criterion = { version = "0.5", default-features = false }
 insta = "1"
+portable-pty = "0.9.0"
 predicates = "3"
 proptest = "1"
 # Used by tests/cli.rs to read the daemon's commands.db file directly
@@ -48,6 +49,7 @@ proptest = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serial_test = "3"
 tempfile = "3"
+vt100 = "0.16.2"
 
 [[bench]]
 name = "segments"

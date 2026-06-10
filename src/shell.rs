@@ -84,7 +84,6 @@ fi
 
 #[allow(clippy::too_many_lines)]
 const BODY_ZSH: &str = r#"_chevron_preexec() {
-    _chevron_cmd_start=$EPOCHREALTIME
     _chevron_cmd_title="$1"
     # OSC 133 C: command output is about to start. Modern terminals
     # (Ghostty, WezTerm, iTerm2, Kitty, VS Code, Windows Terminal) use
@@ -93,22 +92,14 @@ const BODY_ZSH: &str = r#"_chevron_preexec() {
     # silently ignore unknown OSC sequences.
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;C\a'
     # Save the cursor's absolute row (via DSR) for the precmd transient-
-    # colour rewrite. preexec fires AFTER ZLE handed control back to
-    # outside mode (echo restored), so we MUST disable echo around the
-    # DSR query — otherwise the kernel echoes the response bytes
-    # (`^[[N;NR`) to stdout, where they leak into the upcoming
-    # command's output. We save and restore the full stty state to
-    # avoid stomping anything else the user set.
+    # colour rewrite, plus the geometry it was measured under — a resize
+    # while the command runs invalidates every saved coordinate. The
+    # query helper owns all tty state and typeahead safety — see
+    # _chevron_query_row.
     if [[ "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
-        local _chevron_stty=$(stty -g 2>/dev/null)
-        # Both -echo (suppress kernel echo) AND -icanon (drop line-mode
-        # buffering) — line-mode could otherwise echo control bytes via
-        # echoctl regardless of the -echo flag. min/time:0/1 makes read
-        # see bytes as they arrive instead of waiting for a line.
-        stty -echo -icanon min 0 time 0 2>/dev/null
         _chevron_query_row
-        [[ -n "$_chevron_stty" ]] && stty "$_chevron_stty" 2>/dev/null
         _chevron_transient_save_row="$REPLY"
+        _chevron_transient_save_geom="$COLUMNS:$LINES"
     fi
     # Command lifecycle hook (chevron-1yn): publish to chevrond so the
     # query CLI and live segments can consume the history. Disabled by
@@ -121,31 +112,111 @@ const BODY_ZSH: &str = r#"_chevron_preexec() {
     else
         unset _chevron_cmd_id
     fi
+    # Timestamp LAST: the DSR exchange, tty bookkeeping, and the
+    # lifecycle publish above can each cost tens of milliseconds and
+    # must not count against the user's command (precmd takes its end
+    # timestamp first, symmetrically).
+    _chevron_cmd_start=$EPOCHREALTIME
 }
 # Query the current cursor row via DSR (\e[6n). Stores the row in REPLY
-# (empty on failure). One `read -d 'R'` call instead of a per-byte loop
-# — fewer dispatch overheads, and the 300 ms timeout covers tmux/SSH
-# round-trip latency that a tight 50 ms-per-byte budget can't.
+# (empty on failure or skip). One `read -d 'R'` call instead of a
+# per-byte loop — fewer dispatch overheads, and the 300 ms timeout
+# covers tmux/SSH round-trip latency that a tight 50 ms-per-byte budget
+# can't.
 #
-# The DSR response shape is `\e[<row>;<col>R`. `read -d 'R'` reads up
-# to (but not including) the R terminator, so resp ends up containing
-# `\e[<row>;<col>`. Anything in resp BEFORE the ESC is user typeahead;
-# we strip it out and re-inject via `print -z` so a fast-typing user
-# doesn't lose keystrokes to the DSR exchange.
+# Typeahead safety: `read -d 'R'` consumes every queued byte ahead of
+# the response. If the user has already typed the next command, the
+# read would swallow it — the line never executes and reappears parked
+# in the next edit buffer — and a typed literal `R` truncates the
+# exchange early, leaving the real response queued to poison the NEXT
+# cycle's query with a stale row (the rewrite then lands on the wrong
+# line: duplicated chevrons). So probe for pending input first and skip
+# the query entirely when anything is waiting: an honest neutral
+# chevron beats racing the user's keystrokes. zselect ships with zsh;
+# if the module is somehow absent the probe fails closed into the old
+# always-query behaviour.
+#
+# Tty state: -echo must flip BEFORE the query goes out — response bytes
+# arriving ahead of the read are otherwise kernel-echoed at the cursor
+# as `^[[12;34R` (this bit precmd, whose query used to run unguarded).
+# -icanon because line-mode buffers the response forever (no newline
+# ever comes) and echoctl can echo control bytes regardless of -echo.
+# min/time 0/0 makes read see bytes as they arrive. The full stty state
+# is saved and restored to avoid stomping anything else the user set.
+#
+# The DSR response shape is `\e[<row>;<col>R`. The response is parsed
+# from the LAST CSI in the buffer: terminals with focus reporting (or
+# other unsolicited reports) enabled can interleave `\e[I` etc. ahead
+# of the response, and parsing the first CSI would feed garbage like
+# `I\e[5` into arithmetic — a visible zsh math error. The row is then
+# validated as numeric. Anything before the last CSI is input that
+# slipped in between probe and read: plain keystrokes (plus tab/CR/LF)
+# are re-injected via `print -z` so they land in the next edit buffer
+# instead of vanishing; anything carrying other control bytes — ESC
+# from arrow keys or stray reports, ^C from an interrupt racing the
+# exchange — is dropped rather than pushed into the buffer as garbage.
 _chevron_query_row() {
     REPLY=""
+    local fd
+    exec {fd}< /dev/tty 2>/dev/null || return
+    if zselect -t 0 -r $fd 2>/dev/null; then
+        exec {fd}<&-
+        return
+    fi
+    local _chevron_stty=$(stty -g 2>/dev/null)
+    stty -echo -icanon min 0 time 0 2>/dev/null
     printf '\e[6n' > /dev/tty 2>/dev/null
     local resp
-    IFS= read -d 'R' -s -t 0.3 resp < /dev/tty 2>/dev/null
-    if [[ "$resp" == *$'\e['* ]]; then
-        local pre_esc="${resp%%$'\e['*}"
-        local payload="${resp#*$'\e['}"
-        REPLY="${payload%%;*}"
-        [[ -n "$pre_esc" ]] && print -z -- "$pre_esc" 2>/dev/null
+    if IFS= read -u $fd -d 'R' -s -t 0.3 resp 2>/dev/null; then
+        _chevron_dsr_inflight=""
+        # Double-reporting emulator stacks answer twice; absorb the
+        # trailing duplicate now, while the tty is still raw.
+        _chevron_drain_reports $fd
+    else
+        # The response missed the budget and will land later — possibly
+        # while ZLE owns the terminal, where split arrival across
+        # KEYTIMEOUT lets its tail self-insert into the command line as
+        # literal text (`1R`). Flag it; precmd sweeps it out before the
+        # editor runs.
+        _chevron_dsr_inflight=1
     fi
+    [[ -n "$_chevron_stty" ]] && stty "$_chevron_stty" 2>/dev/null
+    exec {fd}<&-
+    if [[ "$resp" == *$'\e['* ]]; then
+        local pre_esc="${resp%$'\e['*}"
+        local payload="${resp##*$'\e['}"
+        REPLY="${payload%%;*}"
+        [[ "$REPLY" == <-> ]] || REPLY=""
+        [[ -n "$pre_esc" && "$pre_esc" != *[^[:print:]$'\t\r\n']* ]] && print -z -- "$pre_esc" 2>/dev/null
+    fi
+}
+# Absorb unsolicited ESC-led reports queued on the tty: duplicate DSR
+# responses from double-reporting emulator stacks (called with the
+# default 20 ms first window right after a successful read) and late
+# responses that missed an earlier read's budget (called from precmd's
+# sweep with a longer window). Only ESC-led data is consumed; the first
+# plain byte is user typeahead — pushed onto the buffer stack, which
+# pops into the next edit buffer BEFORE queued input is read, so typing
+# order is preserved — and draining stops there.
+_chevron_drain_reports() {
+    local fd=$1 _chevron_wait=${2:-2} _chevron_first _chevron_junk
+    while zselect -t $_chevron_wait -r $fd 2>/dev/null; do
+        _chevron_wait=2
+        IFS= read -u $fd -k 1 -s -t 0 _chevron_first 2>/dev/null || break
+        if [[ "$_chevron_first" == $'\e' ]]; then
+            IFS= read -u $fd -d 'R' -s -t 0.1 _chevron_junk 2>/dev/null
+        else
+            print -z -- "$_chevron_first" 2>/dev/null
+            break
+        fi
+    done
 }
 _chevron_precmd() {
     local exit_status=$?
+    # End timestamp FIRST, before the instant-prompt takeover and the
+    # sweep/rewrite machinery below spend their own time — the duration
+    # tag measures the command only.
+    local _chevron_cmd_end=$EPOCHREALTIME
     # Instant-prompt takeover (chevron-nf8). If the top-of-rc snippet
     # painted a cached prompt and redirected stdout/stderr to a buffer,
     # restore the real fds, close the spurious OSC 133 prompt region we
@@ -168,11 +239,16 @@ _chevron_precmd() {
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;D;%d\a' $exit_status
     # Color-correct the transient prompt (chevron-4xq). preexec captured
     # the absolute row of the line below the painted transient (via
-    # DSR). Now we query R_current and absolute-position to (R_saved-1)
-    # to land on the transient line itself, erase it, write the
-    # exit-coloured chevron + cmd, then absolute-position back to
-    # R_current so zsh's main loop draws the next PROMPT where it
-    # belongs.
+    # DSR). Now we query R_current, erase the transient's rows, write
+    # the exit-coloured chevron + cmd at the transient's top row, then
+    # absolute-position back to R_current so zsh's main loop draws the
+    # next PROMPT where it belongs.
+    #
+    # The painted transient is `❯ ` plus the typed command, which WRAPS
+    # on narrow terminals: it occupies ceil(width/COLUMNS) rows ENDING
+    # at R_saved-1. Erasing only the last of those rows left the earlier
+    # rows behind — the duplicated-chevron glitch — while the rewrite
+    # re-wrapped into rows the next prompt then half-overwrote.
     #
     # Pure DSR + absolute positioning — no DECSC/DECRC and no SCOSC.
     # The earlier attempts using \e7/\e8 were silently dropped on some
@@ -183,19 +259,59 @@ _chevron_precmd() {
     #   - Output that scrolled the saved row off-screen: the rewrite
     #     lands somewhere off-visible. Bounded by the `delta < 200`
     #     sanity check.
-    #   - Multi-line input or wrapped input: we only erase one row;
-    #     other rows of the multi-line transient remain.
+    #   - True multi-line input (PS2 continuations): rewrite skipped,
+    #     transient stays neutral (see the guard below).
     #   - Terminals that don't support DSR: query returns empty,
     #     rewrite is skipped, the transient stays neutral grey.
-    if [[ -n "$_chevron_transient_save_row" && "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
+    # Sweep a still-in-flight DSR response (preexec's query timed out on
+    # a slow link) before ZLE takes the terminal: arriving there, split
+    # across KEYTIMEOUT, its tail self-inserts into the command line as
+    # literal text (`1R`). By precmd time the straggler has normally
+    # arrived; wait up to 300 ms more for it. Terminals that never
+    # respond pay this wait once per command — CHEVRON_TRANSIENT=0 is
+    # the escape hatch for those.
+    if [[ -n "$_chevron_dsr_inflight" && "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
+        local _chevron_sweep_fd
+        if exec {_chevron_sweep_fd}< /dev/tty 2>/dev/null; then
+            local _chevron_sweep_stty=$(stty -g 2>/dev/null)
+            stty -echo -icanon min 0 time 0 2>/dev/null
+            _chevron_drain_reports $_chevron_sweep_fd 30
+            [[ -n "$_chevron_sweep_stty" ]] && stty "$_chevron_sweep_stty" 2>/dev/null
+            exec {_chevron_sweep_fd}<&-
+        fi
+        _chevron_dsr_inflight=""
+    fi
+    # A resize between preexec and precmd invalidates the saved row AND
+    # the wrap-span math: reflowing terminals (tmux, kitty, ghostty)
+    # rewrap the transient to different rows entirely, and recomputing
+    # the span under the new COLUMNS would erase rows the transient
+    # never occupied. Skipping is the only honest move.
+    #
+    # Multi-line input (PS2 continuations) is skipped for the same
+    # reason: the painted transient spans the buffer's rows plus PS2
+    # prefixes whose widths we can't reconstruct, and measuring only
+    # the first line made the rewrite erase the continuation row and
+    # paint a SECOND copy of line one there — a duplicated chevron.
+    if [[ -n "$_chevron_transient_save_row" && "${CHEVRON_TRANSIENT:-1}" != "0" \
+          && "$_chevron_transient_save_geom" == "$COLUMNS:$LINES" \
+          && "$_chevron_cmd_title" != *$'\n'* ]]; then
         _chevron_query_row
         if [[ -n "$REPLY" ]]; then
             local _chevron_R_current="$REPLY"
             local _chevron_R_saved="$_chevron_transient_save_row"
-            local _chevron_R_transient=$(( _chevron_R_saved - 1 ))
             local _chevron_delta=$(( _chevron_R_current - _chevron_R_saved ))
             local _chevron_lines=${LINES:-24}
             local _chevron_available=$(( _chevron_lines - _chevron_R_saved ))
+            # Cmd may be multi-line; only its first line is measured and
+            # written so we don't run past the rows we erased.
+            local _chevron_rewrite_cmd="${_chevron_cmd_title%%$'\n'*}"
+            # Rows the wrapped transient occupies. ${(m)#...} counts
+            # display cells (not bytes); `❯ ` adds 2.
+            local _chevron_width=$(( ${(m)#_chevron_rewrite_cmd} + 2 ))
+            local _chevron_cols=${COLUMNS:-80}
+            local _chevron_span=$(( (_chevron_width + _chevron_cols - 1) / _chevron_cols ))
+            (( _chevron_span < 1 )) && _chevron_span=1
+            local _chevron_R_top=$(( _chevron_R_saved - _chevron_span ))
             # Scroll detection: any of these means the saved row is
             # no longer the transient line.
             #   - R_saved at/past bottom: any output scrolled.
@@ -207,7 +323,7 @@ _chevron_precmd() {
             # streaming commands (ps, ls of huge dirs, cargo build)
             # commonly trigger one of these and the user gets a clean
             # gray chevron without a glitched rewrite.
-            if (( _chevron_R_transient > 0 \
+            if (( _chevron_R_top > 0 \
                 && _chevron_R_saved < _chevron_lines \
                 && _chevron_R_current < _chevron_lines \
                 && _chevron_delta >= 0 \
@@ -218,30 +334,32 @@ _chevron_precmd() {
                 else
                     _chevron_color_code=1
                 fi
-                # Cmd may be multi-line; only write its first line so we
-                # don't run past the column we landed on.
-                local _chevron_rewrite_cmd="${_chevron_cmd_title%%$'\n'*}"
                 local _chevron_osc_a=""
                 local _chevron_osc_b=""
                 if [[ "${CHEVRON_OSC133:-1}" != "0" ]]; then
                     _chevron_osc_a=$'\e]133;A\a'
                     _chevron_osc_b=$'\e]133;B\a'
                 fi
-                printf '\e[%d;1H\e[2K%s\e[3%dm❯\e[0m %s%s\e[%d;1H' \
-                    "$_chevron_R_transient" \
+                # Erase every wrapped row top-to-bottom, then write the
+                # rewrite at the top; it re-wraps into exactly the rows
+                # just cleared.
+                local _chevron_erase=""
+                repeat $_chevron_span _chevron_erase+=$'\e[2K\e[B'
+                printf '\e[%d;1H%s\e[%d;1H%s\e[3%dm❯\e[0m %s%s\e[%d;1H' \
+                    "$_chevron_R_top" "$_chevron_erase" "$_chevron_R_top" \
                     "$_chevron_osc_a" "$_chevron_color_code" \
                     "$_chevron_osc_b" "$_chevron_rewrite_cmd" \
                     "$_chevron_R_current" > /dev/tty 2>/dev/null
             fi
         fi
-        unset _chevron_transient_save_row
     fi
+    unset _chevron_transient_save_row _chevron_transient_save_geom
     local duration_ms=0
-    if [[ -n "$_chevron_cmd_start" ]]; then
-        duration_ms=$(( ($EPOCHREALTIME - _chevron_cmd_start) * 1000 ))
+    if [[ -n "$_chevron_cmd_start" && -n "$_chevron_cmd_end" ]]; then
+        duration_ms=$(( (_chevron_cmd_end - _chevron_cmd_start) * 1000 ))
         duration_ms=${duration_ms%.*}
-        unset _chevron_cmd_start
     fi
+    unset _chevron_cmd_start
     # Command lifecycle finish event (chevron-1yn). Mirror of cmd-start
     # in preexec: only emitted when preexec stashed an id (i.e.
     # CHEVRON_HISTORY enabled and the command wasn't ignorespace'd).
@@ -273,6 +391,11 @@ _chevron_precmd() {
     fi
     local job_count=${(%):-%j}
     local chevron_output=""
+    # Generation stamp for the async fast path: bumped every cycle so a
+    # background refresh that finishes after a NEWER prompt is already
+    # up discards itself instead of repainting stale content (previous
+    # directory, previous exit status) over the live prompt.
+    (( _chevron_async_gen++ ))
     # Async fast path (CHEVRON_ASYNC=1): try the cached prompt from the
     # previous render; on hit, set PROMPT immediately and spawn a
     # background refresh whose result will trigger a redraw via the
@@ -327,6 +450,9 @@ _chevron_precmd() {
 # PROMPT, and triggers a redraw.
 _chevron_start_async() {
     local exit_status=$1 duration_ms=$2 job_count=$3
+    # Stamp the refresh with the cycle that spawned it (see the
+    # generation bump in precmd).
+    _chevron_async_spawn_gen="$_chevron_async_gen"
     exec {_chevron_async_fd}< <(CHEVRON_CACHE_FILE="$_chevron_cache_file" chevron prompt 20 "$exit_status" "$duration_ms" "$job_count" 2>/dev/null)
     zle -F "$_chevron_async_fd" _chevron_async_callback
 }
@@ -336,6 +462,10 @@ _chevron_async_callback() {
     fresh=$(cat <&$fd 2>/dev/null)
     zle -F "$fd"
     exec {fd}<&-
+    # Stale guard: if another precmd ran since this refresh was spawned,
+    # the result describes a previous cycle — drop it; the newer cycle
+    # owns the prompt now. (The fd is already closed above either way.)
+    [[ "$_chevron_async_spawn_gen" == "$_chevron_async_gen" ]] || return
     if [[ -n "$fresh" ]]; then
         _chevron_make_prompt "${fresh%%$'\n'*}"
         PROMPT="$REPLY"
@@ -389,6 +519,16 @@ _chevron_make_prompt() {
 # prompt content (which may include path/branch info) isn't world-readable.
 _chevron_cache_file="${XDG_RUNTIME_DIR:-/tmp}/chevron-${UID:-$(id -u)}/last-prompt"
 [[ -d "${_chevron_cache_file:h}" ]] || mkdir -p -m 700 "${_chevron_cache_file:h}" 2>/dev/null
+# zselect backs the pending-input probe in _chevron_query_row. Best
+# effort: if the module is missing, the probe is skipped and the query
+# behaves as before.
+zmodload -F zsh/zselect b:zselect 2>/dev/null
+# EPOCHREALTIME lives in zsh/datetime and expands EMPTY when the module
+# isn't loaded — in a bare .zshrc the duration tag silently never fired
+# (every command measured as 0 ms). Parameter-only load: no strftime
+# builtin or other namespace pollution. Best effort: on failure the
+# duration stays 0, as before.
+zmodload -F zsh/datetime p:EPOCHREALTIME 2>/dev/null
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd _chevron_precmd
 add-zsh-hook preexec _chevron_preexec
@@ -972,6 +1112,166 @@ mod tests {
 
     // ── original body assertions (preamble doesn't affect these) ──────────
 
+    /// Body of a `name() { ... }` zsh function in the init script, up to
+    /// the first un-indented closing brace.
+    fn body_of<'a>(script: &'a str, header: &str) -> &'a str {
+        let start = script.find(header).expect("function exists");
+        let end = script[start..]
+            .find("\n}\n")
+            .map(|i| start + i)
+            .expect("function closes");
+        &script[start..end]
+    }
+
+    #[test]
+    fn zsh_query_row_skips_when_typeahead_pending() {
+        // `read -d 'R'` consumes everything queued ahead of the DSR
+        // response: typed-ahead commands were swallowed (parked in the
+        // next edit buffer, never executed) and a typed `R` left a stale
+        // response behind to mis-row the next cycle's rewrite. The probe
+        // must come before the query so we never race user input.
+        let out = init_zsh();
+        let body = body_of(&out, "_chevron_query_row() {");
+        let probe = body.find("zselect -t 0 -r").expect("pending-input probe");
+        let query = body.find(r"printf '\e[6n'").expect("DSR query");
+        assert!(probe < query, "probe must run before the query is emitted");
+        assert!(
+            out.contains("zmodload -F zsh/zselect b:zselect"),
+            "zselect builtin must be loaded at init"
+        );
+    }
+
+    #[test]
+    fn zsh_query_row_owns_tty_state() {
+        // -echo must flip BEFORE the query leaves: response bytes that
+        // arrive ahead of the read are kernel-echoed at the cursor
+        // (`^[[12;34R`) otherwise. precmd's query historically ran
+        // without this guard — keeping the stty dance inside the helper
+        // covers every caller.
+        let out = init_zsh();
+        let body = body_of(&out, "_chevron_query_row() {");
+        let echo_off = body.find("stty -echo -icanon").expect("echo guard");
+        let query = body.find(r"printf '\e[6n'").expect("DSR query");
+        assert!(echo_off < query, "-echo must be set before the query");
+        // `stty -`/`$(stty` rather than bare `stty`: the preexec comment
+        // block legitimately mentions Ghostty.
+        let pre = body_of(&out, "_chevron_preexec() {");
+        assert!(
+            !pre.contains("stty -") && !pre.contains("$(stty"),
+            "preexec must not duplicate the tty dance outside the helper"
+        );
+    }
+
+    #[test]
+    fn zsh_rewrite_skips_after_resize() {
+        // A resize between preexec and precmd invalidates the saved row
+        // and the wrap-span math (reflowing terminals rewrap the
+        // transient; a new COLUMNS makes the erase loop eat rows the
+        // transient never occupied).
+        let out = init_zsh();
+        assert!(
+            out.contains(r#"_chevron_transient_save_geom="$COLUMNS:$LINES""#),
+            "preexec must stash the geometry the transient was painted under"
+        );
+        assert!(
+            out.contains(r#""$_chevron_transient_save_geom" == "$COLUMNS:$LINES""#),
+            "precmd must compare geometry before rewriting"
+        );
+        assert!(
+            out.contains("unset _chevron_transient_save_row _chevron_transient_save_geom"),
+            "both saved values must be cleared every cycle"
+        );
+    }
+
+    #[test]
+    fn zsh_query_row_parses_last_csi_and_validates_row() {
+        // Focus reports (`\e[I`) and other unsolicited input can land
+        // ahead of the DSR response; parsing the FIRST CSI fed garbage
+        // into arithmetic. Parse the last CSI, require a numeric row,
+        // and never print -z anything containing ESC back into the
+        // edit buffer.
+        let out = init_zsh();
+        let body = body_of(&out, "_chevron_query_row() {");
+        assert!(
+            body.contains(r#"payload="${resp##*$'\e['}""#),
+            "payload must come from the last CSI in the buffer"
+        );
+        assert!(
+            body.contains(r#"[[ "$REPLY" == <-> ]] || REPLY="""#),
+            "row must be validated as numeric"
+        );
+        assert!(
+            body.contains(r#""$pre_esc" != *[^[:print:]$'\t\r\n']*"#),
+            "control bytes (ESC reports, ^C) must never be re-injected into the edit buffer"
+        );
+    }
+
+    #[test]
+    fn zsh_query_row_tracks_inflight_responses() {
+        // A read that times out leaves the response in flight; it can
+        // land while ZLE owns the terminal, where split arrival across
+        // KEYTIMEOUT self-inserts its tail (`1R`) into the command
+        // line (caught by CI's slow runners, invisible locally). The
+        // timeout branch must flag it for precmd's sweep; a successful
+        // read must clear the flag and absorb same-instant duplicates.
+        let out = init_zsh();
+        let body = body_of(&out, "_chevron_query_row() {");
+        assert!(
+            body.contains("_chevron_dsr_inflight=1"),
+            "timeout branch must flag the in-flight response"
+        );
+        assert!(
+            body.contains(r#"_chevron_dsr_inflight="""#),
+            "successful read must clear the flag"
+        );
+        assert!(
+            body.contains("_chevron_drain_reports $fd"),
+            "successful read must absorb trailing duplicates"
+        );
+    }
+
+    #[test]
+    fn zsh_precmd_sweeps_inflight_response_before_zle() {
+        let out = init_zsh();
+        let body = body_of(&out, "_chevron_precmd() {");
+        assert!(
+            body.contains(r#"[[ -n "$_chevron_dsr_inflight""#),
+            "precmd must check for an in-flight response"
+        );
+        assert!(
+            body.contains("_chevron_drain_reports $_chevron_sweep_fd 30"),
+            "sweep must wait up to 300 ms for the straggler"
+        );
+    }
+
+    #[test]
+    fn zsh_drain_consumes_only_escape_led_data() {
+        // The drain must never eat user typeahead: only ESC-led report
+        // data is consumed; the first plain byte is pushed back onto
+        // the buffer stack (order-preserving) and draining stops.
+        let out = init_zsh();
+        let body = body_of(&out, "_chevron_drain_reports() {");
+        assert!(body.contains(r"== $'\e'"), "must discriminate on ESC");
+        assert!(
+            body.contains(r#"print -z -- "$_chevron_first""#),
+            "plain bytes must be pushed back, not eaten"
+        );
+    }
+
+    #[test]
+    fn zsh_rewrite_skips_multiline_input() {
+        // The painted transient for PS2-continued input spans the
+        // buffer's rows plus PS2 prefixes whose widths we can't
+        // reconstruct; measuring only line one made the rewrite erase
+        // the continuation row and paint a second copy of line one
+        // there — a duplicated chevron.
+        let out = init_zsh();
+        assert!(
+            out.contains(r#""$_chevron_cmd_title" != *$'\n'*"#),
+            "precmd must skip the rewrite for multi-line input"
+        );
+    }
+
     #[test]
     fn zsh_contains_hooks() {
         let out = init_zsh();
@@ -1064,24 +1364,46 @@ mod tests {
         // in the rewrite block — some terminals (notably under tmux)
         // silently drop \e8.
         assert!(
-            out.contains("_chevron_R_transient"),
-            "should compute the transient row from saved row - 1"
+            out.contains("_chevron_R_top"),
+            "should compute the top row of the wrapped transient span"
         );
         assert!(
-            out.contains(r"\e[%d;1H\e[2K"),
-            "should absolute-move to transient row and erase"
+            out.contains(r"$'\e[2K\e[B'"),
+            "should erase row-by-row down the span"
         );
         assert!(
             out.contains(r"\e[3%dm❯\e[0m"),
             "should emit colour code + chevron + reset"
         );
-        // The format string MUST contain two `\e[%d;1H` — one to land
-        // on the transient line, one to land back on the next-prompt
-        // row after the rewrite.
+        // The format string MUST contain at least two `\e[%d;1H` — one
+        // to land on the transient span, one to land back on the
+        // next-prompt row after the rewrite.
         let format_str_count = out.matches(r"\e[%d;1H").count();
         assert!(
             format_str_count >= 2,
             "should absolute-position twice (transient then next-prompt), got {format_str_count}"
+        );
+    }
+
+    #[test]
+    fn zsh_rewrite_erases_full_wrapped_span() {
+        // A command wider than the terminal wraps the collapsed
+        // transient across several rows ending at R_saved-1. Erasing
+        // only that last row left the earlier rows behind — duplicated
+        // chevrons — while the rewrite re-wrapped into rows the next
+        // prompt half-overwrote.
+        let out = init_zsh();
+        assert!(
+            out.contains(r"${(m)#_chevron_rewrite_cmd}"),
+            "span width must be measured in display cells, not bytes"
+        );
+        assert!(
+            out.contains("repeat $_chevron_span"),
+            "must erase one row per wrapped row"
+        );
+        assert!(
+            out.contains("_chevron_R_saved - _chevron_span"),
+            "rewrite must anchor at the top of the span"
         );
     }
 
@@ -1116,6 +1438,42 @@ mod tests {
         assert!(
             !printf_fmt.contains(r"\e[u"),
             "rewrite printf must not use SCORC: {printf_fmt}"
+        );
+    }
+
+    #[test]
+    fn zsh_loads_datetime_for_duration_tag() {
+        // EPOCHREALTIME expands empty unless zsh/datetime is loaded;
+        // without this line the duration tag was inert in any bare
+        // .zshrc (caught end-to-end by the PTY harness). The -F p:
+        // form loads only the parameter — no strftime builtin.
+        let out = init_zsh();
+        assert!(
+            out.contains("zmodload -F zsh/datetime p:EPOCHREALTIME"),
+            "init must load the EPOCHREALTIME parameter"
+        );
+    }
+
+    #[test]
+    fn zsh_duration_measures_command_only() {
+        // The DSR exchange, stty forks, and drain in preexec — and the
+        // sweep/rewrite in precmd — cost tens of milliseconds. With the
+        // start timestamp taken first and the duration computed last,
+        // that overhead was billed to the user's command: instant
+        // builtins measured ~0.2s under a lowered threshold. Start is
+        // stamped at the END of preexec, end at the TOP of precmd.
+        let out = init_zsh();
+        let pre = body_of(&out, "_chevron_preexec() {");
+        assert!(
+            pre.find("_chevron_query_row").unwrap()
+                < pre.find("_chevron_cmd_start=$EPOCHREALTIME").unwrap(),
+            "start timestamp must be stamped after the DSR machinery"
+        );
+        let pc = body_of(&out, "_chevron_precmd() {");
+        assert!(
+            pc.find("_chevron_cmd_end=$EPOCHREALTIME").unwrap()
+                < pc.find("_chevron_query_row").unwrap(),
+            "end timestamp must be captured before the rewrite machinery"
         );
     }
 
@@ -1207,6 +1565,29 @@ mod tests {
         assert!(
             out.contains("exec {_chevron_async_fd}< <("),
             "should use `exec {{fd}}< <(cmd)` process substitution"
+        );
+    }
+
+    #[test]
+    fn zsh_async_callback_discards_stale_generations() {
+        // A refresh spawned in cycle N can finish after cycle N+1 has
+        // painted its prompt (typed-ahead `cd`, fast follow-up command):
+        // applying it repainted the PREVIOUS directory/status over the
+        // live prompt. Each cycle bumps a generation; callbacks from
+        // older generations discard their result.
+        let out = init_zsh();
+        assert!(
+            out.contains("(( _chevron_async_gen++ ))"),
+            "precmd must bump the generation every cycle"
+        );
+        assert!(
+            out.contains(r#"_chevron_async_spawn_gen="$_chevron_async_gen""#),
+            "spawn must stamp the generation it belongs to"
+        );
+        let cb = body_of(&out, "_chevron_async_callback() {");
+        assert!(
+            cb.contains(r#"[[ "$_chevron_async_spawn_gen" == "$_chevron_async_gen" ]] || return"#),
+            "callback must drop results from older generations"
         );
     }
 
