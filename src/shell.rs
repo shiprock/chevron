@@ -70,7 +70,19 @@ _chevron_query_row() {
     stty -echo -icanon min 0 time 0 2>/dev/null
     printf '\e[6n' > /dev/tty 2>/dev/null
     local resp
-    IFS= read -u $fd -d 'R' -s -t 0.3 resp 2>/dev/null
+    if IFS= read -u $fd -d 'R' -s -t 0.3 resp 2>/dev/null; then
+        _chevron_dsr_inflight=""
+        # Double-reporting emulator stacks answer twice; absorb the
+        # trailing duplicate now, while the tty is still raw.
+        _chevron_drain_reports $fd
+    else
+        # The response missed the budget and will land later — possibly
+        # while ZLE owns the terminal, where split arrival across
+        # KEYTIMEOUT lets its tail self-insert into the command line as
+        # literal text (`1R`). Flag it; precmd sweeps it out before the
+        # editor runs.
+        _chevron_dsr_inflight=1
+    fi
     [[ -n "$_chevron_stty" ]] && stty "$_chevron_stty" 2>/dev/null
     exec {fd}<&-
     if [[ "$resp" == *$'\e['* ]]; then
@@ -80,6 +92,27 @@ _chevron_query_row() {
         [[ "$REPLY" == <-> ]] || REPLY=""
         [[ -n "$pre_esc" && "$pre_esc" != *[^[:print:]$'\t\r\n']* ]] && print -z -- "$pre_esc" 2>/dev/null
     fi
+}
+# Absorb unsolicited ESC-led reports queued on the tty: duplicate DSR
+# responses from double-reporting emulator stacks (called with the
+# default 20 ms first window right after a successful read) and late
+# responses that missed an earlier read's budget (called from precmd's
+# sweep with a longer window). Only ESC-led data is consumed; the first
+# plain byte is user typeahead — pushed onto the buffer stack, which
+# pops into the next edit buffer BEFORE queued input is read, so typing
+# order is preserved — and draining stops there.
+_chevron_drain_reports() {
+    local fd=$1 _chevron_wait=${2:-2} _chevron_first _chevron_junk
+    while zselect -t $_chevron_wait -r $fd 2>/dev/null; do
+        _chevron_wait=2
+        IFS= read -u $fd -k 1 -s -t 0 _chevron_first 2>/dev/null || break
+        if [[ "$_chevron_first" == $'\e' ]]; then
+            IFS= read -u $fd -d 'R' -s -t 0.1 _chevron_junk 2>/dev/null
+        else
+            print -z -- "$_chevron_first" 2>/dev/null
+            break
+        fi
+    done
 }
 _chevron_precmd() {
     local exit_status=$?
@@ -113,6 +146,24 @@ _chevron_precmd() {
     #     transient stays neutral (see the guard below).
     #   - Terminals that don't support DSR: query returns empty,
     #     rewrite is skipped, the transient stays neutral grey.
+    # Sweep a still-in-flight DSR response (preexec's query timed out on
+    # a slow link) before ZLE takes the terminal: arriving there, split
+    # across KEYTIMEOUT, its tail self-inserts into the command line as
+    # literal text (`1R`). By precmd time the straggler has normally
+    # arrived; wait up to 300 ms more for it. Terminals that never
+    # respond pay this wait once per command — CHEVRON_TRANSIENT=0 is
+    # the escape hatch for those.
+    if [[ -n "$_chevron_dsr_inflight" && "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
+        local _chevron_sweep_fd
+        if exec {_chevron_sweep_fd}< /dev/tty 2>/dev/null; then
+            local _chevron_sweep_stty=$(stty -g 2>/dev/null)
+            stty -echo -icanon min 0 time 0 2>/dev/null
+            _chevron_drain_reports $_chevron_sweep_fd 30
+            [[ -n "$_chevron_sweep_stty" ]] && stty "$_chevron_sweep_stty" 2>/dev/null
+            exec {_chevron_sweep_fd}<&-
+        fi
+        _chevron_dsr_inflight=""
+    fi
     # A resize between preexec and precmd invalidates the saved row AND
     # the wrap-span math: reflowing terminals (tmux, kitty, ghostty)
     # rewrap the transient to different rows entirely, and recomputing
@@ -599,6 +650,58 @@ mod tests {
         assert!(
             body.contains(r#""$pre_esc" != *[^[:print:]$'\t\r\n']*"#),
             "control bytes (ESC reports, ^C) must never be re-injected into the edit buffer"
+        );
+    }
+
+    #[test]
+    fn zsh_query_row_tracks_inflight_responses() {
+        // A read that times out leaves the response in flight; it can
+        // land while ZLE owns the terminal, where split arrival across
+        // KEYTIMEOUT self-inserts its tail (`1R`) into the command
+        // line (caught by CI's slow runners, invisible locally). The
+        // timeout branch must flag it for precmd's sweep; a successful
+        // read must clear the flag and absorb same-instant duplicates.
+        let out = init_zsh();
+        let body = body_of(out, "_chevron_query_row() {");
+        assert!(
+            body.contains("_chevron_dsr_inflight=1"),
+            "timeout branch must flag the in-flight response"
+        );
+        assert!(
+            body.contains(r#"_chevron_dsr_inflight="""#),
+            "successful read must clear the flag"
+        );
+        assert!(
+            body.contains("_chevron_drain_reports $fd"),
+            "successful read must absorb trailing duplicates"
+        );
+    }
+
+    #[test]
+    fn zsh_precmd_sweeps_inflight_response_before_zle() {
+        let out = init_zsh();
+        let body = body_of(out, "_chevron_precmd() {");
+        assert!(
+            body.contains(r#"[[ -n "$_chevron_dsr_inflight""#),
+            "precmd must check for an in-flight response"
+        );
+        assert!(
+            body.contains("_chevron_drain_reports $_chevron_sweep_fd 30"),
+            "sweep must wait up to 300 ms for the straggler"
+        );
+    }
+
+    #[test]
+    fn zsh_drain_consumes_only_escape_led_data() {
+        // The drain must never eat user typeahead: only ESC-led report
+        // data is consumed; the first plain byte is pushed back onto
+        // the buffer stack (order-preserving) and draining stops.
+        let out = init_zsh();
+        let body = body_of(out, "_chevron_drain_reports() {");
+        assert!(body.contains(r"== $'\e'"), "must discriminate on ESC");
+        assert!(
+            body.contains(r#"print -z -- "$_chevron_first""#),
+            "plain bytes must be pushed back, not eaten"
         );
     }
 
