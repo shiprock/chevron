@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Branches
+
+- `unstable` is the integration branch: feature work lands here FIRST.
+  The author's dotfiles flake tracks `github:shiprock/chevron/unstable`,
+  so pushing it (plus `nix flake update chevron` + `darwin-rebuild` in
+  ~/src/dotfiles) updates the day-to-day build.
+- `master` is the stable line; tags are cut from it.
+- Check which branch is checked out BEFORE starting work. If work does
+  land on master, merge it into unstable promptly: the branches diverged
+  once (2026-06) and reconciling cost a conflict-heavy shell.rs merge.
+
 ## Build & Run
 
 ```bash
