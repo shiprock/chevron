@@ -213,6 +213,11 @@ _chevron_precmd() {
     fi
     local job_count=${(%):-%j}
     local chevron_output=""
+    # Generation stamp for the async fast path: bumped every cycle so a
+    # background refresh that finishes after a NEWER prompt is already
+    # up discards itself instead of repainting stale content (previous
+    # directory, previous exit status) over the live prompt.
+    (( _chevron_async_gen++ ))
     # Async fast path (CHEVRON_ASYNC=1): try the cached prompt from the
     # previous render; on hit, set PROMPT immediately and spawn a
     # background refresh whose result will trigger a redraw via the
@@ -262,6 +267,9 @@ _chevron_precmd() {
 # PROMPT, and triggers a redraw.
 _chevron_start_async() {
     local exit_status=$1 duration_ms=$2 job_count=$3
+    # Stamp the refresh with the cycle that spawned it (see the
+    # generation bump in precmd).
+    _chevron_async_spawn_gen="$_chevron_async_gen"
     exec {_chevron_async_fd}< <(CHEVRON_CACHE_FILE="$_chevron_cache_file" chevron prompt 20 "$exit_status" "$duration_ms" "$job_count" 2>/dev/null)
     zle -F "$_chevron_async_fd" _chevron_async_callback
 }
@@ -271,6 +279,10 @@ _chevron_async_callback() {
     fresh=$(cat <&$fd 2>/dev/null)
     zle -F "$fd"
     exec {fd}<&-
+    # Stale guard: if another precmd ran since this refresh was spawned,
+    # the result describes a previous cycle — drop it; the newer cycle
+    # owns the prompt now. (The fd is already closed above either way.)
+    [[ "$_chevron_async_spawn_gen" == "$_chevron_async_gen" ]] || return
     if [[ -n "$fresh" ]]; then
         _chevron_make_prompt "${fresh%%$'\n'*}"
         PROMPT="$REPLY"
@@ -861,6 +873,29 @@ mod tests {
         assert!(
             out.contains("exec {_chevron_async_fd}< <("),
             "should use `exec {{fd}}< <(cmd)` process substitution"
+        );
+    }
+
+    #[test]
+    fn zsh_async_callback_discards_stale_generations() {
+        // A refresh spawned in cycle N can finish after cycle N+1 has
+        // painted its prompt (typed-ahead `cd`, fast follow-up command):
+        // applying it repainted the PREVIOUS directory/status over the
+        // live prompt. Each cycle bumps a generation; callbacks from
+        // older generations discard their result.
+        let out = init_zsh();
+        assert!(
+            out.contains("(( _chevron_async_gen++ ))"),
+            "precmd must bump the generation every cycle"
+        );
+        assert!(
+            out.contains(r#"_chevron_async_spawn_gen="$_chevron_async_gen""#),
+            "spawn must stamp the generation it belongs to"
+        );
+        let cb = body_of(out, "_chevron_async_callback() {");
+        assert!(
+            cb.contains(r#"[[ "$_chevron_async_spawn_gen" == "$_chevron_async_gen" ]] || return"#),
+            "callback must drop results from older generations"
         );
     }
 

@@ -62,6 +62,18 @@ enum Dsr {
     DoubleResponse,
 }
 
+/// Prompt-render mode for the spawned shell.
+#[derive(Clone, Copy)]
+enum Render {
+    /// `CHEVRON_ASYNC` unset: every prompt renders synchronously.
+    Sync,
+    /// `CHEVRON_ASYNC=1`: cached prompt plus background refresh.
+    Async,
+    /// `CHEVRON_ASYNC=1` plus a PATH wrapper delaying every render —
+    /// the lever that makes refresh-vs-next-cycle races deterministic.
+    AsyncDelayed(Duration),
+}
+
 struct Term {
     parser: Arc<Mutex<vt100::Parser>>,
     raw: Arc<Mutex<Vec<u8>>>,
@@ -216,10 +228,25 @@ impl Term {
     /// `.zshrc` is exactly the documented install line. The test-built
     /// chevron binary is first in `path`.
     fn spawn_zsh(dsr: Dsr) -> Self {
-        Self::spawn_zsh_sized(dsr, ROWS, COLS)
+        Self::spawn_inner(dsr, ROWS, COLS, Render::Sync)
     }
 
     fn spawn_zsh_sized(dsr: Dsr, rows: u16, cols: u16) -> Self {
+        Self::spawn_inner(dsr, rows, cols, Render::Sync)
+    }
+
+    /// Spawn with `CHEVRON_ASYNC=1`. `render_delay` installs a PATH
+    /// wrapper that slows every `chevron prompt` render — the lever
+    /// that makes background-refresh-vs-next-cycle races deterministic.
+    fn spawn_zsh_async(dsr: Dsr, render_delay: Option<Duration>) -> Self {
+        let render = match render_delay {
+            Some(d) => Render::AsyncDelayed(d),
+            None => Render::Async,
+        };
+        Self::spawn_inner(dsr, ROWS, COLS, render)
+    }
+
+    fn spawn_inner(dsr: Dsr, rows: u16, cols: u16, mode: Render) -> Self {
         let home = tempfile::TempDir::new().unwrap();
         // macOS tempdirs live behind a /var -> /private/var symlink;
         // canonicalize so $HOME matches what getcwd() reports and the
@@ -233,14 +260,34 @@ impl Term {
         // Skip /etc/zshrc & friends — only our fixture configures the
         // shell. (/etc/zshenv still runs; NO_RCS can't disable it.)
         std::fs::write(home_path.join(".zshenv"), "setopt no_global_rcs\n").unwrap();
+        // Async render-delay wrapper: shadows the real binary on PATH
+        // and sleeps before `prompt` renders, so a background refresh
+        // reliably outlives the next prompt cycle.
+        let mut path_dirs = bin_dir.display().to_string();
+        if let Render::AsyncDelayed(delay) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            let wrapper_dir = home_path.join("wrapper-bin");
+            std::fs::create_dir_all(&wrapper_dir).unwrap();
+            let wrapper = wrapper_dir.join("chevron");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\n[ \"$1\" = prompt ] && sleep {}\nexec {}/chevron \"$@\"\n",
+                    delay.as_secs_f64(),
+                    bin_dir.display()
+                ),
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&wrapper).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&wrapper, perms).unwrap();
+            path_dirs = format!("{} {}", wrapper_dir.display(), path_dirs);
+        }
         // Prepend path *in .zshrc* so it wins over anything /etc/zshenv
         // (nix-darwin, etc.) prepends after CommandBuilder's env.
         std::fs::write(
             home_path.join(".zshrc"),
-            format!(
-                "path=({} $path)\neval \"$(chevron init zsh)\"\n",
-                bin_dir.display()
-            ),
+            format!("path=({path_dirs} $path)\neval \"$(chevron init zsh)\"\n"),
         )
         .unwrap();
 
@@ -262,6 +309,10 @@ impl Term {
         cmd.env("LANG", "en_US.UTF-8");
         cmd.env("LC_ALL", "en_US.UTF-8");
         cmd.env("CHEVRON_NO_DAEMON", "1");
+        // The async prompt cache lives under XDG_RUNTIME_DIR; point it
+        // at the test home so parallel tests (and the developer's real
+        // shells) never share cache state.
+        cmd.env("XDG_RUNTIME_DIR", &home_path);
         // The test shell must not talk to an enclosing tmux server
         // (rename-window would hit the developer's session) nor inherit
         // chevron knobs from the developer's environment.
@@ -275,6 +326,9 @@ impl Term {
             "CHEVRON_CACHE_FILE",
         ] {
             cmd.env_remove(var);
+        }
+        if !matches!(mode, Render::Sync) {
+            cmd.env("CHEVRON_ASYNC", "1");
         }
 
         let child = pair.slave.spawn_command(cmd).unwrap();
@@ -1329,6 +1383,105 @@ fn multiline_ps2_input_no_duplicate_chevrons() {
         t.chevron_color_on_nth(0),
         vt100::Color::Default,
         "multi-line transient stays neutral by design\n{}",
+        t.dump()
+    );
+}
+
+// ── async fast path (CHEVRON_ASYNC=1) ────────────────────────────────────────
+
+/// Async basics: the first prompt is a sync cache miss; later cycles
+/// serve the cached prompt instantly and repaint from the background
+/// refresh. Collapse and rewrite must behave exactly as in sync mode.
+#[test]
+fn async_mode_cycles_collapse_and_recolor() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh_async(Dsr::Immediate, None);
+    t.run("true");
+    t.wait_settled(Duration::from_millis(300));
+    t.run("false");
+    t.wait_settled(Duration::from_millis(300));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true", "\u{276f} false"],
+        "{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_row("\u{276f} true"),
+        GREEN,
+        "{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_row("\u{276f} false"),
+        RED,
+        "{}",
+        t.dump()
+    );
+}
+
+/// THE async race: cycle N serves the cache and spawns a refresh; the
+/// user has already typed `cd /`, so cycle N+1 paints a new-directory
+/// prompt — and THEN cycle N's refresh lands, `zle reset-prompt`ing the
+/// OLD directory's render over it. The 150 ms render delay makes the
+/// ordering deterministic. The callback must discard results from
+/// superseded cycles.
+#[test]
+fn async_stale_refresh_must_not_overwrite_newer_prompt() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh_async(Dsr::Immediate, Some(Duration::from_millis(150)));
+    t.send("true\rcd /\r");
+    t.wait_for("both cycles to collapse and reprompt", |s| {
+        chevron_rows(s).len() >= 2 && prompt_ready(s)
+    });
+    // Generous settle: the stale refresh lands ~150 ms after its spawn,
+    // plus the repaint it may trigger.
+    t.wait_settled(Duration::from_millis(700));
+
+    let prompt = t.with_screen(last_nonempty);
+    assert!(
+        prompt.contains(" / "),
+        "live prompt must show the new directory: {prompt:?}\n{}",
+        t.dump()
+    );
+    assert!(
+        !prompt.contains(" ~ "),
+        "a stale async refresh repainted the OLD directory's prompt: {prompt:?}\n{}",
+        t.dump()
+    );
+}
+
+/// Rapid typed-ahead commands under async: cached instant prompts,
+/// background refreshes, and transient collapses interleave; counts and
+/// the final prompt must stay exact.
+#[test]
+fn async_rapid_typeahead_stays_consistent() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh_async(Dsr::Immediate, None);
+    t.send("true\rtrue\r");
+    t.wait_for("both commands to collapse and reprompt", |s| {
+        chevron_rows(s).len() >= 2 && prompt_ready(s)
+    });
+    t.wait_settled(Duration::from_millis(400));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true", "\u{276f} true"],
+        "{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 2, "{}", t.dump());
+    let prompt = t.with_screen(last_nonempty);
+    assert!(
+        prompt.contains(LIVE_PROMPT_MARK) && !prompt.contains(CHEVRON),
+        "refresh repaints must not disturb the live prompt: {prompt:?}\n{}",
         t.dump()
     );
 }
