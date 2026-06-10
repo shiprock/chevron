@@ -49,6 +49,13 @@ enum Dsr {
     Delayed(Duration),
     /// Never respond, like a terminal that doesn't implement DSR.
     Silent,
+    /// Deliver the response one byte at a time with a gap between
+    /// bytes, like a congested SSH link fragmenting packets.
+    Fragmented(Duration),
+    /// Prefix the response with a focus-in report (`ESC [ I`), like a
+    /// terminal with focus events enabled when the user clicks into it
+    /// mid-exchange.
+    FocusNoise,
 }
 
 struct Term {
@@ -56,16 +63,19 @@ struct Term {
     raw: Arc<Mutex<Vec<u8>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    // Keeps the master side of the PTY open for the reader thread.
-    _master: Box<dyn portable_pty::MasterPty>,
+    // Also keeps the master side of the PTY open for the reader thread.
+    master: Box<dyn portable_pty::MasterPty>,
     _home: tempfile::TempDir,
 }
 
 // ── screen helpers (free functions so wait_for predicates can use them) ─────
 
 fn lines(screen: &vt100::Screen) -> Vec<String> {
+    // Read the width off the screen, not the spawn-time constant — tests
+    // may have resized the terminal.
+    let (_, cols) = screen.size();
     screen
-        .rows(0, COLS)
+        .rows(0, cols)
         .map(|r| r.trim_end().to_string())
         .collect()
 }
@@ -157,13 +167,28 @@ fn pump_output(
                 drop(p);
                 pend.drain(..end);
                 let resp = format!("\x1b[{};{}R", row + 1, col + 1).into_bytes();
-                let due = match dsr {
-                    Dsr::Silent => continue,
-                    Dsr::Immediate => Instant::now(),
-                    Dsr::Delayed(d) => Instant::now() + d,
-                };
-                if tx.send((due, resp)).is_err() {
-                    break;
+                match dsr {
+                    Dsr::Silent => {}
+                    Dsr::Immediate => {
+                        let _ = tx.send((Instant::now(), resp));
+                    }
+                    Dsr::Delayed(d) => {
+                        let _ = tx.send((Instant::now() + d, resp));
+                    }
+                    Dsr::Fragmented(step) => {
+                        let mut due = Instant::now();
+                        for b in resp {
+                            due += step;
+                            if tx.send((due, vec![b])).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Dsr::FocusNoise => {
+                        let mut noisy = b"\x1b[I".to_vec();
+                        noisy.extend_from_slice(&resp);
+                        let _ = tx.send((Instant::now(), noisy));
+                    }
                 }
             } else {
                 let keep = query_prefix_holdback(&pend);
@@ -274,7 +299,7 @@ impl Term {
             raw,
             writer,
             child,
-            _master: pair.master,
+            master: pair.master,
             _home: home,
         };
         term.wait_for("initial prompt", prompt_ready);
@@ -290,6 +315,25 @@ impl Term {
     /// Type a command and press Enter (terminals send CR for Enter).
     fn send_line(&self, s: &str) {
         self.send(&format!("{s}\r"));
+    }
+
+    /// Resize the terminal the way a real emulator does: shrink/grow the
+    /// rendered grid, then update the kernel winsize (which raises
+    /// SIGWINCH in the foreground process group).
+    fn resize(&self, rows: u16, cols: u16) {
+        self.parser
+            .lock()
+            .unwrap()
+            .screen_mut()
+            .set_size(rows, cols);
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
     }
 
     /// Send a command line, then wait until it has collapsed to a `❯`
@@ -797,6 +841,172 @@ fn wrapped_input_line_no_duplicate_chevrons() {
         "live prompt must be intact below the wrapped line\n{}",
         t.dump()
     );
+}
+
+/// Resize while sitting at the prompt: ZLE handles SIGWINCH itself and
+/// repaints; the next command cycle runs entirely under the new
+/// geometry, so the rewrite must keep working.
+#[test]
+fn resize_at_prompt_keeps_rewrite_working() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.run("true");
+    t.resize(24, 80);
+    t.wait_settled(Duration::from_millis(300));
+    t.run("false");
+    t.wait_settled(Duration::from_millis(150));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true", "\u{276f} false"],
+        "{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(1),
+        RED,
+        "post-resize cycle must still color-correct\n{}",
+        t.dump()
+    );
+}
+
+/// Resize while a command is RUNNING: every coordinate saved in preexec
+/// is now meaningless (reflowing terminals rewrap the transient to a
+/// different row entirely), and recomputing the wrap span under the new
+/// width makes the erase loop eat rows it never painted — here, the
+/// previous command's collapsed line. The rewrite must detect the
+/// geometry change and skip.
+#[test]
+fn resize_during_command_skips_rewrite() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    // Sentinel: a collapsed row sitting directly above the transient.
+    t.run("true");
+    // Wide enough to wrap at 120 cols (2 rows) — and at the post-resize
+    // 60 cols the naive span recompute says 3 rows, one of which is the
+    // sentinel.
+    let wide = format!("sleep 0.4 && : {}", "x".repeat(133));
+    t.send_line(&wide);
+    // Collapse + preexec query finish in milliseconds; the resize lands
+    // squarely inside the sleep.
+    std::thread::sleep(Duration::from_millis(200));
+    t.resize(24, 60);
+    t.wait_for("reprompt after mid-command resize", prompt_ready);
+    t.wait_settled(Duration::from_millis(200));
+
+    let all = t.with_screen(lines);
+    assert!(
+        all.iter().any(|l| l == "\u{276f} true"),
+        "rewrite after a resize must not erase rows it never painted\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        2,
+        "one chevron per command, no duplicates\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(1),
+        vt100::Color::Default,
+        "geometry changed mid-command: rewrite must skip, chevron stays neutral\n{}",
+        t.dump()
+    );
+}
+
+/// A congested link delivering the DSR response one byte at a time
+/// (~25 ms apart, well inside the 300 ms budget): the exchange must
+/// still complete and the rewrite must happen.
+#[test]
+fn fragmented_dsr_response_still_rewrites() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Fragmented(Duration::from_millis(25)));
+    t.run("true");
+    t.wait_settled(Duration::from_millis(400));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true"],
+        "{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_row("\u{276f} true"),
+        GREEN,
+        "fragmented response must still complete the rewrite\n{}",
+        t.dump()
+    );
+}
+
+/// A focus-in report (`ESC [ I`) lands ahead of the DSR response — a
+/// terminal with focus events enabled while the user clicks into it.
+/// The parser must take the LAST CSI in the buffer and validate the row
+/// is numeric; parsing the first CSI fed `I\e[5` into zsh arithmetic
+/// and printed a math error at the prompt.
+#[test]
+fn focus_event_during_dsr_exchange_is_harmless() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::FocusNoise);
+    t.run("true");
+    t.wait_settled(Duration::from_millis(150));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true"],
+        "{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_row("\u{276f} true"),
+        GREEN,
+        "the real response follows the noise and must still be used\n{}",
+        t.dump()
+    );
+    let all = t.with_screen(lines);
+    assert!(
+        !all.iter()
+            .any(|l| l.contains("bad math") || l.contains("expression")),
+        "no zsh arithmetic errors may leak to the screen\n{}",
+        t.dump()
+    );
+}
+
+/// Wide (CJK) characters count two cells each: the wrap-span math must
+/// measure display cells, not chars or bytes, or the erase loop misses
+/// rows. `❯ : ` (4) + 70 × あ (140) = 144 cells → 2 rows at 120 cols.
+#[test]
+fn wide_char_wrapped_input_rewrites_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    let cmd = format!(": {}", "\u{3042}".repeat(70));
+    t.run(&cmd);
+    t.wait_settled(Duration::from_millis(150));
+
+    let rows = t.with_screen(chevron_rows);
+    assert_eq!(
+        rows,
+        vec![format!("\u{276f} : {}", "\u{3042}".repeat(58))],
+        "wide-char command must collapse to one chevron row\n{}",
+        t.dump()
+    );
+    let all = t.with_screen(lines);
+    assert_eq!(
+        all[1],
+        "\u{3042}".repeat(12),
+        "wide-char wrap remainder must survive the rewrite\n{}",
+        t.dump()
+    );
+    assert_eq!(t.chevron_color_on_nth(0), GREEN, "{}", t.dump());
 }
 
 /// tmux/SSH-grade latency that still fits the 300 ms read budget: the

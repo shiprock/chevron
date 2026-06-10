@@ -11,11 +11,14 @@ pub fn init_zsh() -> &'static str {
     # silently ignore unknown OSC sequences.
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;C\a'
     # Save the cursor's absolute row (via DSR) for the precmd transient-
-    # colour rewrite. The query helper owns all tty state and typeahead
-    # safety — see _chevron_query_row.
+    # colour rewrite, plus the geometry it was measured under — a resize
+    # while the command runs invalidates every saved coordinate. The
+    # query helper owns all tty state and typeahead safety — see
+    # _chevron_query_row.
     if [[ "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
         _chevron_query_row
         _chevron_transient_save_row="$REPLY"
+        _chevron_transient_save_geom="$COLUMNS:$LINES"
     fi
 }
 # Query the current cursor row via DSR (\e[6n). Stores the row in REPLY
@@ -44,10 +47,16 @@ pub fn init_zsh() -> &'static str {
 # min/time 0/0 makes read see bytes as they arrive. The full stty state
 # is saved and restored to avoid stomping anything else the user set.
 #
-# The DSR response shape is `\e[<row>;<col>R`. Anything in resp BEFORE
-# the ESC is input that slipped in between probe and read; strip it and
-# re-inject via `print -z` so those keystrokes land in the next edit
-# buffer instead of vanishing.
+# The DSR response shape is `\e[<row>;<col>R`. The response is parsed
+# from the LAST CSI in the buffer: terminals with focus reporting (or
+# other unsolicited reports) enabled can interleave `\e[I` etc. ahead
+# of the response, and parsing the first CSI would feed garbage like
+# `I\e[5` into arithmetic — a visible zsh math error. The row is then
+# validated as numeric. Anything before the last CSI is input that
+# slipped in between probe and read: plain keystrokes are re-injected
+# via `print -z` so they land in the next edit buffer instead of
+# vanishing; anything containing ESC (arrow keys, stray reports) is
+# dropped rather than pushed into the buffer as control bytes.
 _chevron_query_row() {
     REPLY=""
     local fd
@@ -64,10 +73,11 @@ _chevron_query_row() {
     [[ -n "$_chevron_stty" ]] && stty "$_chevron_stty" 2>/dev/null
     exec {fd}<&-
     if [[ "$resp" == *$'\e['* ]]; then
-        local pre_esc="${resp%%$'\e['*}"
-        local payload="${resp#*$'\e['}"
+        local pre_esc="${resp%$'\e['*}"
+        local payload="${resp##*$'\e['}"
         REPLY="${payload%%;*}"
-        [[ -n "$pre_esc" ]] && print -z -- "$pre_esc" 2>/dev/null
+        [[ "$REPLY" == <-> ]] || REPLY=""
+        [[ -n "$pre_esc" && "$pre_esc" != *$'\e'* ]] && print -z -- "$pre_esc" 2>/dev/null
     fi
 }
 _chevron_precmd() {
@@ -102,7 +112,13 @@ _chevron_precmd() {
     #     line is measured and rewritten; continuation rows remain.
     #   - Terminals that don't support DSR: query returns empty,
     #     rewrite is skipped, the transient stays neutral grey.
-    if [[ -n "$_chevron_transient_save_row" && "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
+    # A resize between preexec and precmd invalidates the saved row AND
+    # the wrap-span math: reflowing terminals (tmux, kitty, ghostty)
+    # rewrap the transient to different rows entirely, and recomputing
+    # the span under the new COLUMNS would erase rows the transient
+    # never occupied. Skipping is the only honest move.
+    if [[ -n "$_chevron_transient_save_row" && "${CHEVRON_TRANSIENT:-1}" != "0" \
+          && "$_chevron_transient_save_geom" == "$COLUMNS:$LINES" ]]; then
         _chevron_query_row
         if [[ -n "$REPLY" ]]; then
             local _chevron_R_current="$REPLY"
@@ -160,8 +176,8 @@ _chevron_precmd() {
                     "$_chevron_R_current" > /dev/tty 2>/dev/null
             fi
         fi
-        unset _chevron_transient_save_row
     fi
+    unset _chevron_transient_save_row _chevron_transient_save_geom
     local duration_ms=0
     if [[ -n "$_chevron_cmd_start" ]]; then
         duration_ms=$(( ($EPOCHREALTIME - _chevron_cmd_start) * 1000 ))
@@ -519,6 +535,50 @@ mod tests {
         assert!(
             !pre.contains("stty -") && !pre.contains("$(stty"),
             "preexec must not duplicate the tty dance outside the helper"
+        );
+    }
+
+    #[test]
+    fn zsh_rewrite_skips_after_resize() {
+        // A resize between preexec and precmd invalidates the saved row
+        // and the wrap-span math (reflowing terminals rewrap the
+        // transient; a new COLUMNS makes the erase loop eat rows the
+        // transient never occupied).
+        let out = init_zsh();
+        assert!(
+            out.contains(r#"_chevron_transient_save_geom="$COLUMNS:$LINES""#),
+            "preexec must stash the geometry the transient was painted under"
+        );
+        assert!(
+            out.contains(r#""$_chevron_transient_save_geom" == "$COLUMNS:$LINES""#),
+            "precmd must compare geometry before rewriting"
+        );
+        assert!(
+            out.contains("unset _chevron_transient_save_row _chevron_transient_save_geom"),
+            "both saved values must be cleared every cycle"
+        );
+    }
+
+    #[test]
+    fn zsh_query_row_parses_last_csi_and_validates_row() {
+        // Focus reports (`\e[I`) and other unsolicited input can land
+        // ahead of the DSR response; parsing the FIRST CSI fed garbage
+        // into arithmetic. Parse the last CSI, require a numeric row,
+        // and never print -z anything containing ESC back into the
+        // edit buffer.
+        let out = init_zsh();
+        let body = body_of(out, "_chevron_query_row() {");
+        assert!(
+            body.contains(r#"payload="${resp##*$'\e['}""#),
+            "payload must come from the last CSI in the buffer"
+        );
+        assert!(
+            body.contains(r#"[[ "$REPLY" == <-> ]] || REPLY="""#),
+            "row must be validated as numeric"
+        );
+        assert!(
+            body.contains(r#""$pre_esc" != *$'\e'*"#),
+            "control bytes must never be re-injected into the edit buffer"
         );
     }
 
