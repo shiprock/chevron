@@ -56,6 +56,10 @@ enum Dsr {
     /// terminal with focus events enabled when the user clicks into it
     /// mid-exchange.
     FocusNoise,
+    /// Answer every query twice, like buggy emulators and some
+    /// multiplexer/emulator stacks that double-report. The duplicate
+    /// lingers in the input queue to poison the next exchange.
+    DoubleResponse,
 }
 
 struct Term {
@@ -189,6 +193,10 @@ fn pump_output(
                         noisy.extend_from_slice(&resp);
                         let _ = tx.send((Instant::now(), noisy));
                     }
+                    Dsr::DoubleResponse => {
+                        let _ = tx.send((Instant::now(), resp.clone()));
+                        let _ = tx.send((Instant::now(), resp));
+                    }
                 }
             } else {
                 let keep = query_prefix_holdback(&pend);
@@ -208,6 +216,10 @@ impl Term {
     /// `.zshrc` is exactly the documented install line. The test-built
     /// chevron binary is first in `path`.
     fn spawn_zsh(dsr: Dsr) -> Self {
+        Self::spawn_zsh_sized(dsr, ROWS, COLS)
+    }
+
+    fn spawn_zsh_sized(dsr: Dsr, rows: u16, cols: u16) -> Self {
         let home = tempfile::TempDir::new().unwrap();
         // macOS tempdirs live behind a /var -> /private/var symlink;
         // canonicalize so $HOME matches what getcwd() reports and the
@@ -235,8 +247,8 @@ impl Term {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
-                rows: ROWS,
-                cols: COLS,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -269,7 +281,7 @@ impl Term {
         // Close our copy of the slave so master reads EOF once zsh exits.
         drop(pair.slave);
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 200)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 200)));
         let raw = Arc::new(Mutex::new(Vec::new()));
         let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
         let mut reader = pair.master.try_clone_reader().unwrap();
@@ -1007,6 +1019,318 @@ fn wide_char_wrapped_input_rewrites_cleanly() {
         t.dump()
     );
     assert_eq!(t.chevron_color_on_nth(0), GREEN, "{}", t.dump());
+}
+
+/// Ctrl-C on a half-typed line: the accept-line widget never runs, so
+/// nothing collapses and no DSR state is saved; the abandoned line must
+/// not leave chevrons or confuse the next real command.
+#[test]
+fn ctrl_c_aborts_typed_line_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.send("echo oops");
+    t.wait_for("typed text to echo", |s| {
+        lines(s).iter().any(|l| l.contains("echo oops"))
+    });
+    t.send("\x03");
+    t.wait_for("fresh prompt after interrupt", prompt_ready);
+    t.run("true");
+    t.wait_settled(Duration::from_millis(150));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true"],
+        "the aborted line must not collapse or duplicate\n{}",
+        t.dump()
+    );
+    assert!(
+        !t.with_screen(lines).iter().any(|l| l == "oops"),
+        "the aborted command must not run\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_row("\u{276f} true"),
+        GREEN,
+        "{}",
+        t.dump()
+    );
+}
+
+/// Ctrl-C arriving in the same instant as Enter — the interrupt byte
+/// lands inside the preexec DSR exchange. Whatever zsh does with the
+/// interrupt, the screen must stay clean: no `^C` re-injected into the
+/// next edit buffer, no chevron duplicates, and the shell must remain
+/// fully usable.
+#[test]
+fn ctrl_c_racing_the_dsr_exchange_is_harmless() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.send("true\r\x03");
+    t.wait_for("prompt after interrupted cycle", prompt_ready);
+    t.wait_settled(Duration::from_millis(300));
+
+    assert!(
+        t.with_screen(chevron_glyphs) <= 1,
+        "at most the collapsed `true` may carry a chevron\n{}",
+        t.dump()
+    );
+    // The shell must still work, with no leftover control bytes in the
+    // edit buffer.
+    t.run("echo after");
+    t.wait_settled(Duration::from_millis(150));
+    let all = t.with_screen(lines);
+    assert!(
+        all.iter().any(|l| l == "after"),
+        "shell must remain usable after the race\n{}",
+        t.dump()
+    );
+    assert!(
+        all.iter()
+            .all(|l| !l.contains("\u{2403}") && !l.contains("^C\u{276f}")),
+        "no control-byte garbage may persist\n{}",
+        t.dump()
+    );
+}
+
+/// A full-screen application (vim, less): enters the alternate screen,
+/// draws, and leaves. The cursor is restored on exit, so the rewrite
+/// must work exactly as for a no-output builtin — and nothing from the
+/// alternate screen may bleed into the main one.
+#[test]
+fn alt_screen_app_restores_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.send_line("printf '\\e[?1049h\\e[2J\\e[HFULLSCREEN'; sleep 0.6; printf '\\e[?1049l'");
+    t.wait_for("app to enter the alternate screen", |s| {
+        s.alternate_screen() && lines(s).iter().any(|l| l == "FULLSCREEN")
+    });
+    t.wait_for("app to leave the alternate screen", |s| {
+        !s.alternate_screen() && prompt_ready(s)
+    });
+    t.wait_settled(Duration::from_millis(200));
+
+    let rows = t.with_screen(chevron_rows);
+    assert_eq!(
+        rows.len(),
+        1,
+        "one collapsed row, no duplicates\n{}",
+        t.dump()
+    );
+    assert!(
+        rows[0].contains("1049h"),
+        "collapsed row should show the typed command\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(0),
+        GREEN,
+        "rewrite must work after an alt-screen round trip\n{}",
+        t.dump()
+    );
+    // The typed command itself contains the word; only rows BESIDES the
+    // collapsed command line count as bleed.
+    assert!(
+        !t.with_screen(lines)
+            .iter()
+            .filter(|l| !l.contains(CHEVRON))
+            .any(|l| l.contains("FULLSCREEN")),
+        "alternate-screen content must not bleed into the main screen\n{}",
+        t.dump()
+    );
+}
+
+/// A bracketed paste (terminal wraps pasted text in `ESC[200~ … 201~`)
+/// followed by Enter: ZLE strips the markers, the buffer collapses and
+/// rewrites like typed input.
+#[test]
+fn bracketed_paste_collapses_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.send("\x1b[200~echo pasted-text\x1b[201~");
+    t.wait_for("paste to land in the buffer", |s| {
+        lines(s).iter().any(|l| l.contains("echo pasted-text"))
+    });
+    t.send("\r");
+    t.wait_for("pasted command to collapse and run", |s| {
+        chevron_rows(s).len() == 1 && prompt_ready(s)
+    });
+    t.wait_settled(Duration::from_millis(150));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} echo pasted-text"],
+        "{}",
+        t.dump()
+    );
+    assert!(
+        t.with_screen(lines).iter().any(|l| l == "pasted-text"),
+        "pasted command must execute\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_row("\u{276f} echo pasted-text"),
+        GREEN,
+        "{}",
+        t.dump()
+    );
+}
+
+/// A buggy emulator answering every DSR query twice: the duplicate
+/// response lingers in the input queue. The pending-input probe must
+/// notice it on the next exchange and skip rather than read a stale
+/// row — the wrong-row-rewrite class of bug.
+#[test]
+fn double_responding_terminal_degrades_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::DoubleResponse);
+    t.run("true");
+    t.wait_settled(Duration::from_millis(300));
+    t.run("false");
+    t.wait_settled(Duration::from_millis(300));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true", "\u{276f} false"],
+        "each command exactly one chevron row, no wrong-row rewrites\n{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 2, "{}", t.dump());
+    let prompt = t.with_screen(last_nonempty);
+    assert!(
+        prompt.contains(LIVE_PROMPT_MARK),
+        "stray duplicate responses must not garble the prompt: {prompt:?}\n{}",
+        t.dump()
+    );
+}
+
+/// Ctrl-Z suspend and `fg` resume: two full prompt cycles wrap around a
+/// job-control state change; the suspended job's collapsed row must not
+/// duplicate or get rewritten onto the job-control message.
+#[test]
+fn suspend_resume_cycle_keeps_rows_intact() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.send_line("sleep 5");
+    t.wait_for("command to collapse and start", |s| {
+        chevron_rows(s).len() == 1
+    });
+    // The collapse paints before preexec hands the terminal to the
+    // child; ^Z must hit the CHILD's process group. Too early and zsh
+    // (which ignores TSTP) eats it; too late is harmless within the 5 s
+    // sleep window.
+    std::thread::sleep(Duration::from_millis(200));
+    t.send("\x1a"); // Ctrl-Z
+    t.wait_for("suspend message and prompt", |s| {
+        lines(s).iter().any(|l| l.contains("suspended")) && prompt_ready(s)
+    });
+    t.send_line("fg");
+    t.wait_for("job to resume in the foreground", |s| {
+        lines(s)
+            .iter()
+            .any(|l| l.contains("continued") || l.contains("running"))
+    });
+    t.send("\x03"); // kill the resumed sleep
+    t.wait_for("prompt after killing resumed job", prompt_ready);
+    t.wait_settled(Duration::from_millis(200));
+
+    let rows = t.with_screen(chevron_rows);
+    assert_eq!(
+        rows,
+        vec!["\u{276f} sleep 5", "\u{276f} fg"],
+        "suspend/resume must leave exactly one row per command\n{}",
+        t.dump()
+    );
+    assert!(
+        t.with_screen(lines)
+            .iter()
+            .any(|l| l.contains("continued") || l.contains("running")),
+        "fg should have resumed the job\n{}",
+        t.dump()
+    );
+}
+
+/// A tiny terminal (8 rows): every cycle runs against the bottom edge,
+/// so the scroll guards fire constantly. Counts must stay exact and the
+/// shell usable — no chevron may ever be painted into scrolled content.
+#[test]
+fn tiny_terminal_stays_consistent() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh_sized(Dsr::Immediate, 8, 60);
+    for cmd in ["true", "false", "echo tiny"] {
+        t.run(cmd);
+    }
+    t.wait_settled(Duration::from_millis(200));
+
+    let rows = t.with_screen(chevron_rows);
+    assert_eq!(
+        rows,
+        vec!["\u{276f} true", "\u{276f} false", "\u{276f} echo tiny"],
+        "{}",
+        t.dump()
+    );
+    assert!(
+        t.with_screen(lines).iter().any(|l| l == "tiny"),
+        "output must survive at the bottom edge\n{}",
+        t.dump()
+    );
+}
+
+/// Multi-line input through a PS2 continuation (`echo 'a` ⏎ `b'`).
+///
+/// Regression test: the rewrite measured only the FIRST line of the
+/// command, so it erased the continuation row and painted a second
+/// `❯ echo 'a` there — a duplicated chevron. Multi-line input now skips
+/// the rewrite entirely (neutral chevron, rows left as painted).
+#[test]
+fn multiline_ps2_input_no_duplicate_chevrons() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.send_line("echo 'a");
+    t.wait_for("PS2 continuation prompt", |s| {
+        lines(s).iter().any(|l| l.contains("quote"))
+    });
+    t.send_line("b'");
+    t.wait_for("command to run and reprompt", |s| {
+        lines(s).iter().any(|l| l == "b") && prompt_ready(s)
+    });
+    t.wait_settled(Duration::from_millis(200));
+
+    let rows = t.with_screen(chevron_rows);
+    assert_eq!(
+        rows,
+        vec!["\u{276f} echo 'a"],
+        "multi-line input must keep exactly one chevron\n{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 1, "{}", t.dump());
+    let all = t.with_screen(lines);
+    assert!(
+        all.iter().any(|l| l == "a") && all.iter().any(|l| l == "b"),
+        "both output lines must be present\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(0),
+        vt100::Color::Default,
+        "multi-line transient stays neutral by design\n{}",
+        t.dump()
+    );
 }
 
 /// tmux/SSH-grade latency that still fits the 300 ms read budget: the

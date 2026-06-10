@@ -53,10 +53,11 @@ pub fn init_zsh() -> &'static str {
 # of the response, and parsing the first CSI would feed garbage like
 # `I\e[5` into arithmetic — a visible zsh math error. The row is then
 # validated as numeric. Anything before the last CSI is input that
-# slipped in between probe and read: plain keystrokes are re-injected
-# via `print -z` so they land in the next edit buffer instead of
-# vanishing; anything containing ESC (arrow keys, stray reports) is
-# dropped rather than pushed into the buffer as control bytes.
+# slipped in between probe and read: plain keystrokes (plus tab/CR/LF)
+# are re-injected via `print -z` so they land in the next edit buffer
+# instead of vanishing; anything carrying other control bytes — ESC
+# from arrow keys or stray reports, ^C from an interrupt racing the
+# exchange — is dropped rather than pushed into the buffer as garbage.
 _chevron_query_row() {
     REPLY=""
     local fd
@@ -77,7 +78,7 @@ _chevron_query_row() {
         local payload="${resp##*$'\e['}"
         REPLY="${payload%%;*}"
         [[ "$REPLY" == <-> ]] || REPLY=""
-        [[ -n "$pre_esc" && "$pre_esc" != *$'\e'* ]] && print -z -- "$pre_esc" 2>/dev/null
+        [[ -n "$pre_esc" && "$pre_esc" != *[^[:print:]$'\t\r\n']* ]] && print -z -- "$pre_esc" 2>/dev/null
     fi
 }
 _chevron_precmd() {
@@ -108,8 +109,8 @@ _chevron_precmd() {
     #   - Output that scrolled the saved row off-screen: the rewrite
     #     lands somewhere off-visible. Bounded by the `delta < 200`
     #     sanity check.
-    #   - True multi-line input (PS2 continuations): only the first
-    #     line is measured and rewritten; continuation rows remain.
+    #   - True multi-line input (PS2 continuations): rewrite skipped,
+    #     transient stays neutral (see the guard below).
     #   - Terminals that don't support DSR: query returns empty,
     #     rewrite is skipped, the transient stays neutral grey.
     # A resize between preexec and precmd invalidates the saved row AND
@@ -117,8 +118,15 @@ _chevron_precmd() {
     # rewrap the transient to different rows entirely, and recomputing
     # the span under the new COLUMNS would erase rows the transient
     # never occupied. Skipping is the only honest move.
+    #
+    # Multi-line input (PS2 continuations) is skipped for the same
+    # reason: the painted transient spans the buffer's rows plus PS2
+    # prefixes whose widths we can't reconstruct, and measuring only
+    # the first line made the rewrite erase the continuation row and
+    # paint a SECOND copy of line one there — a duplicated chevron.
     if [[ -n "$_chevron_transient_save_row" && "${CHEVRON_TRANSIENT:-1}" != "0" \
-          && "$_chevron_transient_save_geom" == "$COLUMNS:$LINES" ]]; then
+          && "$_chevron_transient_save_geom" == "$COLUMNS:$LINES" \
+          && "$_chevron_cmd_title" != *$'\n'* ]]; then
         _chevron_query_row
         if [[ -n "$REPLY" ]]; then
             local _chevron_R_current="$REPLY"
@@ -577,8 +585,22 @@ mod tests {
             "row must be validated as numeric"
         );
         assert!(
-            body.contains(r#""$pre_esc" != *$'\e'*"#),
-            "control bytes must never be re-injected into the edit buffer"
+            body.contains(r#""$pre_esc" != *[^[:print:]$'\t\r\n']*"#),
+            "control bytes (ESC reports, ^C) must never be re-injected into the edit buffer"
+        );
+    }
+
+    #[test]
+    fn zsh_rewrite_skips_multiline_input() {
+        // The painted transient for PS2-continued input spans the
+        // buffer's rows plus PS2 prefixes whose widths we can't
+        // reconstruct; measuring only line one made the rewrite erase
+        // the continuation row and paint a second copy of line one
+        // there — a duplicated chevron.
+        let out = init_zsh();
+        assert!(
+            out.contains(r#""$_chevron_cmd_title" != *$'\n'*"#),
+            "precmd must skip the rewrite for multi-line input"
         );
     }
 
