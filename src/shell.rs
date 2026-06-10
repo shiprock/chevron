@@ -11,39 +11,58 @@ pub fn init_zsh() -> &'static str {
     # silently ignore unknown OSC sequences.
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;C\a'
     # Save the cursor's absolute row (via DSR) for the precmd transient-
-    # colour rewrite. preexec fires AFTER ZLE handed control back to
-    # outside mode (echo restored), so we MUST disable echo around the
-    # DSR query — otherwise the kernel echoes the response bytes
-    # (`^[[N;NR`) to stdout, where they leak into the upcoming
-    # command's output. We save and restore the full stty state to
-    # avoid stomping anything else the user set.
+    # colour rewrite. The query helper owns all tty state and typeahead
+    # safety — see _chevron_query_row.
     if [[ "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
-        local _chevron_stty=$(stty -g 2>/dev/null)
-        # Both -echo (suppress kernel echo) AND -icanon (drop line-mode
-        # buffering) — line-mode could otherwise echo control bytes via
-        # echoctl regardless of the -echo flag. min/time:0/1 makes read
-        # see bytes as they arrive instead of waiting for a line.
-        stty -echo -icanon min 0 time 0 2>/dev/null
         _chevron_query_row
-        [[ -n "$_chevron_stty" ]] && stty "$_chevron_stty" 2>/dev/null
         _chevron_transient_save_row="$REPLY"
     fi
 }
 # Query the current cursor row via DSR (\e[6n). Stores the row in REPLY
-# (empty on failure). One `read -d 'R'` call instead of a per-byte loop
-# — fewer dispatch overheads, and the 300 ms timeout covers tmux/SSH
-# round-trip latency that a tight 50 ms-per-byte budget can't.
+# (empty on failure or skip). One `read -d 'R'` call instead of a
+# per-byte loop — fewer dispatch overheads, and the 300 ms timeout
+# covers tmux/SSH round-trip latency that a tight 50 ms-per-byte budget
+# can't.
 #
-# The DSR response shape is `\e[<row>;<col>R`. `read -d 'R'` reads up
-# to (but not including) the R terminator, so resp ends up containing
-# `\e[<row>;<col>`. Anything in resp BEFORE the ESC is user typeahead;
-# we strip it out and re-inject via `print -z` so a fast-typing user
-# doesn't lose keystrokes to the DSR exchange.
+# Typeahead safety: `read -d 'R'` consumes every queued byte ahead of
+# the response. If the user has already typed the next command, the
+# read would swallow it — the line never executes and reappears parked
+# in the next edit buffer — and a typed literal `R` truncates the
+# exchange early, leaving the real response queued to poison the NEXT
+# cycle's query with a stale row (the rewrite then lands on the wrong
+# line: duplicated chevrons). So probe for pending input first and skip
+# the query entirely when anything is waiting: an honest neutral
+# chevron beats racing the user's keystrokes. zselect ships with zsh;
+# if the module is somehow absent the probe fails closed into the old
+# always-query behaviour.
+#
+# Tty state: -echo must flip BEFORE the query goes out — response bytes
+# arriving ahead of the read are otherwise kernel-echoed at the cursor
+# as `^[[12;34R` (this bit precmd, whose query used to run unguarded).
+# -icanon because line-mode buffers the response forever (no newline
+# ever comes) and echoctl can echo control bytes regardless of -echo.
+# min/time 0/0 makes read see bytes as they arrive. The full stty state
+# is saved and restored to avoid stomping anything else the user set.
+#
+# The DSR response shape is `\e[<row>;<col>R`. Anything in resp BEFORE
+# the ESC is input that slipped in between probe and read; strip it and
+# re-inject via `print -z` so those keystrokes land in the next edit
+# buffer instead of vanishing.
 _chevron_query_row() {
     REPLY=""
+    local fd
+    exec {fd}< /dev/tty 2>/dev/null || return
+    if zselect -t 0 -r $fd 2>/dev/null; then
+        exec {fd}<&-
+        return
+    fi
+    local _chevron_stty=$(stty -g 2>/dev/null)
+    stty -echo -icanon min 0 time 0 2>/dev/null
     printf '\e[6n' > /dev/tty 2>/dev/null
     local resp
-    IFS= read -d 'R' -s -t 0.3 resp < /dev/tty 2>/dev/null
+    IFS= read -u $fd -d 'R' -s -t 0.3 resp 2>/dev/null
+    [[ -n "$_chevron_stty" ]] && stty "$_chevron_stty" 2>/dev/null
+    exec {fd}<&-
     if [[ "$resp" == *$'\e['* ]]; then
         local pre_esc="${resp%%$'\e['*}"
         local payload="${resp#*$'\e['}"
@@ -265,6 +284,10 @@ _chevron_make_prompt() {
 # prompt content (which may include path/branch info) isn't world-readable.
 _chevron_cache_file="${XDG_RUNTIME_DIR:-/tmp}/chevron-${UID:-$(id -u)}/last-prompt"
 [[ -d "${_chevron_cache_file:h}" ]] || mkdir -p -m 700 "${_chevron_cache_file:h}" 2>/dev/null
+# zselect backs the pending-input probe in _chevron_query_row. Best
+# effort: if the module is missing, the probe is skipped and the query
+# behaves as before.
+zmodload -F zsh/zselect b:zselect 2>/dev/null
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd _chevron_precmd
 add-zsh-hook preexec _chevron_preexec
@@ -432,6 +455,56 @@ end
 #[cfg(test)]
 mod tests {
     use super::{init_bash, init_fish, init_zsh};
+
+    /// Body of a `name() { ... }` zsh function in the init script, up to
+    /// the first un-indented closing brace.
+    fn body_of<'a>(script: &'a str, header: &str) -> &'a str {
+        let start = script.find(header).expect("function exists");
+        let end = script[start..]
+            .find("\n}\n")
+            .map(|i| start + i)
+            .expect("function closes");
+        &script[start..end]
+    }
+
+    #[test]
+    fn zsh_query_row_skips_when_typeahead_pending() {
+        // `read -d 'R'` consumes everything queued ahead of the DSR
+        // response: typed-ahead commands were swallowed (parked in the
+        // next edit buffer, never executed) and a typed `R` left a stale
+        // response behind to mis-row the next cycle's rewrite. The probe
+        // must come before the query so we never race user input.
+        let out = init_zsh();
+        let body = body_of(out, "_chevron_query_row() {");
+        let probe = body.find("zselect -t 0 -r").expect("pending-input probe");
+        let query = body.find(r"printf '\e[6n'").expect("DSR query");
+        assert!(probe < query, "probe must run before the query is emitted");
+        assert!(
+            out.contains("zmodload -F zsh/zselect b:zselect"),
+            "zselect builtin must be loaded at init"
+        );
+    }
+
+    #[test]
+    fn zsh_query_row_owns_tty_state() {
+        // -echo must flip BEFORE the query leaves: response bytes that
+        // arrive ahead of the read are kernel-echoed at the cursor
+        // (`^[[12;34R`) otherwise. precmd's query historically ran
+        // without this guard — keeping the stty dance inside the helper
+        // covers every caller.
+        let out = init_zsh();
+        let body = body_of(out, "_chevron_query_row() {");
+        let echo_off = body.find("stty -echo -icanon").expect("echo guard");
+        let query = body.find(r"printf '\e[6n'").expect("DSR query");
+        assert!(echo_off < query, "-echo must be set before the query");
+        // `stty -`/`$(stty` rather than bare `stty`: the preexec comment
+        // block legitimately mentions Ghostty.
+        let pre = body_of(out, "_chevron_preexec() {");
+        assert!(
+            !pre.contains("stty -") && !pre.contains("$(stty"),
+            "preexec must not duplicate the tty dance outside the helper"
+        );
+    }
 
     #[test]
     fn zsh_contains_hooks() {

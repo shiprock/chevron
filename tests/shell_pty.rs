@@ -114,6 +114,20 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// These are integration tests of the *zsh* init; environments without
+/// zsh (the nix build sandbox, minimal CI images) skip them — loudly —
+/// instead of failing at PTY spawn.
+fn zsh_available() -> bool {
+    let ok = std::process::Command::new("zsh")
+        .args(["-fc", "exit 0"])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        eprintln!("skipping PTY test: zsh not available on PATH");
+    }
+    ok
+}
+
 /// Reader-thread body: feeds shell output into the vt100 screen and
 /// answers DSR queries with the cursor position *at the moment the query
 /// arrives* — exactly what a real terminal reports — even when delivery
@@ -334,19 +348,37 @@ impl Term {
         }
     }
 
-    /// Foreground color of the first chevron glyph on the given row.
-    fn chevron_color_on_row(&self, row_text: &str) -> vt100::Color {
+    fn chevron_cell_color(&self, row: usize, line: &str) -> vt100::Color {
+        let col = line.chars().position(|c| c == CHEVRON).unwrap();
         self.with_screen(|s| {
-            let all = lines(s);
-            let row = all
-                .iter()
-                .position(|l| l == row_text)
-                .unwrap_or_else(|| panic!("row {row_text:?} not on screen\n{}", self.dump()));
-            let col = all[row].chars().position(|c| c == CHEVRON).unwrap();
             s.cell(u16::try_from(row).unwrap(), u16::try_from(col).unwrap())
                 .unwrap()
                 .fgcolor()
         })
+    }
+
+    /// Foreground color of the chevron glyph on the given row.
+    fn chevron_color_on_row(&self, row_text: &str) -> vt100::Color {
+        let (row, line) = self
+            .with_screen(lines)
+            .into_iter()
+            .enumerate()
+            .find(|(_, l)| l == row_text)
+            .unwrap_or_else(|| panic!("row {row_text:?} not on screen\n{}", self.dump()));
+        self.chevron_cell_color(row, &line)
+    }
+
+    /// Foreground color of the chevron on the n-th (0-based) chevron row
+    /// — for screens where several collapsed rows have identical text.
+    fn chevron_color_on_nth(&self, n: usize) -> vt100::Color {
+        let (row, line) = self
+            .with_screen(lines)
+            .into_iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(CHEVRON))
+            .nth(n)
+            .unwrap_or_else(|| panic!("fewer than {} chevron rows\n{}", n + 1, self.dump()));
+        self.chevron_cell_color(row, &line)
     }
 
     /// Screen + escaped raw-byte tail, for failure messages. This is the
@@ -387,6 +419,9 @@ const RED: vt100::Color = vt100::Color::Idx(1);
 
 #[test]
 fn builtin_collapses_to_single_chevron_line() {
+    if !zsh_available() {
+        return;
+    }
     let t = Term::spawn_zsh(Dsr::Immediate);
     t.run("true");
     t.wait_settled(Duration::from_millis(150));
@@ -398,6 +433,9 @@ fn builtin_collapses_to_single_chevron_line() {
 
 #[test]
 fn rewrite_colors_chevron_by_exit_status() {
+    if !zsh_available() {
+        return;
+    }
     let t = Term::spawn_zsh(Dsr::Immediate);
     t.run("true");
     t.run("false");
@@ -426,6 +464,9 @@ fn rewrite_colors_chevron_by_exit_status() {
 
 #[test]
 fn repeated_builtins_collapse_one_row_each() {
+    if !zsh_available() {
+        return;
+    }
     let t = Term::spawn_zsh(Dsr::Immediate);
     for cmd in ["true", ":", "export CHEVRON_TEST_X=1", "cd /"] {
         t.run(cmd);
@@ -449,6 +490,9 @@ fn repeated_builtins_collapse_one_row_each() {
 
 #[test]
 fn external_command_keeps_output_and_single_chevron() {
+    if !zsh_available() {
+        return;
+    }
     let t = Term::spawn_zsh(Dsr::Immediate);
     t.run("/bin/echo hello-from-pty");
     t.wait_settled(Duration::from_millis(150));
@@ -472,18 +516,19 @@ fn external_command_keeps_output_and_single_chevron() {
 /// exchanges for the first. This is the everyday "typed ahead after a
 /// builtin" case.
 ///
-/// KNOWN BUG (deterministic repro, fails 3/3): the typed-ahead `true\r`
-/// is consumed by the DSR `read -d 'R'` along with the cursor response,
-/// stripped as "pre-ESC typeahead", and re-injected with `print -z` —
-/// which parks it in the next prompt's edit buffer instead of executing
-/// it. The raw transcript also shows the precmd DSR response echoed
-/// literally (`^[[2;1R`): unlike preexec, precmd's query has no
-/// `stty -echo` guard, so response bytes arriving before `read -s`
-/// flips echo off are echoed by the kernel at the cursor position.
-/// Run with: `cargo test --test shell_pty -- --ignored`
+/// Regression test: the DSR `read -d 'R'` used to consume the typed-ahead
+/// `true\r` together with the cursor response — the second command never
+/// executed and reappeared parked in the next edit buffer, and the
+/// transcript showed precmd's response kernel-echoed as literal
+/// `^[[2;1R`. The query helper now probes for pending input and skips
+/// the exchange rather than racing the user's keystrokes: a command run
+/// with typeahead behind it may keep a neutral chevron, but every typed
+/// command must execute and collapse to exactly one row.
 #[test]
-#[ignore = "deterministic repro of typeahead-swallowing during DSR exchange; see doc comment"]
 fn rapid_consecutive_builtins_no_duplicates() {
+    if !zsh_available() {
+        return;
+    }
     let t = Term::spawn_zsh(Dsr::Immediate);
     t.send("true\rtrue\r");
     t.wait_for("both commands to collapse and reprompt", |s| {
@@ -505,12 +550,23 @@ fn rapid_consecutive_builtins_no_duplicates() {
         "live prompt must not contain leaked chevrons or DSR fragments: {prompt:?}\n{}",
         t.dump()
     );
+    // The second command's DSR exchange runs against an empty queue, so
+    // its rewrite must still happen.
+    assert_eq!(
+        t.chevron_color_on_nth(1),
+        GREEN,
+        "second command's chevron should be color-corrected\n{}",
+        t.dump()
+    );
 }
 
 /// tmux/SSH-grade latency that still fits the 300 ms read budget: the
 /// rewrite must work exactly as in the immediate case.
 #[test]
 fn tmux_like_dsr_latency_still_rewrites() {
+    if !zsh_available() {
+        return;
+    }
     let t = Term::spawn_zsh(Dsr::Delayed(Duration::from_millis(80)));
     t.run("true");
     t.wait_settled(Duration::from_millis(300));
@@ -535,6 +591,9 @@ fn tmux_like_dsr_latency_still_rewrites() {
 /// surface as typed garbage or extra chevrons.
 #[test]
 fn dsr_slower_than_read_budget_degrades_cleanly() {
+    if !zsh_available() {
+        return;
+    }
     let t = Term::spawn_zsh(Dsr::Delayed(Duration::from_millis(500)));
     t.run("true");
     // Long settle: the straggler response lands ~500 ms after the query.
@@ -561,6 +620,9 @@ fn dsr_slower_than_read_budget_degrades_cleanly() {
 /// duplicates, no hang.
 #[test]
 fn terminal_without_dsr_degrades_cleanly() {
+    if !zsh_available() {
+        return;
+    }
     let t = Term::spawn_zsh(Dsr::Silent);
     t.run("true");
     t.wait_settled(Duration::from_millis(400));
