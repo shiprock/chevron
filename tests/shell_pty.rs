@@ -560,6 +560,245 @@ fn rapid_consecutive_builtins_no_duplicates() {
     );
 }
 
+/// `echo` is the interesting builtin: unlike `true` it produces output,
+/// so the cursor row moves between preexec's query and precmd's — the
+/// rewrite math runs with a non-zero delta.
+#[test]
+fn builtin_echo_collapses_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.run("echo hi");
+    t.wait_settled(Duration::from_millis(150));
+
+    let all = t.with_screen(lines);
+    assert!(
+        all.iter().any(|l| l == "hi"),
+        "echo output must survive the rewrite\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} echo hi"],
+        "{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_row("\u{276f} echo hi"),
+        GREEN,
+        "{}",
+        t.dump()
+    );
+}
+
+/// Output without a trailing newline leaves the cursor mid-row: the
+/// precmd query and the rewrite's reposition must put the cursor back
+/// where the command left it — row AND column — or zsh's partial-line
+/// handling (the inverse `%` mark) paints over the output.
+#[test]
+fn builtin_echo_no_newline_keeps_partial_output() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.run("echo -n hi");
+    t.wait_settled(Duration::from_millis(150));
+
+    let all = t.with_screen(lines);
+    assert!(
+        // zsh appends its PROMPT_EOL_MARK (`%`) right after the partial
+        // output, so the row reads `hi%`.
+        all.iter().any(|l| l.starts_with("hi")),
+        "partial-line output must not be stomped by the reposition\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} echo -n hi"],
+        "{}",
+        t.dump()
+    );
+}
+
+/// Empty enters: accept-line collapses the prompt to a bare chevron but
+/// preexec never fires (there is no command), so no DSR state must leak
+/// into the next real command's rewrite.
+#[test]
+fn empty_enters_leave_bare_chevrons_and_no_stale_state() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.send("\r");
+    t.wait_for("first bare chevron", |s| {
+        chevron_rows(s).len() == 1 && prompt_ready(s)
+    });
+    t.send("\r");
+    t.wait_for("second bare chevron", |s| {
+        chevron_rows(s).len() == 2 && prompt_ready(s)
+    });
+    t.run("true");
+    t.wait_settled(Duration::from_millis(150));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f}", "\u{276f}", "\u{276f} true"],
+        "{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(2),
+        GREEN,
+        "the real command after empty enters must still be rewritten\n{}",
+        t.dump()
+    );
+}
+
+/// `clear` moves the cursor ABOVE the saved row (negative delta): the
+/// rewrite must be skipped, leaving a clean screen with just the prompt.
+#[test]
+fn clear_builtin_skips_rewrite_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.run("true");
+    t.send_line("clear");
+    t.wait_for("screen cleared back to a lone prompt", |s| {
+        chevron_rows(s).is_empty() && prompt_ready(s)
+    });
+    t.wait_settled(Duration::from_millis(150));
+
+    let all = t.with_screen(lines);
+    assert!(
+        all[0].contains(LIVE_PROMPT_MARK),
+        "prompt must be at the top after clear\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        0,
+        "no rewrite may resurrect a chevron after clear\n{}",
+        t.dump()
+    );
+}
+
+/// Output that scrolls the saved row off-screen: the scroll guards must
+/// skip the rewrite entirely — a rewrite here would paint a chevron into
+/// the middle of the output.
+#[test]
+fn scrolling_output_skips_rewrite() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    // Not run(): the collapsed row scrolls off-screen, so waiting for a
+    // chevron row would never succeed. Wait on the output tail instead.
+    t.send_line("print -l {1..40}");
+    t.wait_for("output to finish and reprompt", |s| {
+        lines(s).iter().any(|l| l == "40") && prompt_ready(s)
+    });
+    t.wait_settled(Duration::from_millis(150));
+
+    let all = t.with_screen(lines);
+    // The collapsed line scrolled off; every chevron-free row is either
+    // a number from the output or blank, and no chevron was painted into
+    // the output.
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        0,
+        "rewrite must not paint into scrolled output\n{}",
+        t.dump()
+    );
+    assert!(
+        all.iter().any(|l| l == "40"),
+        "output tail must be visible\n{}",
+        t.dump()
+    );
+}
+
+/// A command issued from the bottom row of the screen: the collapse
+/// itself scrolls, so `R_saved` sits at the screen edge and the guards
+/// must leave the chevron neutral rather than rewrite a wrong row.
+#[test]
+fn command_from_bottom_row_skips_rewrite() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    // Park the prompt on the bottom row.
+    t.run("print -l {1..21}");
+    t.run("true");
+    t.wait_settled(Duration::from_millis(150));
+
+    let rows = t.with_screen(chevron_rows);
+    assert_eq!(
+        rows,
+        vec!["\u{276f} print -l {1..21}", "\u{276f} true"],
+        "exactly one chevron row per command, no duplicates\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(1),
+        vt100::Color::Default,
+        "bottom-row command must stay neutral (rewrite skipped)\n{}",
+        t.dump()
+    );
+}
+
+/// Input wider than the terminal wraps the collapsed line across two
+/// rows.
+///
+/// Regression test: the rewrite used to target only R_saved-1 — the
+/// wrap REMAINDER row, not the chevron's row — erasing the remainder,
+/// re-painting the full command there (wrapping over the next-prompt
+/// row), and leaving the original chevron row untouched: two chevron
+/// rows on screen. On an 80-column terminal any command past ~78 chars
+/// triggered it. The rewrite now measures the wrapped span and erases
+/// all of it.
+#[test]
+fn wrapped_input_line_no_duplicate_chevrons() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    // `:` ignores its arguments; `❯ : ` (4 cells) + 148 `x`s = 152
+    // cells, wrapping a 120-column screen onto a second row.
+    let long = format!(": {}", "x".repeat(148));
+    t.run(&long);
+    t.wait_settled(Duration::from_millis(150));
+
+    let rows = t.with_screen(chevron_rows);
+    assert_eq!(
+        rows,
+        vec![format!("\u{276f} : {}", "x".repeat(116))],
+        "a wrapped command must collapse to a single chevron row\n{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 1, "{}", t.dump());
+    // The wrap remainder re-wraps onto the row below, intact.
+    let all = t.with_screen(lines);
+    assert_eq!(
+        all[1],
+        "x".repeat(32),
+        "wrap remainder must survive the rewrite\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(0),
+        GREEN,
+        "wrapped command's chevron must still be color-corrected\n{}",
+        t.dump()
+    );
+    let prompt = t.with_screen(last_nonempty);
+    assert!(
+        prompt.contains(LIVE_PROMPT_MARK),
+        "live prompt must be intact below the wrapped line\n{}",
+        t.dump()
+    );
+}
+
 /// tmux/SSH-grade latency that still fits the 300 ms read budget: the
 /// rewrite must work exactly as in the immediate case.
 #[test]

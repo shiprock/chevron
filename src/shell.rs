@@ -78,11 +78,16 @@ _chevron_precmd() {
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;D;%d\a' $exit_status
     # Color-correct the transient prompt (chevron-4xq). preexec captured
     # the absolute row of the line below the painted transient (via
-    # DSR). Now we query R_current and absolute-position to (R_saved-1)
-    # to land on the transient line itself, erase it, write the
-    # exit-coloured chevron + cmd, then absolute-position back to
-    # R_current so zsh's main loop draws the next PROMPT where it
-    # belongs.
+    # DSR). Now we query R_current, erase the transient's rows, write
+    # the exit-coloured chevron + cmd at the transient's top row, then
+    # absolute-position back to R_current so zsh's main loop draws the
+    # next PROMPT where it belongs.
+    #
+    # The painted transient is `❯ ` plus the typed command, which WRAPS
+    # on narrow terminals: it occupies ceil(width/COLUMNS) rows ENDING
+    # at R_saved-1. Erasing only the last of those rows left the earlier
+    # rows behind — the duplicated-chevron glitch — while the rewrite
+    # re-wrapped into rows the next prompt then half-overwrote.
     #
     # Pure DSR + absolute positioning — no DECSC/DECRC and no SCOSC.
     # The earlier attempts using \e7/\e8 were silently dropped on some
@@ -93,8 +98,8 @@ _chevron_precmd() {
     #   - Output that scrolled the saved row off-screen: the rewrite
     #     lands somewhere off-visible. Bounded by the `delta < 200`
     #     sanity check.
-    #   - Multi-line input or wrapped input: we only erase one row;
-    #     other rows of the multi-line transient remain.
+    #   - True multi-line input (PS2 continuations): only the first
+    #     line is measured and rewritten; continuation rows remain.
     #   - Terminals that don't support DSR: query returns empty,
     #     rewrite is skipped, the transient stays neutral grey.
     if [[ -n "$_chevron_transient_save_row" && "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
@@ -102,10 +107,19 @@ _chevron_precmd() {
         if [[ -n "$REPLY" ]]; then
             local _chevron_R_current="$REPLY"
             local _chevron_R_saved="$_chevron_transient_save_row"
-            local _chevron_R_transient=$(( _chevron_R_saved - 1 ))
             local _chevron_delta=$(( _chevron_R_current - _chevron_R_saved ))
             local _chevron_lines=${LINES:-24}
             local _chevron_available=$(( _chevron_lines - _chevron_R_saved ))
+            # Cmd may be multi-line; only its first line is measured and
+            # written so we don't run past the rows we erased.
+            local _chevron_rewrite_cmd="${_chevron_cmd_title%%$'\n'*}"
+            # Rows the wrapped transient occupies. ${(m)#...} counts
+            # display cells (not bytes); `❯ ` adds 2.
+            local _chevron_width=$(( ${(m)#_chevron_rewrite_cmd} + 2 ))
+            local _chevron_cols=${COLUMNS:-80}
+            local _chevron_span=$(( (_chevron_width + _chevron_cols - 1) / _chevron_cols ))
+            (( _chevron_span < 1 )) && _chevron_span=1
+            local _chevron_R_top=$(( _chevron_R_saved - _chevron_span ))
             # Scroll detection: any of these means the saved row is
             # no longer the transient line.
             #   - R_saved at/past bottom: any output scrolled.
@@ -117,7 +131,7 @@ _chevron_precmd() {
             # streaming commands (ps, ls of huge dirs, cargo build)
             # commonly trigger one of these and the user gets a clean
             # gray chevron without a glitched rewrite.
-            if (( _chevron_R_transient > 0 \
+            if (( _chevron_R_top > 0 \
                 && _chevron_R_saved < _chevron_lines \
                 && _chevron_R_current < _chevron_lines \
                 && _chevron_delta >= 0 \
@@ -128,17 +142,19 @@ _chevron_precmd() {
                 else
                     _chevron_color_code=1
                 fi
-                # Cmd may be multi-line; only write its first line so we
-                # don't run past the column we landed on.
-                local _chevron_rewrite_cmd="${_chevron_cmd_title%%$'\n'*}"
                 local _chevron_osc_a=""
                 local _chevron_osc_b=""
                 if [[ "${CHEVRON_OSC133:-1}" != "0" ]]; then
                     _chevron_osc_a=$'\e]133;A\a'
                     _chevron_osc_b=$'\e]133;B\a'
                 fi
-                printf '\e[%d;1H\e[2K%s\e[3%dm❯\e[0m %s%s\e[%d;1H' \
-                    "$_chevron_R_transient" \
+                # Erase every wrapped row top-to-bottom, then write the
+                # rewrite at the top; it re-wraps into exactly the rows
+                # just cleared.
+                local _chevron_erase=""
+                repeat $_chevron_span _chevron_erase+=$'\e[2K\e[B'
+                printf '\e[%d;1H%s\e[%d;1H%s\e[3%dm❯\e[0m %s%s\e[%d;1H' \
+                    "$_chevron_R_top" "$_chevron_erase" "$_chevron_R_top" \
                     "$_chevron_osc_a" "$_chevron_color_code" \
                     "$_chevron_osc_b" "$_chevron_rewrite_cmd" \
                     "$_chevron_R_current" > /dev/tty 2>/dev/null
@@ -598,24 +614,46 @@ mod tests {
         // in the rewrite block — some terminals (notably under tmux)
         // silently drop \e8.
         assert!(
-            out.contains("_chevron_R_transient"),
-            "should compute the transient row from saved row - 1"
+            out.contains("_chevron_R_top"),
+            "should compute the top row of the wrapped transient span"
         );
         assert!(
-            out.contains(r"\e[%d;1H\e[2K"),
-            "should absolute-move to transient row and erase"
+            out.contains(r"$'\e[2K\e[B'"),
+            "should erase row-by-row down the span"
         );
         assert!(
             out.contains(r"\e[3%dm❯\e[0m"),
             "should emit colour code + chevron + reset"
         );
-        // The format string MUST contain two `\e[%d;1H` — one to land
-        // on the transient line, one to land back on the next-prompt
-        // row after the rewrite.
+        // The format string MUST contain at least two `\e[%d;1H` — one
+        // to land on the transient span, one to land back on the
+        // next-prompt row after the rewrite.
         let format_str_count = out.matches(r"\e[%d;1H").count();
         assert!(
             format_str_count >= 2,
             "should absolute-position twice (transient then next-prompt), got {format_str_count}"
+        );
+    }
+
+    #[test]
+    fn zsh_rewrite_erases_full_wrapped_span() {
+        // A command wider than the terminal wraps the collapsed
+        // transient across several rows ending at R_saved-1. Erasing
+        // only that last row left the earlier rows behind — duplicated
+        // chevrons — while the rewrite re-wrapped into rows the next
+        // prompt half-overwrote.
+        let out = init_zsh();
+        assert!(
+            out.contains(r"${(m)#_chevron_rewrite_cmd}"),
+            "span width must be measured in display cells, not bytes"
+        );
+        assert!(
+            out.contains("repeat $_chevron_span"),
+            "must erase one row per wrapped row"
+        );
+        assert!(
+            out.contains("_chevron_R_saved - _chevron_span"),
+            "rewrite must anchor at the top of the span"
         );
     }
 
