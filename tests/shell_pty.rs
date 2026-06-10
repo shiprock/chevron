@@ -1629,3 +1629,61 @@ fn terminal_without_dsr_degrades_cleanly() {
         t.dump()
     );
 }
+
+/// The shell's stderr must stay wired to the terminal. Regression test:
+/// the query helper opened its tty fd with a bare `exec {fd}< /dev/tty
+/// 2>/dev/null` — and exec makes every redirection on it permanent, so
+/// the first prompt cycle pointed the shell's (and every child's) fd 2
+/// at /dev/null. Error messages silently vanished from then on.
+#[test]
+fn command_stderr_stays_visible() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    // A full prompt cycle first, so the query helper's fd dance has run.
+    t.run("true");
+    t.send_line("ls /chevron-no-such-path");
+    t.wait_for("ls's error text to reach the terminal", |s| {
+        lines(s).iter().any(|l| l.starts_with("ls:"))
+    });
+}
+
+/// `reset` (ncurses tset) reads the terminal via stderr and
+/// re-initializes it with RIS (`\ec`), which clears the screen and homes
+/// the cursor between preexec's row save and precmd's rewrite. The
+/// rewrite must skip (the homed cursor sits above the saved row, so the
+/// delta goes negative), a fresh prompt must paint on the cleared
+/// screen, and the shell must stay fully usable afterwards.
+///
+/// Regression test: with the shell's stderr left on /dev/null by the
+/// bare-exec bug above, tset's `tcgetattr(STDERR_FILENO)` failed with
+/// ENOTTY and it exited 1 before emitting a single byte — "the reset
+/// command no longer works", with even its error message swallowed.
+#[test]
+fn reset_command_reinitializes_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.run("/bin/echo before-reset");
+    t.send_line("reset");
+    t.wait_for("RIS to clear the screen and a fresh prompt", |s| {
+        prompt_ready(s) && !lines(s).iter().any(|l| l.contains("before-reset"))
+    });
+    t.run("/bin/echo after-reset");
+    t.wait_settled(Duration::from_millis(200));
+
+    let all = t.with_screen(lines);
+    assert!(
+        all.iter().any(|l| l == "after-reset"),
+        "shell must stay usable after reset\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} /bin/echo after-reset"],
+        "only the post-reset command's collapsed row should remain\n{}",
+        t.dump()
+    );
+}

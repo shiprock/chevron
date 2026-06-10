@@ -87,6 +87,12 @@ verification):
   sequences or control bytes).
 - Async fast path (`CHEVRON_ASYNC=1`): background refreshes carry a
   generation stamp; callbacks from superseded cycles discard their result.
+- Never hang error suppression on a bare `exec`: every redirection on an
+  `exec` is permanent, so `exec {fd}< /dev/tty 2>/dev/null` pointed the
+  whole shell's stderr at /dev/null from the first prompt cycle — error
+  messages vanished and ncurses `reset`/`tset` (which reach the terminal
+  via fd 2) exited 1 silently. Scope it instead:
+  `{ exec {fd}< /dev/tty } 2>/dev/null`.
 
 ## Testing
 

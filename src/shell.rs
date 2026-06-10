@@ -68,8 +68,10 @@ if [[ -o interactive && -t 1 ]] \
                 # user isn't stuck with a broken terminal.
                 _chevron_instant_zshexit() {
                     [[ -z "$_chevron_instant_active" ]] && return
+                    # No 2>/dev/null here: exec persists every redirection
+                    # on it, so it would re-point stderr at /dev/null.
                     exec >&"$_chevron_instant_orig_stdout" \
-                         2>&"$_chevron_instant_orig_stderr" 2>/dev/null
+                         2>&"$_chevron_instant_orig_stderr"
                     [[ -s "$_chevron_instant_buf" ]] \
                         && cat -- "$_chevron_instant_buf" >&2 2>/dev/null
                     rm -f -- "$_chevron_instant_buf" 2>/dev/null
@@ -158,7 +160,14 @@ const BODY_ZSH: &str = r#"_chevron_preexec() {
 _chevron_query_row() {
     REPLY=""
     local fd
-    exec {fd}< /dev/tty 2>/dev/null || return
+    # The braces are load-bearing: a bare `exec` makes EVERY redirection
+    # on it permanent, so a trailing 2>/dev/null — meant only to silence
+    # a failed open — would point the whole shell's stderr at /dev/null
+    # for the rest of the session. Command error output vanishes, and
+    # ncurses tset/reset (which reach the terminal via fd 2) abort
+    # silently: "reset stopped working". The brace group scopes the
+    # suppression to the open; the fd allocated by exec persists anyway.
+    { exec {fd}< /dev/tty } 2>/dev/null || return
     if zselect -t 0 -r $fd 2>/dev/null; then
         exec {fd}<&-
         return
@@ -223,8 +232,13 @@ _chevron_precmd() {
     # opened, clear the cached prompt line, then replay any output that
     # .zshrc produced. No-op when the snippet wasn't activated.
     if [[ -n "$_chevron_instant_active" ]]; then
-        exec >&"$_chevron_instant_orig_stdout" 2>&"$_chevron_instant_orig_stderr" 2>/dev/null
-        exec {_chevron_instant_orig_stdout}>&- {_chevron_instant_orig_stderr}>&- 2>/dev/null
+        # No error suppression on the restore: redirections apply left to
+        # right and exec persists ALL of them, so a trailing 2>/dev/null
+        # was the FINAL word on fd 2 — every instant-prompt shell ran with
+        # stderr on /dev/null from the first prompt on. A failed restore
+        # prints into the buffer file instead, which is harmless.
+        exec >&"$_chevron_instant_orig_stdout" 2>&"$_chevron_instant_orig_stderr"
+        { exec {_chevron_instant_orig_stdout}>&- {_chevron_instant_orig_stderr}>&- } 2>/dev/null
         [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;D;0\a'
         print -n -- $'\r\e[2K'
         [[ -s "$_chevron_instant_buf" ]] && cat -- "$_chevron_instant_buf"
@@ -272,7 +286,9 @@ _chevron_precmd() {
     # the escape hatch for those.
     if [[ -n "$_chevron_dsr_inflight" && "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
         local _chevron_sweep_fd
-        if exec {_chevron_sweep_fd}< /dev/tty 2>/dev/null; then
+        # Braced for the same reason as _chevron_query_row's open: a bare
+        # exec would make the 2>/dev/null permanent for the whole shell.
+        if { exec {_chevron_sweep_fd}< /dev/tty } 2>/dev/null; then
             local _chevron_sweep_stty=$(stty -g 2>/dev/null)
             stty -echo -icanon min 0 time 0 2>/dev/null
             _chevron_drain_reports $_chevron_sweep_fd 30
@@ -561,7 +577,7 @@ _chevron_live_callback() {
     # re-enable Phase 3 by opening a new shell.
     if ! IFS= read -r line <&$fd; then
         zle -F "$fd" 2>/dev/null
-        exec {fd}<&- 2>/dev/null
+        { exec {fd}<&- } 2>/dev/null
         unset _chevron_live_fd
         return
     fi
@@ -1159,6 +1175,37 @@ mod tests {
         assert!(
             !pre.contains("stty -") && !pre.contains("$(stty"),
             "preexec must not duplicate the tty dance outside the helper"
+        );
+    }
+
+    #[test]
+    fn zsh_exec_never_persists_stderr_suppression() {
+        // A bare `exec` makes every redirection on it permanent: `exec
+        // {fd}< /dev/tty 2>/dev/null` pointed the whole shell's stderr
+        // at /dev/null from the first prompt cycle — error messages
+        // vanished and ncurses reset/tset (which reach the terminal via
+        // fd 2) aborted silently as "reset stopped working". Error
+        // suppression on an exec must be scoped via a brace group.
+        let out = init_zsh();
+        assert!(
+            out.contains("{ exec {fd}< /dev/tty } 2>/dev/null || return"),
+            "query helper's tty open must scope its 2>/dev/null"
+        );
+        assert!(
+            out.contains("if { exec {_chevron_sweep_fd}< /dev/tty } 2>/dev/null; then"),
+            "precmd sweep's tty open must scope its 2>/dev/null"
+        );
+        // The instant-prompt fd restores must not end with a stderr
+        // redirect: redirections apply left to right, so a trailing
+        // 2>/dev/null is the final word on fd 2 and exec persists it.
+        assert!(
+            !out.contains(r#""$_chevron_instant_orig_stderr" 2>/dev/null"#),
+            "instant takeover restore must not re-point fd 2 at /dev/null"
+        );
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(
+            !snippet.contains(r#""$_chevron_instant_orig_stderr" 2>/dev/null"#),
+            "zshexit restore must not re-point fd 2 at /dev/null"
         );
     }
 
