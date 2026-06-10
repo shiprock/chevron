@@ -324,6 +324,7 @@ impl Term {
             "CHEVRON_OSC133",
             "CHEVRON_ASYNC",
             "CHEVRON_CACHE_FILE",
+            "CHEVRON_TRANSIENT_DURATION_MS",
         ] {
             cmd.env_remove(var);
         }
@@ -1385,6 +1386,67 @@ fn multiline_ps2_input_no_duplicate_chevrons() {
         "multi-line transient stays neutral by design\n{}",
         t.dump()
     );
+}
+
+/// The post-exec duration tag: a dim ` N.Ns` row between a slow
+/// command's output and the next prompt.
+///
+/// Regression test: the tag reads `$EPOCHREALTIME`, which expands EMPTY
+/// unless zsh/datetime is loaded — and the init never loaded it, so in
+/// a bare `.zshrc` every command measured 0 ms and the shipped feature
+/// silently never fired.
+#[test]
+fn duration_tag_renders_for_slow_commands() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    // Lower the threshold so the test stays fast; exported in-shell to
+    // keep the spawn fixture identical to the documented install.
+    t.run("export CHEVRON_TRANSIENT_DURATION_MS=100");
+    t.run("sleep 0.2");
+    t.wait_settled(Duration::from_millis(200));
+
+    // ` 0.2s`-shaped row (digits may vary with scheduler overshoot).
+    let is_tag = |l: &str| {
+        l.strip_prefix(' ')
+            .and_then(|b| b.strip_suffix('s'))
+            .and_then(|b| b.split_once('.'))
+            .is_some_and(|(a, b)| {
+                !a.is_empty()
+                    && a.chars().all(|c| c.is_ascii_digit())
+                    && !b.is_empty()
+                    && b.chars().all(|c| c.is_ascii_digit())
+            })
+    };
+    let all = t.with_screen(lines);
+    let tag_rows: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| is_tag(l).then_some(i))
+        .collect();
+    // Exactly one: the instant `export` above must NOT be tagged — the
+    // measurement brackets the command only, not the DSR machinery
+    // around it (which costs tens of ms and used to be billed to the
+    // command under a lowered threshold).
+    assert_eq!(
+        tag_rows.len(),
+        1,
+        "exactly the slow command gets a duration tag\n{}",
+        t.dump()
+    );
+    let tag_row = tag_rows[0];
+    let sleep_row = all.iter().position(|l| l == "\u{276f} sleep 0.2").unwrap();
+    assert!(
+        tag_row > sleep_row,
+        "tag must sit between the command and the prompt\n{}",
+        t.dump()
+    );
+    let dim = t.with_screen(|s| {
+        s.cell(u16::try_from(tag_row).unwrap(), 1)
+            .is_some_and(vt100::Cell::dim)
+    });
+    assert!(dim, "duration tag must be dim-styled\n{}", t.dump());
 }
 
 // ── async fast path (CHEVRON_ASYNC=1) ────────────────────────────────────────

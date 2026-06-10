@@ -2,7 +2,6 @@
 #[allow(clippy::too_many_lines)]
 pub fn init_zsh() -> &'static str {
     r#"_chevron_preexec() {
-    _chevron_cmd_start=$EPOCHREALTIME
     _chevron_cmd_title="$1"
     # OSC 133 C: command output is about to start. Modern terminals
     # (Ghostty, WezTerm, iTerm2, Kitty, VS Code, Windows Terminal) use
@@ -20,6 +19,10 @@ pub fn init_zsh() -> &'static str {
         _chevron_transient_save_row="$REPLY"
         _chevron_transient_save_geom="$COLUMNS:$LINES"
     fi
+    # Timestamp LAST: the DSR exchange and tty bookkeeping above can
+    # cost tens of milliseconds and must not count against the user's
+    # command (precmd takes its end timestamp first, symmetrically).
+    _chevron_cmd_start=$EPOCHREALTIME
 }
 # Query the current cursor row via DSR (\e[6n). Stores the row in REPLY
 # (empty on failure or skip). One `read -d 'R'` call instead of a
@@ -116,6 +119,9 @@ _chevron_drain_reports() {
 }
 _chevron_precmd() {
     local exit_status=$?
+    # End timestamp FIRST, before the sweep/rewrite machinery below
+    # spends its own time — the duration tag measures the command only.
+    local _chevron_cmd_end=$EPOCHREALTIME
     # OSC 133 D: the just-completed command finished with $exit_status.
     # Emitted first so it closes out the previous command region before
     # we print the duration tag and next prompt's A marker.
@@ -238,11 +244,11 @@ _chevron_precmd() {
     fi
     unset _chevron_transient_save_row _chevron_transient_save_geom
     local duration_ms=0
-    if [[ -n "$_chevron_cmd_start" ]]; then
-        duration_ms=$(( ($EPOCHREALTIME - _chevron_cmd_start) * 1000 ))
+    if [[ -n "$_chevron_cmd_start" && -n "$_chevron_cmd_end" ]]; then
+        duration_ms=$(( (_chevron_cmd_end - _chevron_cmd_start) * 1000 ))
         duration_ms=${duration_ms%.*}
-        unset _chevron_cmd_start
     fi
+    unset _chevron_cmd_start
     # Post-execution duration tag: if the just-completed command took
     # longer than the threshold, emit a dim duration line below its
     # output and above the next prompt. This preserves timing info in
@@ -391,6 +397,12 @@ _chevron_cache_file="${XDG_RUNTIME_DIR:-/tmp}/chevron-${UID:-$(id -u)}/last-prom
 # effort: if the module is missing, the probe is skipped and the query
 # behaves as before.
 zmodload -F zsh/zselect b:zselect 2>/dev/null
+# EPOCHREALTIME lives in zsh/datetime and expands EMPTY when the module
+# isn't loaded — in a bare .zshrc the duration tag silently never fired
+# (every command measured as 0 ms). Parameter-only load: no strftime
+# builtin or other namespace pollution. Best effort: on failure the
+# duration stays 0, as before.
+zmodload -F zsh/datetime p:EPOCHREALTIME 2>/dev/null
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd _chevron_precmd
 add-zsh-hook preexec _chevron_preexec
@@ -885,6 +897,42 @@ mod tests {
         assert!(
             !printf_fmt.contains(r"\e[u"),
             "rewrite printf must not use SCORC: {printf_fmt}"
+        );
+    }
+
+    #[test]
+    fn zsh_loads_datetime_for_duration_tag() {
+        // EPOCHREALTIME expands empty unless zsh/datetime is loaded;
+        // without this line the duration tag was inert in any bare
+        // .zshrc (caught end-to-end by the PTY harness). The -F p:
+        // form loads only the parameter — no strftime builtin.
+        let out = init_zsh();
+        assert!(
+            out.contains("zmodload -F zsh/datetime p:EPOCHREALTIME"),
+            "init must load the EPOCHREALTIME parameter"
+        );
+    }
+
+    #[test]
+    fn zsh_duration_measures_command_only() {
+        // The DSR exchange, stty forks, and drain in preexec — and the
+        // sweep/rewrite in precmd — cost tens of milliseconds. With the
+        // start timestamp taken first and the duration computed last,
+        // that overhead was billed to the user's command: instant
+        // builtins measured ~0.2s under a lowered threshold. Start is
+        // stamped at the END of preexec, end at the TOP of precmd.
+        let out = init_zsh();
+        let pre = body_of(out, "_chevron_preexec() {");
+        assert!(
+            pre.find("_chevron_query_row").unwrap()
+                < pre.find("_chevron_cmd_start=$EPOCHREALTIME").unwrap(),
+            "start timestamp must be stamped after the DSR machinery"
+        );
+        let pc = body_of(out, "_chevron_precmd() {");
+        assert!(
+            pc.find("_chevron_cmd_end=$EPOCHREALTIME").unwrap()
+                < pc.find("_chevron_query_row").unwrap(),
+            "end timestamp must be captured before the rewrite machinery"
         );
     }
 
