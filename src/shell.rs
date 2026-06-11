@@ -98,7 +98,12 @@ const BODY_ZSH: &str = r#"_chevron_preexec() {
     # while the command runs invalidates every saved coordinate. The
     # query helper owns all tty state and typeahead safety — see
     # _chevron_query_row.
-    if [[ "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
+    # Gated on the collapse having actually painted: alternate accept
+    # widgets (accept-and-hold, accept-line-and-down-history, custom
+    # widgets that call .accept-line directly) bypass the override, so
+    # the FULL prompt is still on screen — a rewrite sized for `❯ cmd`
+    # would erase the wrong span and paint a collapsed line over it.
+    if [[ "${CHEVRON_TRANSIENT:-1}" != "0" && -n "$_chevron_transient_collapsed" ]]; then
         _chevron_query_row
         _chevron_transient_save_row="$REPLY"
         _chevron_transient_save_geom="$COLUMNS:$LINES"
@@ -390,7 +395,14 @@ _chevron_precmd() {
             # streaming commands (ps, ls of huge dirs, cargo build)
             # commonly trigger one of these and the user gets a clean
             # gray chevron without a glitched rewrite.
+            # Width an exact multiple of COLUMNS: the painted transient
+            # ends in the auto-margin pending-wrap state, and emulators
+            # DISAGREE on how the following newline advances from there
+            # (one row or two — ble.sh's "xenl" trap). The saved row may
+            # be off by one, which paints the duplicated-chevron glitch;
+            # unknowable from here, so skip honestly.
             if (( _chevron_R_top > 0 \
+                && _chevron_width % _chevron_cols != 0 \
                 && _chevron_R_saved < _chevron_lines \
                 && _chevron_R_current < _chevron_lines \
                 && _chevron_delta >= 0 \
@@ -420,7 +432,8 @@ _chevron_precmd() {
             fi
         fi
     fi
-    unset _chevron_transient_save_row _chevron_transient_save_geom
+    unset _chevron_transient_save_row _chevron_transient_save_geom \
+          _chevron_transient_collapsed
     local duration_ms=0
     if [[ -n "$_chevron_cmd_start" && -n "$_chevron_cmd_end" ]]; then
         duration_ms=$(( (_chevron_cmd_end - _chevron_cmd_start) * 1000 ))
@@ -543,13 +556,20 @@ _chevron_async_callback() {
                 tmux set-option -p @custom_title "" \; set-option -p @dir_title "$_chevron_tmux_title" \; rename-window "$_chevron_tmux_title"
             fi
         fi
-        zle reset-prompt
+        # PS2 continuation lines: reset-prompt there corrupts the
+        # secondary-prompt state (pure guards identically). The fresh
+        # PROMPT still applies at the next repaint.
+        [[ "$CONTEXT" != "cont" ]] && zle reset-prompt
     fi
 }
 # Transient prompt: rewrite the just-issued prompt line to a minimal stub
 # (single chevron) so scrollback stays clean and copy-paste captures only
 # the command, not the prompt chrome. Disable with CHEVRON_TRANSIENT=0.
 _chevron_accept_line() {
+    # Record that the collapse really painted — preexec's row save (and
+    # with it the precmd rewrite) is gated on this, because execution
+    # paths that bypass this widget leave the full prompt on screen.
+    _chevron_transient_collapsed=1
     # Strip the trailing space from the transient prompt since
     # _chevron_make_prompt re-adds one when wrapping; otherwise we'd get
     # a double space between the chevron and the user's input cursor.
@@ -838,6 +858,10 @@ end
 function _chevron_postexec --on-event fish_postexec
     # Capture $status FIRST — every later command resets it.
     set -l exit_status $status
+    # Belt-and-suspenders flag clear: fish_prompt normally consumes it
+    # at the repaint, but an execute that skipped the repaint must not
+    # leave it armed for the next prompt.
+    set -e _chevron_transient_show
     # OSC 133 D: previous command finished.
     test "$CHEVRON_OSC133" != "0"; and printf '\e]133;D;%d\a' $exit_status
     # Command lifecycle finish event (chevron-1yn). Mirrors fish_preexec:
@@ -867,14 +891,40 @@ end
 # The deferred-event ordering matters here: `commandline -f` schedules
 # operations to run after the current binding returns, so the flag stays
 # set when fish_prompt fires for the repaint, then the execute follows.
+#
+# Collapse only when the line will actually execute (gating ported from
+# starship and oh-my-posh):
+#   - with the completion pager open, Enter selects an entry — never
+#     collapse;
+#   - an incomplete buffer (open quote, unterminated block) makes
+#     `execute` insert a newline instead of running — collapsing would
+#     strand a bare chevron over a buffer still being edited;
+#   - a syntactically valid or empty line really executes — collapse.
 function _chevron_transient_enter
-    set -g _chevron_transient_show 1
-    commandline -f repaint
+    if commandline --paging-mode
+        commandline -f execute
+        return
+    end
+    if commandline --is-valid; or test -z (commandline --current-buffer | string collect)
+        set -g _chevron_transient_show 1
+        commandline -f repaint
+    end
     commandline -f execute
+end
+# fish_prompt consumes the flag at the repaint; this covers paths where
+# that repaint never happens (line cancelled with ^C) so a stale flag
+# cannot collapse the NEXT prompt.
+function _chevron_transient_cancel --on-event fish_cancel
+    set -e _chevron_transient_show
 end
 if test "$CHEVRON_TRANSIENT" != "0"
     bind \r _chevron_transient_enter
     bind \n _chevron_transient_enter
+    # vi-mode users hit Enter from insert (and occasionally visual)
+    # mode; the default-mode binding above does not cover those maps.
+    bind -M insert \r _chevron_transient_enter
+    bind -M insert \n _chevron_transient_enter
+    bind -M visual \r _chevron_transient_enter
 end
 # Session id for the command-lifecycle hooks (chevron-1yn). Once per
 # fish process; stays unset when CHEVRON_HISTORY=0 so the hooks
@@ -1226,6 +1276,60 @@ mod tests {
         assert!(
             !pre.contains("stty -") && !pre.contains("$(stty"),
             "preexec must not duplicate the tty dance outside the helper"
+        );
+    }
+
+    #[test]
+    fn zsh_rewrite_only_after_real_collapse() {
+        // Alternate accept widgets (accept-and-hold, custom widgets
+        // calling .accept-line) bypass the override: the full prompt is
+        // still on screen, and a rewrite sized for the collapsed line
+        // would erase the wrong span over it. The row save (and with it
+        // the rewrite) must be gated on the collapse having painted.
+        let out = init_zsh();
+        let widget = body_of(&out, "_chevron_accept_line() {");
+        assert!(
+            widget.contains("_chevron_transient_collapsed=1"),
+            "accept-line override must record that the collapse painted"
+        );
+        let pre = body_of(&out, "_chevron_preexec() {");
+        assert!(
+            pre.contains(r#"-n "$_chevron_transient_collapsed""#),
+            "preexec row save must be gated on the collapse flag"
+        );
+        assert!(
+            out.contains("_chevron_transient_collapsed\n")
+                || out.contains("_chevron_transient_collapsed "),
+            "the flag must be cleared every cycle"
+        );
+    }
+
+    #[test]
+    fn zsh_async_reset_prompt_skips_ps2_continuations() {
+        // reset-prompt during a PS2 continuation corrupts the
+        // secondary-prompt state; the async callback must skip it there
+        // (the fresh PROMPT still applies at the next repaint).
+        let out = init_zsh();
+        assert!(
+            out.contains(r#"[[ "$CONTEXT" != "cont" ]] && zle reset-prompt"#),
+            "async callback must not reset-prompt during PS2"
+        );
+    }
+
+    #[test]
+    fn fish_transient_gates_on_validity_and_pager() {
+        // Ported from starship/oh-my-posh: Enter with the completion
+        // pager open selects an entry (never collapse); an incomplete
+        // buffer inserts a newline instead of executing (collapsing
+        // would strand a bare chevron over a live multiline edit); a
+        // cancelled line must drop the armed flag.
+        let out = init_fish();
+        assert!(out.contains("commandline --paging-mode"));
+        assert!(out.contains("commandline --is-valid"));
+        assert!(out.contains("--on-event fish_cancel"));
+        assert!(
+            out.contains(r"bind -M insert \r _chevron_transient_enter"),
+            "vi insert mode needs its own Enter binding"
         );
     }
 

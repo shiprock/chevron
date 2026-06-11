@@ -1969,6 +1969,87 @@ fn instant_prompt_paints_takes_over_and_restores_fds() {
     });
 }
 
+/// A line executed through a widget other than the overridden
+/// accept-line — accept-and-hold, accept-line-and-down-history, or any
+/// custom widget calling `.accept-line` directly. No collapse is
+/// painted, so the precmd rewrite (sized for `❯ cmd`) must not fire:
+/// it would erase the wrong span and paint a collapsed line over the
+/// still-visible full prompt.
+#[test]
+fn alternate_accept_widget_skips_rewrite() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.run("zle -A .accept-line direct-accept; bindkey '^O' direct-accept");
+    t.send("echo bypass-probe\x0f");
+    t.wait_for("bypassed line to execute and reprompt", |s| {
+        lines(s).iter().any(|l| l == "bypass-probe") && prompt_ready(s)
+    });
+    t.wait_settled(Duration::from_millis(300));
+
+    // Only the first (normally accepted) command may carry a chevron;
+    // the bypassed line keeps its full prompt, un-rewritten.
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        1,
+        "the bypassed line must not gain a collapsed chevron\n{}",
+        t.dump()
+    );
+    assert!(
+        t.with_screen(lines)
+            .iter()
+            .any(|l| l.contains(LIVE_PROMPT_MARK) && l.ends_with("echo bypass-probe")),
+        "the bypassed line's full prompt must stay intact\n{}",
+        t.dump()
+    );
+}
+
+/// The collapsed line exactly fills the terminal width (and exactly two
+/// rows) — the cursor ends in the auto-margin pending-wrap state, from
+/// which emulators disagree on how the following newline advances
+/// (ble.sh's "xenl" trap), so the saved row can be off by one. The
+/// rewrite painted a duplicated chevron one row down. It must skip
+/// instead: one neutral chevron per command, no duplicates.
+#[test]
+fn exact_width_input_skips_rewrite_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    // `❯ ` is 2 cells; the command fills the remaining 118 of 120.
+    let one_row = format!("true {}", "a".repeat(113));
+    assert_eq!(one_row.len() + 2, COLS as usize);
+    let two_rows = format!("true {}", "b".repeat(113 + COLS as usize));
+    t.run(&one_row);
+    t.run(&two_rows);
+    t.wait_settled(Duration::from_millis(200));
+
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        2,
+        "exactly one chevron per exact-width command, no duplicates\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(0),
+        vt100::Color::Default,
+        "ambiguous-row rewrite must be skipped, chevron neutral\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(1),
+        vt100::Color::Default,
+        "ambiguous-row rewrite must be skipped, chevron neutral\n{}",
+        t.dump()
+    );
+    assert!(
+        t.with_screen(prompt_ready),
+        "prompt must be intact below the collapsed lines\n{}",
+        t.dump()
+    );
+}
+
 /// `CHEVRON_TRANSIENT=0` is the documented escape hatch for terminals
 /// whose DSR handling misbehaves. It must mean what it says: zero
 /// cursor-position queries on the wire and no accept-line collapse.

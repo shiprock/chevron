@@ -106,6 +106,22 @@ verification):
   chain mid-function, and without the always-list the stty restore is
   skipped — terminal left raw with echo off, which the next exchange's
   `stty -g` save then makes permanent.
+- Rewrite only after a real collapse: alternate accept widgets
+  (accept-and-hold, custom widgets calling `.accept-line`) bypass the
+  override, leaving the FULL prompt on screen — a rewrite sized for
+  `❯ cmd` erases the wrong span over it. The row save is gated on a
+  flag the accept-line override sets.
+- Skip the rewrite when the transient's width is an exact multiple of
+  COLUMNS: the cursor ends in auto-margin pending-wrap, from which
+  emulators disagree on how the next newline advances (ble.sh's "xenl"
+  trap) — the saved row may be off by one (duplicated-chevron glitch).
+- Never `zle reset-prompt` from the async callback during a PS2
+  continuation (`$CONTEXT == cont`) — it corrupts the secondary-prompt
+  state; pure guards identically.
+- fish: collapse only when the line will execute — gate Enter on
+  `commandline --is-valid` / empty buffer and skip when
+  `--paging-mode` is active (Enter selects a completion); clear the
+  armed flag on `fish_cancel`. Ported from starship/oh-my-posh.
 
 ## Testing
 
