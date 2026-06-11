@@ -186,38 +186,48 @@ _chevron_query_row() {
     # suppression to the open; the fd allocated by exec persists anyway.
     { exec {fd}< /dev/tty } 2>/dev/null || return
     local _chevron_stty=$(stty -g 2>/dev/null)
-    stty -echo -icanon min 0 time 0 2>/dev/null
-    if zselect -t 0 -r $fd 2>/dev/null; then
+    local resp
+    # try/always: a ^C during the exchange — the zselect, the read, or
+    # a linger drain; windows up to 600 ms on a slow terminal — unwinds
+    # the whole hook chain mid-function. Without the always-block the
+    # stty restore and fd close are skipped: the terminal is left raw
+    # with echo off (typing invisible, interactive reads broken), and
+    # the NEXT exchange saves the wedged state via `stty -g` and
+    # faithfully re-restores it, making the wedge permanent. The
+    # always-list runs on interrupt as well as on every normal exit
+    # path, including the early return.
+    {
+        stty -echo -icanon min 0 time 0 2>/dev/null
+        if zselect -t 0 -r $fd 2>/dev/null; then
+            return
+        fi
+        printf '\e[6n' > /dev/tty 2>/dev/null
+        if IFS= read -u $fd -d 'R' -s -t 0.3 resp 2>/dev/null \
+            && [[ "$resp" == *$'\e['* ]]; then
+            _chevron_dsr_inflight=""
+            # Double-reporting emulator stacks answer twice; absorb the
+            # trailing duplicate now, while the tty is still raw.
+            _chevron_drain_reports $fd
+        else
+            # Timed out, or truncated by a typed `R` before the response
+            # arrived — either way the answer lands later, possibly while
+            # ZLE owns the terminal, where split arrival across KEYTIMEOUT
+            # lets its tail self-insert into the command line as literal
+            # text (`1R`). Flag it; precmd sweeps it out before the editor
+            # runs.
+            _chevron_dsr_inflight=1
+        fi
+        # Linger mode: this caller has no sweep point behind it, so absorb
+        # the straggler now, while -echo still holds. Restoring echo first
+        # would let the response kernel-echo at the cursor as `^[[68;1R`.
+        if [[ -n "$1" && -n "$_chevron_dsr_inflight" ]]; then
+            _chevron_drain_reports $fd "$1"
+            _chevron_dsr_inflight=""
+        fi
+    } always {
         [[ -n "$_chevron_stty" ]] && stty "$_chevron_stty" 2>/dev/null
         exec {fd}<&-
-        return
-    fi
-    printf '\e[6n' > /dev/tty 2>/dev/null
-    local resp
-    if IFS= read -u $fd -d 'R' -s -t 0.3 resp 2>/dev/null \
-        && [[ "$resp" == *$'\e['* ]]; then
-        _chevron_dsr_inflight=""
-        # Double-reporting emulator stacks answer twice; absorb the
-        # trailing duplicate now, while the tty is still raw.
-        _chevron_drain_reports $fd
-    else
-        # Timed out, or truncated by a typed `R` before the response
-        # arrived — either way the answer lands later, possibly while
-        # ZLE owns the terminal, where split arrival across KEYTIMEOUT
-        # lets its tail self-insert into the command line as literal
-        # text (`1R`). Flag it; precmd sweeps it out before the editor
-        # runs.
-        _chevron_dsr_inflight=1
-    fi
-    # Linger mode: this caller has no sweep point behind it, so absorb
-    # the straggler now, while -echo still holds. Restoring echo first
-    # would let the response kernel-echo at the cursor as `^[[68;1R`.
-    if [[ -n "$1" && -n "$_chevron_dsr_inflight" ]]; then
-        _chevron_drain_reports $fd "$1"
-        _chevron_dsr_inflight=""
-    fi
-    [[ -n "$_chevron_stty" ]] && stty "$_chevron_stty" 2>/dev/null
-    exec {fd}<&-
+    }
     if [[ "$resp" == *$'\e['* ]]; then
         local pre_esc="${resp%$'\e['*}"
         local payload="${resp##*$'\e['}"
@@ -320,10 +330,16 @@ _chevron_precmd() {
         # exec would make the 2>/dev/null permanent for the whole shell.
         if { exec {_chevron_sweep_fd}< /dev/tty } 2>/dev/null; then
             local _chevron_sweep_stty=$(stty -g 2>/dev/null)
-            stty -echo -icanon min 0 time 0 2>/dev/null
-            _chevron_drain_reports $_chevron_sweep_fd 30
-            [[ -n "$_chevron_sweep_stty" ]] && stty "$_chevron_sweep_stty" 2>/dev/null
-            exec {_chevron_sweep_fd}<&-
+            # Interrupt-safe for the same reason as _chevron_query_row:
+            # the 300 ms drain is a wide ^C target, and an unwound hook
+            # would otherwise leave the terminal raw with echo off.
+            {
+                stty -echo -icanon min 0 time 0 2>/dev/null
+                _chevron_drain_reports $_chevron_sweep_fd 30
+            } always {
+                [[ -n "$_chevron_sweep_stty" ]] && stty "$_chevron_sweep_stty" 2>/dev/null
+                exec {_chevron_sweep_fd}<&-
+            }
         fi
         _chevron_dsr_inflight=""
     fi
@@ -1210,6 +1226,26 @@ mod tests {
         assert!(
             !pre.contains("stty -") && !pre.contains("$(stty"),
             "preexec must not duplicate the tty dance outside the helper"
+        );
+    }
+
+    #[test]
+    fn zsh_tty_dances_are_interrupt_safe() {
+        // ^C during the exchange unwinds the hook chain mid-function;
+        // only an always-block guarantees the stty restore and fd close
+        // still run. Without it the terminal is left raw with echo off,
+        // and the next exchange's `stty -g` save makes the wedge
+        // permanent.
+        let out = init_zsh();
+        let query = body_of(&out, "_chevron_query_row() {");
+        assert!(
+            query.contains("} always {"),
+            "query helper must restore the tty via an always-block"
+        );
+        let precmd = body_of(&out, "_chevron_precmd() {");
+        assert!(
+            precmd.contains("} always {"),
+            "precmd sweep must restore the tty via an always-block"
         );
     }
 

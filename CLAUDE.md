@@ -101,6 +101,11 @@ verification):
   linger (drain in its own raw window) on timeout: unlike preexec's
   query there is no sweep behind it, and an unabsorbed straggler
   kernel-echoes at the cursor as literal `^[[68;1R`.
+- Every tty dance (raw flip through restore) sits in a `{ try } always
+  { restore }` block: ^C during the exchange or sweep unwinds the hook
+  chain mid-function, and without the always-list the stty restore is
+  skipped — terminal left raw with echo off, which the next exchange's
+  `stty -g` save then makes permanent.
 
 ## Testing
 

@@ -150,6 +150,13 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+fn count_subslices(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
 /// These are integration tests of the *zsh* init; environments without
 /// zsh (the nix build sandbox, minimal CI images) skip them — loudly —
 /// instead of failing at PTY spawn.
@@ -267,6 +274,21 @@ impl Term {
     }
 
     fn spawn_inner(dsr: Dsr, rows: u16, cols: u16, mode: Render) -> Self {
+        Self::spawn_customized(dsr, rows, cols, mode, |_, _| {})
+    }
+
+    /// Spawn with a fixture hook: `customize(home, path_dirs)` runs
+    /// after the default `.zshenv`/`.zshrc` are written and before zsh
+    /// starts. Tests use it to overwrite `.zshrc` (keep
+    /// `path=({path_dirs} $path)` so the test-built chevron wins over
+    /// /etc/zshenv) or to pre-seed cache files under the hermetic home.
+    fn spawn_customized(
+        dsr: Dsr,
+        rows: u16,
+        cols: u16,
+        mode: Render,
+        customize: impl FnOnce(&std::path::Path, &str),
+    ) -> Self {
         let home = tempfile::TempDir::new().unwrap();
         // macOS tempdirs live behind a /var -> /private/var symlink;
         // canonicalize so $HOME matches what getcwd() reports and the
@@ -310,6 +332,7 @@ impl Term {
             format!("path=({path_dirs} $path)\neval \"$(chevron init zsh)\"\n"),
         )
         .unwrap();
+        customize(&home_path, &path_dirs);
 
         let pty = native_pty_system();
         let pair = pty
@@ -444,6 +467,24 @@ impl Term {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if self.with_screen(&pred) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}\n{}",
+                self.dump()
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+
+    /// Like `wait_for`, but the predicate runs over the raw byte stream
+    /// — for syncing on emissions that never change the rendered grid
+    /// (OSC markers, DSR queries).
+    fn wait_for_raw(&self, what: &str, pred: impl Fn(&[u8]) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if pred(&self.raw.lock().unwrap()) {
                 return;
             }
             assert!(
@@ -1797,6 +1838,219 @@ fn slow_precmd_dsr_response_never_leaks() {
         t.with_screen(chevron_rows),
         vec!["\u{276f} true"],
         "{}",
+        t.dump()
+    );
+}
+
+/// ^C landing inside the precmd sweep's raw-mode window (the 300 ms
+/// drain paid on terminals that never answered preexec's query). The
+/// interrupt unwinds the hook chain mid-function; without an
+/// always-block the stty restore and fd close are skipped, leaving the
+/// terminal raw with echo off — and the NEXT exchange's `stty -g` save
+/// captures the wedged state and faithfully re-restores it, making the
+/// wedge permanent. The tty state after the interrupt must equal the
+/// state before it.
+#[test]
+fn ctrl_c_during_dsr_sweep_leaves_tty_sane() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Silent);
+    t.run("pre_stty=$(stty -g)");
+    t.send_line("true");
+    // precmd announces itself with the third OSC 133 D (spawn cycle,
+    // the stty capture, then `true`); the 300 ms sweep drain starts
+    // just after. Land the interrupt ~100 ms into it.
+    t.wait_for_raw("third OSC 133 D (precmd entered)", |raw| {
+        count_subslices(raw, b"\x1b]133;D") >= 3
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    t.send("\x03");
+    // The unwound precmd never reaches the prompt render, so zsh reuses
+    // the collapsed stub (`❯ `) as the next prompt — cosmetic, repaired
+    // by the next full cycle. Wait for output to settle, not for a full
+    // prompt.
+    t.wait_settled(Duration::from_millis(500));
+
+    t.send_line("[[ \"$(stty -g)\" == \"$pre_stty\" ]] && echo TTY-SANE || echo TTY-WEDGED");
+    t.wait_for("tty verdict", |s| {
+        lines(s)
+            .iter()
+            .any(|l| l == "TTY-SANE" || l == "TTY-WEDGED")
+    });
+    assert!(
+        t.with_screen(|s| lines(s).iter().any(|l| l == "TTY-SANE")),
+        "an interrupted sweep must still restore the tty\n{}",
+        t.dump()
+    );
+    // The cycle after the interrupt repaints the full prompt.
+    t.wait_for("full prompt to return", prompt_ready);
+}
+
+/// End-to-end instant prompt (chevron-nf8): the paste-in snippet paints
+/// the cached prompt before .zshrc finishes, buffers all .zshrc output,
+/// and the first precmd takes over — restoring fds, clearing the cached
+/// line, and replaying the buffer. The snippet had no PTY coverage at
+/// all, despite owning one of the stderr-nuking exec bugs.
+#[test]
+fn instant_prompt_paints_takes_over_and_restores_fds() {
+    if !zsh_available() {
+        return;
+    }
+    let snippet = std::process::Command::new(env!("CARGO_BIN_EXE_chevron"))
+        .args(["init", "zsh", "--instant-prompt"])
+        .output()
+        .unwrap();
+    assert!(snippet.status.success(), "init zsh --instant-prompt failed");
+    let snippet = String::from_utf8(snippet.stdout).unwrap();
+    let uid = String::from_utf8(
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let t = Term::spawn_customized(
+        Dsr::Immediate,
+        ROWS,
+        COLS,
+        Render::Sync,
+        move |home, path_dirs| {
+            // Pre-seed the cache the snippet reads: pwd line, zsh-shaped
+            // prompt body (must contain `%{`), tmux title line.
+            let cache_dir = home.join(format!("chevron-{uid}"));
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            std::fs::write(
+                cache_dir.join("last-prompt"),
+                format!(
+                    "{}\n%{{\x1b[32m%}}CACHED-INSTANT%{{\x1b[0m%}} \ntitle\n",
+                    home.display()
+                ),
+            )
+            .unwrap();
+            // The documented install: snippet at the very top, then the
+            // normal init. The echo runs while fds are buffered and must
+            // be replayed at takeover.
+            std::fs::write(
+                home.join(".zshrc"),
+                format!(
+                    "{snippet}\necho zshrc-noise\npath=({path_dirs} $path)\neval \"$(chevron init zsh)\"\n"
+                ),
+            )
+            .unwrap();
+        },
+    );
+    t.wait_settled(Duration::from_millis(200));
+
+    // The cached prompt was painted. The takeover clears that line, so
+    // assert on the raw stream, not the final grid.
+    assert!(
+        {
+            let raw = t.raw.lock().unwrap();
+            find_subslice(&raw, b"CACHED-INSTANT").is_some()
+        },
+        "cached prompt must be painted while .zshrc loads\n{}",
+        t.dump()
+    );
+    // Output produced while fds were redirected must be replayed.
+    assert!(
+        t.with_screen(lines).iter().any(|l| l == "zshrc-noise"),
+        ".zshrc output must be replayed at takeover\n{}",
+        t.dump()
+    );
+    // fds fully restored: stderr reaches the terminal afterwards.
+    t.send_line("ls /chevron-instant-probe");
+    t.wait_for("stderr to reach the terminal after takeover", |s| {
+        lines(s).iter().any(|l| l.starts_with("ls:"))
+    });
+}
+
+/// `CHEVRON_TRANSIENT=0` is the documented escape hatch for terminals
+/// whose DSR handling misbehaves. It must mean what it says: zero
+/// cursor-position queries on the wire and no accept-line collapse.
+#[test]
+fn transient_disabled_sends_no_dsr_queries() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_customized(
+        Dsr::Immediate,
+        ROWS,
+        COLS,
+        Render::Sync,
+        |home, path_dirs| {
+            std::fs::write(
+                home.join(".zshrc"),
+                format!(
+                    "path=({path_dirs} $path)\nexport CHEVRON_TRANSIENT=0\neval \"$(chevron init zsh)\"\n"
+                ),
+            )
+            .unwrap();
+        },
+    );
+    t.send_line("echo knob-probe");
+    t.wait_for("first command output", |s| {
+        lines(s).iter().any(|l| l == "knob-probe") && prompt_ready(s)
+    });
+    t.send_line("echo knob-two");
+    t.wait_for("second command output", |s| {
+        lines(s).iter().any(|l| l == "knob-two") && prompt_ready(s)
+    });
+    t.wait_settled(Duration::from_millis(300));
+
+    assert!(
+        {
+            let raw = t.raw.lock().unwrap();
+            find_subslice(&raw, DSR_QUERY).is_none()
+        },
+        "CHEVRON_TRANSIENT=0 must suppress every DSR query\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        0,
+        "no transient collapse with the feature off\n{}",
+        t.dump()
+    );
+}
+
+/// `CHEVRON_OSC133=0` must silence every OSC 133 marker: A/B around the
+/// prompt, C at command start, D at command end — including the copies
+/// inside the transient rewrite.
+#[test]
+fn osc133_disabled_emits_no_markers() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_customized(
+        Dsr::Immediate,
+        ROWS,
+        COLS,
+        Render::Sync,
+        |home, path_dirs| {
+            std::fs::write(
+                home.join(".zshrc"),
+                format!(
+                    "path=({path_dirs} $path)\nexport CHEVRON_OSC133=0\neval \"$(chevron init zsh)\"\n"
+                ),
+            )
+            .unwrap();
+        },
+    );
+    t.run("echo osc-probe");
+    t.run("false");
+    t.wait_settled(Duration::from_millis(300));
+
+    assert!(
+        {
+            let raw = t.raw.lock().unwrap();
+            find_subslice(&raw, b"\x1b]133").is_none()
+        },
+        "CHEVRON_OSC133=0 must suppress every OSC 133 emission\n{}",
         t.dump()
     );
 }
