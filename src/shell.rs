@@ -546,6 +546,14 @@ _chevron_async_callback() {
     # the result describes a previous cycle — drop it; the newer cycle
     # owns the prompt now. (The fd is already closed above either way.)
     [[ "$_chevron_async_spawn_gen" == "$_chevron_async_gen" ]] || return
+    # The generation only bumps in precmd, so a refresh landing in the
+    # accept window — after the collapse painted, before the next
+    # precmd — passes the guard above, and its reset-prompt would draw
+    # a fresh full prompt over the just-collapsed line (chevron-6tc).
+    # The result describes a finished cycle and the next precmd
+    # re-renders regardless; the collapse flag brackets exactly that
+    # window, so drop the result there.
+    [[ -n "$_chevron_transient_collapsed" ]] && return
     if [[ -n "$fresh" ]]; then
         _chevron_make_prompt "${fresh%%$'\n'*}"
         PROMPT="$REPLY"
@@ -1313,6 +1321,29 @@ mod tests {
         assert!(
             out.contains(r#"[[ "$CONTEXT" != "cont" ]] && zle reset-prompt"#),
             "async callback must not reset-prompt during PS2"
+        );
+    }
+
+    #[test]
+    fn zsh_async_callback_drops_results_in_accept_window() {
+        // The generation stamp only advances in precmd, so a refresh
+        // landing between accept-line and the next precmd passes the
+        // stale guard — and repainting there draws a full prompt over
+        // the just-collapsed line (chevron-6tc). The collapse flag
+        // brackets that window; the callback must drop results inside
+        // it, before any PROMPT mutation.
+        let out = init_zsh();
+        let cb = body_of(&out, "_chevron_async_callback() {");
+        let gen_guard = cb
+            .find("_chevron_async_spawn_gen")
+            .expect("generation stale guard");
+        let collapse_guard = cb
+            .find(r#"-n "$_chevron_transient_collapsed" ]] && return"#)
+            .expect("accept-window guard");
+        let prompt_set = cb.find("PROMPT=").expect("PROMPT assignment");
+        assert!(
+            gen_guard < collapse_guard && collapse_guard < prompt_set,
+            "accept-window guard must sit between the stale guard and the repaint"
         );
     }
 

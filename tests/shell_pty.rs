@@ -1018,11 +1018,18 @@ fn resize_during_command_skips_rewrite() {
     // Wide enough to wrap at 120 cols (2 rows) — and at the post-resize
     // 60 cols the naive span recompute says 3 rows, one of which is the
     // sentinel.
-    let wide = format!("sleep 0.4 && : {}", "x".repeat(133));
+    let wide = format!("sleep 1 && : {}", "x".repeat(133));
     t.send_line(&wide);
-    // Collapse + preexec query finish in milliseconds; the resize lands
-    // squarely inside the sleep.
-    std::thread::sleep(Duration::from_millis(200));
+    // Anchor the resize to the command actually starting — preexec's
+    // OSC 133 C on the wire (one per command; this is the second) —
+    // rather than a fixed test-thread sleep: a loaded parallel run can
+    // starve the shell past any fixed budget, landing the resize before
+    // the command starts and stamping a consistent post-resize geometry
+    // (so the guard legitimately doesn't fire and the test lies).
+    t.wait_for_raw("wide command to start", |raw| {
+        count_subslices(raw, b"\x1b]133;C") >= 2
+    });
+    std::thread::sleep(Duration::from_millis(100));
     t.resize(24, 60);
     t.wait_for("reprompt after mid-command resize", prompt_ready);
     t.wait_settled(Duration::from_millis(200));
@@ -1610,6 +1617,51 @@ fn async_rapid_typeahead_stays_consistent() {
     );
 }
 
+/// chevron-6tc: a background refresh landing in the accept window —
+/// after accept-line paints the collapsed stub but before the next
+/// precmd bumps the generation — is NOT stale by the generation guard
+/// (the bump hasn't happened yet), so its `zle reset-prompt` repaints
+/// over the collapse and the cycle shows a duplicated line. Sweep the
+/// Enter timing across the refresh's ~150 ms arrival so some cycle
+/// lands inside the window; every cycle must still collapse to exactly
+/// one chevron row.
+#[test]
+fn async_refresh_at_accept_never_duplicates() {
+    if !zsh_available() {
+        return;
+    }
+    // 48 rows: 16 two-row cycles must all stay on screen for the final
+    // glyph count (the default 24 rows scrolls early cycles away).
+    let t = Term::spawn_inner(
+        Dsr::Immediate,
+        48,
+        COLS,
+        Render::AsyncDelayed(Duration::from_millis(150)),
+    );
+    let offsets: [u64; 16] = [
+        110, 130, 137, 140, 143, 146, 149, 152, 155, 158, 161, 164, 167, 170, 180, 195,
+    ];
+    for (i, off) in offsets.iter().enumerate() {
+        // The refresh for the prompt on screen was spawned by the
+        // precmd that painted it; varying the typing offset sweeps the
+        // race window around its arrival.
+        std::thread::sleep(Duration::from_millis(*off));
+        let marker = format!("c{i}-out");
+        t.send_line(&format!("echo {marker}"));
+        t.wait_for("cycle output and reprompt", move |s| {
+            lines(s).iter().any(|l| l == &marker) && prompt_ready(s)
+        });
+    }
+    t.wait_settled(Duration::from_millis(500));
+
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        offsets.len(),
+        "every cycle must keep exactly one collapsed chevron\n{}",
+        t.dump()
+    );
+}
+
 /// tmux/SSH-grade latency that still fits the 300 ms read budget: the
 /// rewrite must work exactly as in the immediate case.
 #[test]
@@ -1776,18 +1828,17 @@ fn paste_leftovers_during_interactive_read_stay_clean() {
     t.wait_for("read to finish with the key intact", |s| {
         lines(s).iter().any(|l| l.contains("len-10"))
     });
-    t.wait_settled(Duration::from_millis(400));
+    // Poll for the parked leftovers rather than settle-then-assert: on
+    // a loaded parallel run, a 400 ms quiet window can elapse while the
+    // starved shell still has the typeahead pop pending.
+    t.wait_for("paste leftovers parked in the edit buffer", |s| {
+        last_nonempty(s).ends_with("TRAILR-MORE")
+    });
 
     let all = t.with_screen(lines);
     assert!(
         all.iter().all(|l| !l.contains(";1") && !l.contains("^[")),
         "no DSR response may leak as literal text\n{}",
-        t.dump()
-    );
-    let prompt_row = t.with_screen(last_nonempty);
-    assert!(
-        prompt_row.ends_with("TRAILR-MORE"),
-        "paste leftovers must reach the edit buffer intact, not be eaten\n{}",
         t.dump()
     );
 }

@@ -491,25 +491,34 @@ mod tests {
 
         // The listener ACKs lifecycle events as soon as they're queued
         // for the state actor — actual SQLite commit happens
-        // asynchronously on the state thread. Flush by issuing a
-        // STATUS request: the actor processes messages in mpsc order,
-        // so once the STATUS reply lands, the earlier CmdStart and
-        // CmdEnd have been processed. More robust than a sleep under
-        // load (the original Phase 1 test was flaky in 5x-stress
-        // pre-push runs).
-        let _ = try_query_patient(dir.path());
-
-        // Use a fresh read-only connection so the actor's writer-side
-        // WAL state still flushes our row to readers. WAL allows
-        // concurrent reads against an open writer.
+        // asynchronously on the state thread. The earlier "flush by
+        // STATUS request" barrier here was illusory: for a non-repo
+        // path (the socket tempdir) handle_status short-circuits in the
+        // LISTENER and never traverses the actor queue, so under a
+        // loaded parallel run the row could still be in flight when we
+        // read the DB directly (chevron-8q7). Poll with a deadline
+        // instead of trusting a barrier; each query_row is its own WAL
+        // read transaction, so a fresh snapshot is taken every retry.
+        // finished_at IS NOT NULL also waits out the intermediate
+        // CmdStart-only state (finished_at would read as NULL).
         let conn = rusqlite::Connection::open(dir.path().join("commands.db")).unwrap();
-        let (cmd, finished_at, exit_status): (String, i64, i64) = conn
-            .query_row(
-                "SELECT cmd, finished_at, exit_status FROM commands WHERE id = ?1",
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (cmd, finished_at, exit_status): (String, i64, i64) = loop {
+            match conn.query_row(
+                "SELECT cmd, finished_at, exit_status FROM commands \
+                 WHERE id = ?1 AND finished_at IS NOT NULL",
                 ["test-cmd-1"],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
+            ) {
+                Ok(row) => break row,
+                Err(rusqlite::Error::QueryReturnedNoRows)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("command row never landed: {e}"),
+            }
+        };
         assert_eq!(cmd, "echo 'hi  there'");
         assert_eq!(finished_at, 250);
         assert_eq!(exit_status, 0);
