@@ -663,6 +663,20 @@ _chevron_live_callback() {
     # The subscriber filters PINGs out, so we should only see EVENT
     # lines here — but guard defensively in case of future changes.
     [[ "$line" != EVENT* ]] && return
+    # Scope (chevron-ffu.3). By default redraw only for events in the
+    # current repo, so N shells across M repos don't all re-render on one
+    # repo's change. The daemon's own cwd filter is exact-match (useless
+    # from a subdirectory), so we filter here against live $PWD — which
+    # also makes `cd` Just Work with no re-subscribe. CHEVRON_LIVE_SCOPE=all
+    # opts back into cross-repo events (the cross-pane case, chevron-i1h).
+    if [[ "${CHEVRON_LIVE_SCOPE:-cwd}" != all && "$line" == *cwd=* ]]; then
+        local _ev_cwd="${line#*cwd=}"; _ev_cwd="${_ev_cwd%% *}"
+        # cwd is percent-encoded on the wire; decode only when needed.
+        [[ "$_ev_cwd" == *%* ]] && _ev_cwd=$(printf '%b' "${_ev_cwd//\%/\\x}")
+        # Redraw only when $PWD is inside the event's workdir. Trailing
+        # slashes guard the /repo-vs-/repo2 prefix trap.
+        [[ "$PWD/" == "${_ev_cwd%/}/"* ]] || return
+    fi
     # Debounce. A single `git commit` fires several FS events that the
     # daemon coalesces per workdir, but bursts from `git rebase` etc.
     # can still produce a handful within ms of each other. One redraw
@@ -971,6 +985,7 @@ fn shell_preamble_posix(cfg: &ShellConfig) -> String {
     write_posix_default(&mut out, "CHEVRON_ASYNC", bool_to_shell(cfg.async_render));
     write_posix_default(&mut out, "CHEVRON_HISTORY", bool_to_shell(cfg.history));
     write_posix_default(&mut out, "CHEVRON_LIVE", bool_to_shell(cfg.live));
+    write_posix_default(&mut out, "CHEVRON_LIVE_SCOPE", "cwd");
     out.push('\n');
     out
 }
@@ -997,6 +1012,7 @@ fn shell_preamble_fish(cfg: &ShellConfig) -> String {
     write_fish_default(&mut out, "CHEVRON_ASYNC", bool_to_shell(cfg.async_render));
     write_fish_default(&mut out, "CHEVRON_HISTORY", bool_to_shell(cfg.history));
     write_fish_default(&mut out, "CHEVRON_LIVE", bool_to_shell(cfg.live));
+    write_fish_default(&mut out, "CHEVRON_LIVE_SCOPE", "cwd");
     out.push('\n');
     out
 }
@@ -1030,6 +1046,7 @@ mod tests {
         assert!(out.contains("export CHEVRON_ASYNC=\"${CHEVRON_ASYNC-0}\""));
         assert!(out.contains("export CHEVRON_HISTORY=\"${CHEVRON_HISTORY-1}\""));
         assert!(out.contains("export CHEVRON_LIVE=\"${CHEVRON_LIVE-0}\""));
+        assert!(out.contains("export CHEVRON_LIVE_SCOPE=\"${CHEVRON_LIVE_SCOPE-cwd}\""));
     }
 
     #[test]
@@ -2387,6 +2404,30 @@ mod tests {
         assert!(
             body.contains("zle -F \"$fd\""),
             "callback should call `zle -F fd` (no handler) on EOF to unregister"
+        );
+    }
+
+    #[test]
+    fn zsh_live_callback_scopes_redraws_to_cwd_by_default() {
+        // Without scoping, every shell re-renders on every repo's events
+        // (thundering herd). The callback must filter EVENT lines against
+        // $PWD unless the user opted into cross-repo liveness for the
+        // cross-pane case (CHEVRON_LIVE_SCOPE=all).
+        let out = init_zsh();
+        let cb_start = out.find("_chevron_live_callback() {").unwrap();
+        let cb_end = out[cb_start..].find("\n}\n").map(|i| cb_start + i).unwrap();
+        let body = &out[cb_start..cb_end];
+        assert!(
+            body.contains("CHEVRON_LIVE_SCOPE"),
+            "live callback must honor the scope knob"
+        );
+        assert!(
+            body.contains("!= all"),
+            "scope must be opt-out-able via CHEVRON_LIVE_SCOPE=all (cross-pane)"
+        );
+        assert!(
+            body.contains(r#""$PWD/" == "#),
+            "scoped filter must redraw only when $PWD is inside the event workdir"
         );
     }
 
