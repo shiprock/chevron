@@ -2214,6 +2214,231 @@ fn git_in(dir: &std::path::Path, args: &[&str]) {
     );
 }
 
+#[cfg(feature = "daemon")]
+use chevron::daemon::{
+    listener,
+    proto::{CmdEndEvent, CmdStartEvent},
+    state::{self, StateMsg},
+};
+#[cfg(feature = "daemon")]
+use std::os::unix::net::UnixListener;
+
+/// An in-process chevrond on a hermetic socket plus a live (`CHEVRON_LIVE=1`)
+/// zsh whose `$HOME` is a one-commit git repo on branch `base`. Keeps
+/// `state_tx` so a test can inject daemon events deterministically.
+#[cfg(feature = "daemon")]
+struct LiveFixture {
+    term: Term,
+    home: std::path::PathBuf,
+    state_tx: std::sync::mpsc::Sender<StateMsg>,
+    // Owns the socket dir; declared last so it outlives `term` on drop.
+    sockdir: tempfile::TempDir,
+}
+
+#[cfg(feature = "daemon")]
+impl LiveFixture {
+    fn spawn() -> Self {
+        let sockdir = tempfile::TempDir::new().unwrap();
+        let state_tx = Self::start_daemon(sockdir.path());
+
+        let home_slot = Arc::new(Mutex::new(std::path::PathBuf::new()));
+        let socket_dir = sockdir.path().to_path_buf();
+        let home_out = Arc::clone(&home_slot);
+        let term = Term::spawn_customized(
+            Dsr::Immediate,
+            ROWS,
+            COLS,
+            Render::Sync,
+            move |home, path_dirs| {
+                git_in(home, &["init", "-q", "-b", "base"]);
+                git_in(home, &["config", "user.email", "t@example.com"]);
+                git_in(home, &["config", "user.name", "chevron-test"]);
+                git_in(home, &["commit", "-q", "--allow-empty", "-m", "init"]);
+                std::fs::write(
+                    home.join(".zshrc"),
+                    format!(
+                        "path=({path_dirs} $path)\n\
+                         export CHEVRON_SOCKET_DIR=\"{sd}\"\n\
+                         export CHEVRON_LIVE=1\n\
+                         unset CHEVRON_NO_DAEMON\n\
+                         eval \"$(chevron init zsh)\"\n",
+                        sd = socket_dir.display()
+                    ),
+                )
+                .unwrap();
+                *home_out.lock().unwrap() = home.to_path_buf();
+            },
+        );
+        let home = home_slot.lock().unwrap().clone();
+        let fx = Self {
+            term,
+            home,
+            state_tx,
+            sockdir,
+        };
+        fx.term.wait_for("initial prompt on branch `base`", |s| {
+            lines(s).iter().any(|l| l.contains("base"))
+        });
+        fx
+    }
+
+    /// Bind a fresh listener + state actor at `dir/chevrond.sock`.
+    fn start_daemon(dir: &std::path::Path) -> std::sync::mpsc::Sender<StateMsg> {
+        let listener_sock = UnixListener::bind(dir.join("chevrond.sock")).unwrap();
+        let db = state::open_db(dir).unwrap();
+        let (state_tx, _join) = state::spawn(state::TTL, db).unwrap();
+        let serve_tx = state_tx.clone();
+        std::thread::spawn(move || listener::serve_loop(&listener_sock, &serve_tx));
+        state_tx
+    }
+
+    /// Stop the daemon and bring a fresh one up on the same socket. Shutting
+    /// the state actor down drops its subscriber senders, so the helper's
+    /// relay sees EOF and chevron-1mh's reconnect kicks in. The old listener
+    /// thread is left stuck accepting a now-unlinked socket — it leaks
+    /// harmlessly and the test process reaps it at exit.
+    fn restart_daemon(&mut self) {
+        let _ = self.state_tx.send(StateMsg::Shutdown);
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = std::fs::remove_file(self.sockdir.path().join("chevrond.sock"));
+        self.state_tx = Self::start_daemon(self.sockdir.path());
+    }
+
+    /// Fire a git `FsEvent` for `$HOME` (its gitdir watch was registered by the
+    /// initial prompt's status query).
+    fn fire_home_git_event(&self) {
+        let head = self.home.join(".git").join("HEAD");
+        let _ = self.state_tx.send(StateMsg::FsEvent(vec![head]));
+    }
+
+    /// Inject a synthetic command-lifecycle event whose broadcast cwd is
+    /// `cwd` — any path, no gitdir watch required. The daemon looks the cwd
+    /// up from the `CmdStart` row and broadcasts a `cmd` EVENT, which is what
+    /// the live callback's cwd-scope filter keys on.
+    fn fire_cmd_event(&self, cwd: &std::path::Path) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let id = format!("evt{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        self.state_tx
+            .send(StateMsg::CmdStart(CmdStartEvent {
+                id: id.clone(),
+                session_id: "test".to_string(),
+                hostname: "test".to_string(),
+                cwd: cwd.to_path_buf(),
+                cmd: "true".to_string(),
+                started_at_ms: 0,
+            }))
+            .unwrap();
+        self.state_tx
+            .send(StateMsg::CmdEnd(CmdEndEvent {
+                id,
+                finished_at_ms: 0,
+                duration_ms: 0,
+                exit_status: 0,
+                output_bytes: None,
+                output_truncated: None,
+            }))
+            .unwrap();
+    }
+
+    /// True if any rendered row contains `needle`.
+    fn screen_has(&self, needle: &str) -> bool {
+        self.term
+            .with_screen(|s| lines(s).iter().any(|l| l.contains(needle)))
+    }
+
+    /// Re-run `fire` each tick until `pred` holds over the screen, or panic
+    /// with a dump. Re-firing covers the subscriber's async attach and the
+    /// callback's 100 ms debounce.
+    fn drive_until(&self, fire: impl Fn(), what: &str, pred: impl Fn(&vt100::Screen) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            fire();
+            if self.term.with_screen(&pred) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}\n{}",
+                self.term.dump()
+            );
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+}
+
+/// chevron-ffu.6: a cwd-scoped shell must ignore other repos' events while
+/// still redrawing for its own. Bites the ffu.3 cwd filter.
+#[test]
+#[ignore = "daemon-backed live-loop e2e; shake out in CI (chevron-ffu.6)"]
+#[cfg(feature = "daemon")]
+fn live_prompt_ignores_cross_repo_events_when_scoped() {
+    let fx = LiveFixture::spawn();
+
+    // Confirm the subscriber is attached and live: an own-repo event redraws.
+    git_in(&fx.home, &["checkout", "-q", "-b", "warmup"]);
+    fx.drive_until(
+        || fx.fire_home_git_event(),
+        "warmup redraw confirming the subscriber is live",
+        |s| lines(s).iter().any(|l| l.contains("warmup")),
+    );
+
+    // Stage a change a redraw WOULD surface, but never fire $HOME's event.
+    git_in(&fx.home, &["checkout", "-q", "-b", "scopedout"]);
+
+    // Hammer foreign-repo cmd events. With the default CHEVRON_LIVE_SCOPE=cwd
+    // the callback must filter these — the prompt must NOT pick up the branch.
+    let foreign = std::path::Path::new("/no/such/other-repo");
+    let until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < until {
+        fx.fire_cmd_event(foreign);
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    assert!(
+        !fx.screen_has("scopedout"),
+        "a cross-repo event leaked a redraw past the cwd-scope filter\n{}",
+        fx.term.dump()
+    );
+
+    // Liveness intact: the shell still redraws for its OWN repo's events.
+    fx.drive_until(
+        || fx.fire_home_git_event(),
+        "own-repo redraw after the scoped-out foreign burst",
+        |s| lines(s).iter().any(|l| l.contains("scopedout")),
+    );
+}
+
+/// chevron-ffu.5: the live prompt survives a daemon restart — a post-restart
+/// event still redraws, proving the helper reconnected (chevron-1mh).
+#[test]
+#[ignore = "daemon-backed live-loop e2e; shake out in CI (chevron-ffu.5)"]
+#[cfg(feature = "daemon")]
+fn live_prompt_survives_daemon_restart() {
+    let mut fx = LiveFixture::spawn();
+
+    // Liveness before the restart.
+    git_in(&fx.home, &["checkout", "-q", "-b", "before"]);
+    fx.drive_until(
+        || fx.fire_home_git_event(),
+        "redraw before the restart",
+        |s| lines(s).iter().any(|l| l.contains("before")),
+    );
+
+    // Drop the daemon and bring a fresh one up on the same socket.
+    fx.restart_daemon();
+
+    // A post-restart event must still redraw — only possible if the helper
+    // reconnected. Use a cmd event (cwd=$HOME) so we don't depend on the new
+    // daemon re-registering the gitdir watch.
+    git_in(&fx.home, &["checkout", "-q", "-b", "afterrestart"]);
+    let home = fx.home.clone();
+    fx.drive_until(
+        || fx.fire_cmd_event(&home),
+        "redraw after the daemon restart (reconnect)",
+        |s| lines(s).iter().any(|l| l.contains("afterrestart")),
+    );
+}
+
 /// End-to-end proof that the dark-launched live prompt redraws on a
 /// chevrond event with NO keystroke (chevron-ffu.1).
 ///
@@ -2236,86 +2461,14 @@ fn git_in(dir: &std::path::Path, args: &[&str]) {
 #[ignore = "daemon-backed live-loop e2e; shake out in CI before un-ignoring (chevron-ffu.1)"]
 #[cfg(feature = "daemon")]
 fn live_prompt_redraws_on_daemon_event() {
-    use chevron::daemon::{listener, state};
-    use std::os::unix::net::UnixListener;
-
-    // In-process chevrond on a hermetic socket. We keep `state_tx` so the
-    // test can inject events; a clone drives the accept loop.
-    let sockdir = tempfile::TempDir::new().unwrap();
-    let listener_sock = UnixListener::bind(sockdir.path().join("chevrond.sock")).unwrap();
-    let db = state::open_db(sockdir.path()).unwrap();
-    let (state_tx, _state_join) = state::spawn(state::TTL, db).unwrap();
-    {
-        let serve_tx = state_tx.clone();
-        std::thread::spawn(move || listener::serve_loop(&listener_sock, &serve_tx));
-    }
-
-    // The harness owns its hermetic $HOME; hand it back out of the closure
-    // so the test can mutate the repo once the shell is up.
-    let home_slot = Arc::new(Mutex::new(std::path::PathBuf::new()));
-    let socket_dir = sockdir.path().to_path_buf();
-    let home_out = Arc::clone(&home_slot);
-
-    let t = Term::spawn_customized(
-        Dsr::Immediate,
-        ROWS,
-        COLS,
-        Render::Sync,
-        move |home, path_dirs| {
-            // $HOME becomes a one-commit git repo on a known branch.
-            git_in(home, &["init", "-q", "-b", "base"]);
-            git_in(home, &["config", "user.email", "t@example.com"]);
-            git_in(home, &["config", "user.name", "chevron-test"]);
-            git_in(home, &["commit", "-q", "--allow-empty", "-m", "init"]);
-            // Point chevron at OUR daemon, turn the live subscriber on, and
-            // clear the harness's daemon opt-out — all before the init eval
-            // so CHEVRON_LIVE is set when the subscriber spawn block runs.
-            std::fs::write(
-                home.join(".zshrc"),
-                format!(
-                    "path=({path_dirs} $path)\n\
-                     export CHEVRON_SOCKET_DIR=\"{sd}\"\n\
-                     export CHEVRON_LIVE=1\n\
-                     unset CHEVRON_NO_DAEMON\n\
-                     eval \"$(chevron init zsh)\"\n",
-                    sd = socket_dir.display()
-                ),
-            )
-            .unwrap();
-            *home_out.lock().unwrap() = home.to_path_buf();
-        },
+    let fx = LiveFixture::spawn();
+    // Switch the branch on disk — NO shell input — then drive daemon events
+    // until the prompt repaints. The new branch reaches the screen only via
+    // subscribe -> zle -F -> async render -> reset-prompt.
+    git_in(&fx.home, &["checkout", "-q", "-b", "livebranch"]);
+    fx.drive_until(
+        || fx.fire_home_git_event(),
+        "the prompt to redraw to the new branch with an untouched keyboard",
+        |s| lines(s).iter().any(|l| l.contains("livebranch")),
     );
-
-    let home = home_slot.lock().unwrap().clone();
-
-    // Sanity: the initial prompt rendered the git segment on `base`.
-    t.wait_for("initial prompt on branch `base`", |s| {
-        lines(s).iter().any(|l| l.contains("base"))
-    });
-
-    // Switch the branch on disk — NO shell input. .git/HEAD now points at
-    // refs/heads/livebranch.
-    git_in(&home, &["checkout", "-q", "-b", "livebranch"]);
-
-    // Drive daemon events until the prompt repaints to the new branch. We
-    // re-inject: the subscriber attaches asynchronously during init, so a
-    // one-shot event fired before it connects would be lost; the callback
-    // debounces extras at 100 ms.
-    let head = home.join(".git").join("HEAD");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        state_tx
-            .send(state::StateMsg::FsEvent(vec![head.clone()]))
-            .unwrap();
-        if t.with_screen(|s| lines(s).iter().any(|l| l.contains("livebranch"))) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "live prompt never redrew to the new branch without input \
-             (subscribe -> zle -F -> async render -> reset-prompt)\n{}",
-            t.dump()
-        );
-        std::thread::sleep(Duration::from_millis(150));
-    }
 }
