@@ -2186,3 +2186,136 @@ fn osc133_disabled_emits_no_markers() {
         t.dump()
     );
 }
+
+// ── chevron-ffu.1: daemon-backed live-loop e2e ─────────────────────────
+//
+// The zsh live subscriber (CHEVRON_LIVE=1, src/shell.rs:689) shipped dark
+// because every other PTY test runs CHEVRON_NO_DAEMON=1 and never stands up
+// a daemon, so the event -> redraw path had zero end-to-end coverage. This
+// is the test mode that closes that gap and gates flipping the default on
+// (the parent epic, chevron-ffu).
+
+/// Run `git <args>` in `dir` with a hermetic config (no user/system
+/// gitconfig leaking in), asserting success.
+#[cfg(feature = "daemon")]
+fn git_in(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// End-to-end proof that the dark-launched live prompt redraws on a
+/// chevrond event with NO keystroke (chevron-ffu.1).
+///
+/// Stands up an in-process chevrond on a hermetic socket, makes `$HOME` a
+/// one-commit git repo on branch `base`, and launches an interactive zsh
+/// wired to that daemon with the live subscriber on. Then — without
+/// sending any input — it switches the on-disk branch to `livebranch` and
+/// injects `FsEvent`s until the prompt repaints. The new branch can reach
+/// the screen only via `chevron subscribe` -> `zle -F` -> async render ->
+/// `reset-prompt`, so its appearance with an untouched keyboard proves the
+/// event-driven redraw path end to end.
+///
+/// `#[ignore]`d pending shake-out across terminals/CI — that hardening *is*
+/// the parent epic (chevron-ffu). Run explicitly with:
+///
+/// ```text
+/// cargo test --test shell_pty -- --ignored live_prompt_redraws_on_daemon_event
+/// ```
+#[test]
+#[ignore = "daemon-backed live-loop e2e; shake out in CI before un-ignoring (chevron-ffu.1)"]
+#[cfg(feature = "daemon")]
+fn live_prompt_redraws_on_daemon_event() {
+    use chevron::daemon::{listener, state};
+    use std::os::unix::net::UnixListener;
+
+    // In-process chevrond on a hermetic socket. We keep `state_tx` so the
+    // test can inject events; a clone drives the accept loop.
+    let sockdir = tempfile::TempDir::new().unwrap();
+    let listener_sock = UnixListener::bind(sockdir.path().join("chevrond.sock")).unwrap();
+    let db = state::open_db(sockdir.path()).unwrap();
+    let (state_tx, _state_join) = state::spawn(state::TTL, db).unwrap();
+    {
+        let serve_tx = state_tx.clone();
+        std::thread::spawn(move || listener::serve_loop(&listener_sock, &serve_tx));
+    }
+
+    // The harness owns its hermetic $HOME; hand it back out of the closure
+    // so the test can mutate the repo once the shell is up.
+    let home_slot = Arc::new(Mutex::new(std::path::PathBuf::new()));
+    let socket_dir = sockdir.path().to_path_buf();
+    let home_out = Arc::clone(&home_slot);
+
+    let t = Term::spawn_customized(
+        Dsr::Immediate,
+        ROWS,
+        COLS,
+        Render::Sync,
+        move |home, path_dirs| {
+            // $HOME becomes a one-commit git repo on a known branch.
+            git_in(home, &["init", "-q", "-b", "base"]);
+            git_in(home, &["config", "user.email", "t@example.com"]);
+            git_in(home, &["config", "user.name", "chevron-test"]);
+            git_in(home, &["commit", "-q", "--allow-empty", "-m", "init"]);
+            // Point chevron at OUR daemon, turn the live subscriber on, and
+            // clear the harness's daemon opt-out — all before the init eval
+            // so CHEVRON_LIVE is set when the subscriber spawn block runs.
+            std::fs::write(
+                home.join(".zshrc"),
+                format!(
+                    "path=({path_dirs} $path)\n\
+                     export CHEVRON_SOCKET_DIR=\"{sd}\"\n\
+                     export CHEVRON_LIVE=1\n\
+                     unset CHEVRON_NO_DAEMON\n\
+                     eval \"$(chevron init zsh)\"\n",
+                    sd = socket_dir.display()
+                ),
+            )
+            .unwrap();
+            *home_out.lock().unwrap() = home.to_path_buf();
+        },
+    );
+
+    let home = home_slot.lock().unwrap().clone();
+
+    // Sanity: the initial prompt rendered the git segment on `base`.
+    t.wait_for("initial prompt on branch `base`", |s| {
+        lines(s).iter().any(|l| l.contains("base"))
+    });
+
+    // Switch the branch on disk — NO shell input. .git/HEAD now points at
+    // refs/heads/livebranch.
+    git_in(&home, &["checkout", "-q", "-b", "livebranch"]);
+
+    // Drive daemon events until the prompt repaints to the new branch. We
+    // re-inject: the subscriber attaches asynchronously during init, so a
+    // one-shot event fired before it connects would be lost; the callback
+    // debounces extras at 100 ms.
+    let head = home.join(".git").join("HEAD");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        state_tx
+            .send(state::StateMsg::FsEvent(vec![head.clone()]))
+            .unwrap();
+        if t.with_screen(|s| lines(s).iter().any(|l| l.contains("livebranch"))) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "live prompt never redrew to the new branch without input \
+             (subscribe -> zle -F -> async render -> reset-prompt)\n{}",
+            t.dump()
+        );
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
