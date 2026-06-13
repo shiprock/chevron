@@ -2319,11 +2319,23 @@ impl LiveFixture {
         state_tx
     }
 
-    /// Stop the daemon and bring a fresh one up on the same socket. Shutting
-    /// the state actor down drops its subscriber senders, so the helper's
-    /// relay sees EOF and chevron-1mh's reconnect kicks in. The old listener
-    /// thread is left stuck accepting a now-unlinked socket — it leaks
-    /// harmlessly and the test process reaps it at exit.
+    /// Restart the daemon on the same socket. Shutting the old state actor
+    /// down drops its subscriber senders, so the helper's relay sees EOF and
+    /// chevron-1mh's reconnect kicks in.
+    ///
+    /// Ordering is deliberate:
+    /// - Sleep AFTER the shutdown (socket still bound) so the old state
+    ///   actor finishes and closes its commands.db before the replacement
+    ///   opens a fresh one — overlapping connections deadlock the open. The
+    ///   live shell's status query during this window connects to the (now
+    ///   stateless) old listener rather than seeing a missing socket.
+    /// - Remove the socket immediately BEFORE rebinding, leaving no window
+    ///   where the path is absent: the shell has `CHEVRON_NO_DAEMON` unset, so
+    ///   a status query against a missing socket would auto-spawn a real
+    ///   chevrond that grabs the path and AddrInUse-s our rebind.
+    ///
+    /// The old listener thread is left stuck accepting a now-unlinked socket;
+    /// it leaks harmlessly and the test process reaps it at exit.
     fn restart_daemon(&mut self) {
         let _ = self.state_tx.send(StateMsg::Shutdown);
         std::thread::sleep(Duration::from_millis(50));
@@ -2378,7 +2390,9 @@ impl LiveFixture {
     /// with a dump. Re-firing covers the subscriber's async attach and the
     /// callback's 100 ms debounce.
     fn drive_until(&self, fire: impl Fn(), what: &str, pred: impl Fn(&vt100::Screen) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Generous deadline: the daemon-restart reconnect chain (ffu.5) plus a
+        // loaded CI runner can take several seconds end to end.
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             fire();
             if self.term.with_screen(&pred) {
