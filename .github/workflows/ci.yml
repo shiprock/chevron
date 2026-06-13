@@ -76,6 +76,44 @@ jobs:
             echo "::endgroup::"
           done
 
+  # Daemon-backed live-prompt e2e (chevron-ffu). These stand up an
+  # in-process chevrond and a real interactive zsh in a PTY, asserting
+  # event-driven redraws against the rendered grid. They are #[ignore]'d in
+  # the default `test` job (timing-sensitive) and run here explicitly via
+  # `--ignored`, the graduation gate before flip-default drops the ignore.
+  # The Nix sandbox has no zsh, so the harness can only run here. Serial +
+  # repeated: loaded runners reproduce scheduling races a fast laptop can't
+  # — treat a failure as signal, not a flake, and read the screen dump.
+  live-e2e:
+    name: Live e2e / ${{ matrix.os }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # macOS ships zsh; Ubuntu runners may not. Install explicitly so the
+      # harness runs rather than skipping silently (a false green).
+      - name: Install zsh (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      # Fail loudly if zsh is somehow still absent — the harness would
+      # otherwise skip the tests and the job would pass without running them.
+      - name: Verify zsh is present
+        run: zsh --version
+      - name: Run live-prompt e2e (3x, serial, for flake detection)
+        run: |
+          set -e
+          for i in 1 2 3; do
+            echo "::group::live e2e run $i/3"
+            cargo test --test shell_pty -- --ignored --test-threads=1
+            echo "::endgroup::"
+          done
+
   # Build under the Nix sandbox. Catches environment-specific issues that
   # plain cargo test on a GitHub runner can miss (different scheduling,
   # missing system deps, sandbox paths). The Nix sandbox is the environment
