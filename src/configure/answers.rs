@@ -124,7 +124,7 @@ impl Default for Features {
             transient: true,
             async_render: false,
             history: true,
-            live: false,
+            live: true,
             capture: CaptureMode::Off,
         }
     }
@@ -216,7 +216,7 @@ mod tests {
         assert!(a.features.transient);
         assert!(!a.features.async_render);
         assert!(a.features.history);
-        assert!(!a.features.live);
+        assert!(a.features.live);
         assert_eq!(a.features.capture, CaptureMode::Off);
         assert!(a.segment_order.is_empty());
     }

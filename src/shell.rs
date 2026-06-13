@@ -713,7 +713,8 @@ _chevron_live_callback() {
     _chevron_start_async "$_exit" "$_dur" "$_jobs"
 }
 # Spawn the subscriber helper and register the zle -F handler when
-# CHEVRON_LIVE=1. Off by default until shaken out across terminals.
+# CHEVRON_LIVE != 0 (on by default since the live prompt graduated,
+# chevron-ffu — reconnecting, cwd-scoped, PS2-safe, e2e-proven in CI).
 # The subscriber inherits SIGHUP from this shell on exit, so its
 # lifecycle is bounded — no need to track a PID for cleanup.
 if [[ "${CHEVRON_LIVE:-0}" != "0" ]]; then
@@ -1061,7 +1062,8 @@ mod tests {
         ));
         assert!(out.contains("export CHEVRON_ASYNC=\"${CHEVRON_ASYNC-0}\""));
         assert!(out.contains("export CHEVRON_HISTORY=\"${CHEVRON_HISTORY-1}\""));
-        assert!(out.contains("export CHEVRON_LIVE=\"${CHEVRON_LIVE-0}\""));
+        // Live prompt is on by default now (graduated, chevron-ffu).
+        assert!(out.contains("export CHEVRON_LIVE=\"${CHEVRON_LIVE-1}\""));
         assert!(out.contains("export CHEVRON_LIVE_SCOPE=\"${CHEVRON_LIVE_SCOPE-cwd}\""));
     }
 
@@ -2368,10 +2370,10 @@ mod tests {
     // ── chevron-1yn.3 Phase 3: live prompt subscriber ───────────────────
 
     #[test]
-    fn zsh_live_subscriber_off_by_default() {
+    fn zsh_live_subscriber_gated_on_env() {
         let out = init_zsh();
-        // The spawn block is gated on CHEVRON_LIVE != 0; default value
-        // is 0, so out-of-the-box behavior is identical to pre-Phase-3.
+        // The spawn block is gated on CHEVRON_LIVE != 0. The preamble now
+        // defaults it on (graduated, chevron-ffu); CHEVRON_LIVE=0 opts out.
         assert!(
             out.contains("${CHEVRON_LIVE:-0}"),
             "live subscriber should be gated on CHEVRON_LIVE env var"

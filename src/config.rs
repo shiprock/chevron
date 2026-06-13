@@ -84,7 +84,10 @@ impl Default for ShellConfig {
             transient_duration_ms: 2000,
             async_render: false,
             history: true,
-            live: false,
+            // Live prompt graduated from dark-launch to default-on
+            // (chevron-ffu): reconnecting subscriber, cwd-scoped redraws,
+            // PS2-safe, and e2e-proven in CI. Opt out with CHEVRON_LIVE=0.
+            live: true,
         }
     }
 }

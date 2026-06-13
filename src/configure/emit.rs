@@ -182,7 +182,7 @@ mod tests {
         assert!(toml.contains("transient = true"));
         assert!(toml.contains("async_render = false"));
         assert!(toml.contains("history = true"));
-        assert!(toml.contains("live = false"));
+        assert!(toml.contains("live = true"));
     }
 
     #[test]
@@ -298,6 +298,6 @@ mod tests {
         assert!(cfg.shell.transient);
         assert!(!cfg.shell.async_render);
         assert!(cfg.shell.history);
-        assert!(!cfg.shell.live);
+        assert!(cfg.shell.live);
     }
 }

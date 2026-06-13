@@ -102,6 +102,8 @@ fn minimal() -> AnswerSet {
         features: Features {
             transient: false,
             osc133: false,
+            // Safe-mode / scripted output: no background live subscriber.
+            live: false,
             ..Features::default()
         },
         languages: Vec::new(),

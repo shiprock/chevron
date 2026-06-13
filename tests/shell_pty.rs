@@ -356,6 +356,11 @@ impl Term {
         cmd.env("LANG", "en_US.UTF-8");
         cmd.env("LC_ALL", "en_US.UTF-8");
         cmd.env("CHEVRON_NO_DAEMON", "1");
+        // Live is on by default now; keep it off for the non-live tests so
+        // they don't each spawn a (daemon-less, immediately-exiting)
+        // `chevron subscribe`. LiveFixture re-exports CHEVRON_LIVE=1 in its
+        // .zshrc, which the init preamble honors.
+        cmd.env("CHEVRON_LIVE", "0");
         // The async prompt cache lives under XDG_RUNTIME_DIR; point it
         // at the test home so parallel tests (and the developer's real
         // shells) never share cache state.
