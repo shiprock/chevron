@@ -580,17 +580,25 @@ fn migrate_v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Test-only: spawn the actor without a real `notify` watcher. Logical
-/// watch tracking still happens (so LRU and `FsEvent` invalidation can
-/// be exercised) but no actual `notify` resources are created.
-#[cfg(test)]
-fn spawn_no_watcher(ttl: Duration, db: Connection) -> (Sender<StateMsg>, JoinHandle<()>) {
+/// Spawn the state actor WITHOUT a real `notify` watcher. Logical watch
+/// tracking still happens (so LRU eviction and [`StateMsg::FsEvent`]
+/// invalidation work), but no `notify` resources are created — the caller
+/// drives invalidation by sending `FsEvent` itself. Used by unit tests and
+/// by the daemon-backed e2e harness, where injecting every event keeps the
+/// event → redraw timing deterministic instead of racing real FS events.
+///
+/// # Errors
+///
+/// Returns an error if the state-actor thread fails to spawn.
+pub fn spawn_no_watcher(
+    ttl: Duration,
+    db: Connection,
+) -> std::io::Result<(Sender<StateMsg>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel();
     let handle = std::thread::Builder::new()
-        .name("chevrond-state-test".into())
-        .spawn(move || run_inner(rx, None, ttl, db))
-        .unwrap();
-    (tx, handle)
+        .name("chevrond-state-unwatched".into())
+        .spawn(move || run_inner(rx, None, ttl, db))?;
+    Ok((tx, handle))
 }
 
 #[cfg(test)]
@@ -768,7 +776,7 @@ mod tests {
         let git_dir = workdir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
 
-        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap());
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
         insert(&tx, &workdir, &git_dir, "master");
         assert!(query(&tx, workdir.clone()).is_some());
 
@@ -794,7 +802,7 @@ mod tests {
         let git_dir = workdir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
 
-        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap());
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
         insert(&tx, &workdir, &git_dir, "master");
 
         tx.send(StateMsg::FsEvent(vec![PathBuf::from("/var/log/something")]))
@@ -1101,7 +1109,7 @@ mod tests {
         let git_dir = workdir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
 
-        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap());
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
         insert(&tx, &workdir, &git_dir, "master");
         let (event_rx, _id) = subscribe(&tx);
 
@@ -1129,7 +1137,7 @@ mod tests {
         let git_dir = workdir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
 
-        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap());
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
         insert(&tx, &workdir, &git_dir, "master");
         let (event_rx, _id) = subscribe(&tx);
 
@@ -1163,7 +1171,7 @@ mod tests {
         std::fs::create_dir_all(&git_a).unwrap();
         std::fs::create_dir_all(&git_b).unwrap();
 
-        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap());
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
         insert(&tx, &workdir_a, &git_a, "master");
         insert(&tx, &workdir_b, &git_b, "master");
 
@@ -1201,7 +1209,7 @@ mod tests {
         let git_dir = workdir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
 
-        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap());
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
         insert(&tx, &workdir, &git_dir, "master");
 
         let (event_tx, event_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAP);
@@ -1266,7 +1274,7 @@ mod tests {
         // makes the test multi-second. Logical watch tracking still
         // happens via the unconditional `watches` insert, so LRU is
         // exercised. Use throwaway PathBufs (no real dirs needed).
-        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap());
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
         let workdirs: Vec<PathBuf> = (0..=MAX_WATCHES)
             .map(|i| PathBuf::from(format!("/tmp/lru-test-{i}")))
             .collect();

@@ -2290,11 +2290,16 @@ impl LiveFixture {
         fx
     }
 
-    /// Bind a fresh listener + state actor at `dir/chevrond.sock`.
+    /// Bind a fresh listener + state actor at `dir/chevrond.sock`. Uses a
+    /// NO-WATCHER actor: every event is injected via `state_tx`, so the
+    /// event → redraw path is deterministic. A real `notify` watcher would
+    /// fire its own `FsEvent`s off the `git checkout`s these tests do — which
+    /// raced the assertions on fast Linux inotify (CI) while passing on
+    /// slower/coalesced macOS `FSEvents` locally (chevron-ffu.6).
     fn start_daemon(dir: &std::path::Path) -> std::sync::mpsc::Sender<StateMsg> {
         let listener_sock = UnixListener::bind(dir.join("chevrond.sock")).unwrap();
         let db = state::open_db(dir).unwrap();
-        let (state_tx, _join) = state::spawn(state::TTL, db).unwrap();
+        let (state_tx, _join) = state::spawn_no_watcher(state::TTL, db).unwrap();
         let serve_tx = state_tx.clone();
         std::thread::spawn(move || listener::serve_loop(&listener_sock, &serve_tx));
         state_tx
