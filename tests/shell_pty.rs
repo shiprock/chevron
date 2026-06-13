@@ -30,6 +30,10 @@ use std::time::{Duration, Instant};
 
 const ROWS: u16 = 24;
 const COLS: u16 = 120;
+/// Wide terminal for the daemon-backed live fixture, so a long CI hostname
+/// can't wrap the short test input. See `LiveFixture::spawn_with`.
+#[cfg(feature = "daemon")]
+const LIVE_COLS: u16 = 220;
 /// The chevron glyph used by the transient prompt collapse/rewrite.
 const CHEVRON: char = '\u{276f}'; // ❯
 /// Tail of the live (un-collapsed) prompt: the `$` prompt char followed
@@ -2254,7 +2258,12 @@ impl LiveFixture {
         let term = Term::spawn_customized(
             Dsr::Immediate,
             ROWS,
-            COLS,
+            // A wide terminal so the prompt can't wrap the short test input:
+            // CI runners can have very long hostnames (e.g. the macOS
+            // `iad20-...local` ephemeral names), and a wrapped command line
+            // would split assertions like `screen_has("echo 'abc")` across
+            // rows (chevron-ffu.2.1).
+            LIVE_COLS,
             Render::Sync,
             move |home, path_dirs| {
                 git_in(home, &["init", "-q", "-b", "base"]);
