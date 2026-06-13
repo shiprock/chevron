@@ -380,6 +380,59 @@ fn resolve_workdir<'a>(watches: &'a HashMap<PathBuf, PathBuf>, path: &Path) -> O
     None
 }
 
+/// Directories under `workdir` to watch for working-tree liveness
+/// (chevron-95q). A gitignore-aware walk that skips `.git` and any directory
+/// libgit2 reports ignored (`node_modules/`, `target/`, …) so a worktree
+/// watch doesn't blow `fs.inotify.max_user_watches` on big trees — the hard
+/// part the feature is named for.
+///
+/// Returns `None` (→ watch the gitdir only, fall back to the TTL for
+/// working-tree edits) when the repo can't be opened or the non-ignored
+/// directory count exceeds `limit`. The returned set always includes
+/// `workdir` itself; callers watch each entry NON-recursively and resolve
+/// events back to `workdir` via its root key in the watch map.
+///
+/// This is the gitignore-filtering primitive for the worktree watch; the
+/// wiring into `register_watch`/`evict_lru` (with the watch budget and
+/// unwatch-on-eviction bookkeeping) is tracked on chevron-95q.
+#[must_use]
+pub fn worktree_watch_dirs(workdir: &Path, limit: usize) -> Option<Vec<PathBuf>> {
+    let repo = git2::Repository::open(workdir).ok()?;
+    let dotgit = std::ffi::OsStr::new(".git");
+    let mut dirs = vec![workdir.to_path_buf()];
+    let mut stack = vec![workdir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // `file_type` does not follow symlinks, so a symlinked directory
+            // reads as a non-dir and is skipped — no watch, no walk cycles.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+            if path.file_name() == Some(dotgit) {
+                continue;
+            }
+            // is_path_ignored wants a workdir-relative path. A path that
+            // can't be made relative isn't under the worktree — skip it.
+            let Ok(rel) = path.strip_prefix(workdir) else {
+                continue;
+            };
+            if repo.is_path_ignored(rel).unwrap_or(false) {
+                continue;
+            }
+            dirs.push(path.clone());
+            stack.push(path);
+            if dirs.len() > limit {
+                return None;
+            }
+        }
+    }
+    Some(dirs)
+}
+
 /// Drive the actor loop. Owns the cache, watcher, and `SQLite` handle
 /// for the lifetime of the call.
 #[allow(clippy::needless_pass_by_value)]
@@ -1290,5 +1343,66 @@ mod tests {
 
         tx.send(StateMsg::Shutdown).unwrap();
         handle.join().unwrap();
+    }
+
+    // ── chevron-95q: gitignore-filtered worktree enumerator ──────────────
+
+    #[test]
+    fn worktree_watch_dirs_skips_dotgit_and_gitignored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        crate::segments::testutil::init_repo(root);
+        std::fs::write(root.join(".gitignore"), "node_modules/\ntarget/\n").unwrap();
+        std::fs::create_dir_all(root.join("src").join("inner")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules").join("pkg")).unwrap();
+        std::fs::create_dir_all(root.join("target").join("debug")).unwrap();
+
+        let dirs = worktree_watch_dirs(root, 1000).unwrap();
+        let names: Vec<String> = dirs
+            .iter()
+            .map(|d| d.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            dirs.contains(&root.to_path_buf()),
+            "must include the worktree root: {names:?}"
+        );
+        assert!(
+            dirs.iter().any(|d| d.ends_with("src")),
+            "must include src: {names:?}"
+        );
+        assert!(
+            dirs.iter().any(|d| d.ends_with("src/inner")),
+            "must descend into src/inner: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("node_modules")),
+            "gitignored node_modules must be skipped: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("target")),
+            "gitignored target must be skipped: {names:?}"
+        );
+        assert!(
+            !dirs.iter().any(|d| d.ends_with(".git")),
+            ".git must be skipped: {names:?}"
+        );
+    }
+
+    #[test]
+    fn worktree_watch_dirs_bails_over_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        crate::segments::testutil::init_repo(root);
+        for i in 0..10 {
+            std::fs::create_dir_all(root.join(format!("d{i}"))).unwrap();
+        }
+        // 10 dirs + root exceeds the limit → bail (gitdir-only fallback).
+        assert!(worktree_watch_dirs(root, 5).is_none());
+    }
+
+    #[test]
+    fn worktree_watch_dirs_none_when_not_a_repo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(worktree_watch_dirs(tmp.path(), 1000).is_none());
     }
 }
