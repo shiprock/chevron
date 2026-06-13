@@ -198,9 +198,14 @@ fn run_pty(
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
-            // Make stdin (which is now the slave PTY post-Stdio
-            // dup2) our controlling terminal.
-            if libc::ioctl(0, libc::TIOCSCTTY.into(), 0) == -1 {
+            // Make stdin (which is now the slave PTY post-Stdio dup2) our
+            // controlling terminal. TIOCSCTTY is u32 on macOS (widened to
+            // ioctl's c_ulong request) but already c_ulong on Linux, where
+            // the `.into()` is a no-op — keep it for the macOS build and
+            // allow clippy::useless_conversion, which fires only on Linux.
+            #[allow(clippy::useless_conversion)]
+            let request: libc::c_ulong = libc::TIOCSCTTY.into();
+            if libc::ioctl(0, request, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())

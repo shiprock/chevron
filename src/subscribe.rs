@@ -326,10 +326,10 @@ mod tests {
         assert_eq!(backoff_delay(2), Some(Duration::from_millis(200)));
         assert_eq!(backoff_delay(5), Some(Duration::from_millis(1600)));
         // Capped at 2 s.
-        assert_eq!(backoff_delay(6), Some(Duration::from_millis(2000)));
+        assert_eq!(backoff_delay(6), Some(Duration::from_secs(2)));
         assert_eq!(
             backoff_delay(MAX_RECONNECT_ATTEMPTS),
-            Some(Duration::from_millis(2000))
+            Some(Duration::from_secs(2))
         );
         // Budget spent past the cap.
         assert_eq!(backoff_delay(MAX_RECONNECT_ATTEMPTS + 1), None);
