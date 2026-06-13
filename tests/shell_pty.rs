@@ -2397,19 +2397,18 @@ impl LiveFixture {
 fn live_prompt_ignores_cross_repo_events_when_scoped() {
     let fx = LiveFixture::spawn();
 
-    // Confirm the subscriber is attached and live: an own-repo event redraws.
-    git_in(&fx.home, &["checkout", "-q", "-b", "warmup"]);
-    fx.drive_until(
-        || fx.fire_home_git_event(),
-        "warmup redraw confirming the subscriber is live",
-        |s| lines(s).iter().any(|l| l.contains("warmup")),
-    );
-
-    // Stage a change a redraw WOULD surface, but never fire $HOME's event.
+    // Stage a branch a redraw WOULD surface, but fire NO own-repo event. With
+    // the no-watcher daemon the checkout broadcasts nothing, and nothing else
+    // spawns an async render before the assertion below — so no render can
+    // read `scopedout`. (Deliberately no warmup phase: an own-repo warmup
+    // redraw's trailing async raced this checkout on fast Linux — ffu.6.)
     git_in(&fx.home, &["checkout", "-q", "-b", "scopedout"]);
 
-    // Hammer foreign-repo cmd events. With the default CHEVRON_LIVE_SCOPE=cwd
-    // the callback must filter these — the prompt must NOT pick up the branch.
+    // Hammer foreign-repo cmd events for >1s. With the default
+    // CHEVRON_LIVE_SCOPE=cwd the callback must filter every one — the prompt
+    // must NOT pick up the new branch. The own-repo redraw at the end confirms
+    // the subscriber was live throughout, so a clean screen here means the
+    // events were filtered, not lost.
     let foreign = std::path::Path::new("/no/such/other-repo");
     let until = Instant::now() + Duration::from_millis(1500);
     while Instant::now() < until {
@@ -2422,7 +2421,9 @@ fn live_prompt_ignores_cross_repo_events_when_scoped() {
         fx.term.dump()
     );
 
-    // Liveness intact: the shell still redraws for its OWN repo's events.
+    // Liveness intact: an OWN-repo event still redraws (and proves the
+    // subscriber was connected for the foreign burst above — a dead
+    // subscriber would time out here rather than false-pass the assertion).
     fx.drive_until(
         || fx.fire_home_git_event(),
         "own-repo redraw after the scoped-out foreign burst",
