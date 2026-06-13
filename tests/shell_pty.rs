@@ -2238,12 +2238,19 @@ struct LiveFixture {
 #[cfg(feature = "daemon")]
 impl LiveFixture {
     fn spawn() -> Self {
+        Self::spawn_with("")
+    }
+
+    /// Like [`Self::spawn`], with extra shell lines (e.g. env exports)
+    /// inserted before the `chevron init` eval.
+    fn spawn_with(extra_env: &str) -> Self {
         let sockdir = tempfile::TempDir::new().unwrap();
         let state_tx = Self::start_daemon(sockdir.path());
 
         let home_slot = Arc::new(Mutex::new(std::path::PathBuf::new()));
         let socket_dir = sockdir.path().to_path_buf();
         let home_out = Arc::clone(&home_slot);
+        let extra = extra_env.to_string();
         let term = Term::spawn_customized(
             Dsr::Immediate,
             ROWS,
@@ -2260,6 +2267,7 @@ impl LiveFixture {
                         "path=({path_dirs} $path)\n\
                          export CHEVRON_SOCKET_DIR=\"{sd}\"\n\
                          export CHEVRON_LIVE=1\n\
+                         {extra}\
                          unset CHEVRON_NO_DAEMON\n\
                          eval \"$(chevron init zsh)\"\n",
                         sd = socket_dir.display()
@@ -2406,6 +2414,84 @@ fn live_prompt_ignores_cross_repo_events_when_scoped() {
         "own-repo redraw after the scoped-out foreign burst",
         |s| lines(s).iter().any(|l| l.contains("scopedout")),
     );
+}
+
+/// chevron-ffu.2.1: a live event landing during a PS2 continuation must be
+/// harmless — the `CONTEXT == cont` guard (the `zle reset-prompt` skip in
+/// `_chevron_async_callback`) is what stands between a daemon event and a
+/// repaint over the secondary-prompt edit.
+///
+/// Runs with `CHEVRON_TRANSIENT=0` deliberately: with the transient on, the
+/// accept-line collapse flag (set on Enter, cleared only in precmd) already
+/// drops every async result for the whole continuation, shadowing the cont
+/// guard. With it off the widget is never bound, no flag is ever set, and
+/// the cont guard is the SOLE protection — the configuration where it must
+/// bite.
+#[test]
+#[ignore = "daemon-backed live-loop e2e; shake out in CI (chevron-ffu.2.1)"]
+#[cfg(feature = "daemon")]
+fn live_event_during_ps2_continuation_is_harmless() {
+    let fx = LiveFixture::spawn_with("export CHEVRON_TRANSIENT=0\n");
+
+    // Open a PS2 continuation: Enter on an unterminated quote. zsh's
+    // default PS2 (`%_> `) renders as `quote>` inside the open quote.
+    fx.term.send("echo 'abc\r");
+    fx.term.wait_for("PS2 continuation (quote>)", |s| {
+        lines(s).iter().any(|l| l.contains("quote>"))
+    });
+    let prompt_rows_before = fx.term.with_screen(|s| {
+        lines(s)
+            .iter()
+            .filter(|l| l.contains(LIVE_PROMPT_MARK))
+            .count()
+    });
+
+    // Hammer own-repo events while the continuation is open. Each one runs
+    // live callback -> async render -> async callback with CONTEXT == cont;
+    // only the cont guard keeps the result from repainting mid-edit.
+    let until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < until {
+        fx.fire_home_git_event();
+        std::thread::sleep(Duration::from_millis(60));
+    }
+
+    // The edit display must be untouched: the buffer line and exactly one
+    // PS2 row still painted, and no prompt repaint landed mid-continuation.
+    assert!(
+        fx.screen_has("echo 'abc"),
+        "the continuation's buffer line vanished during the event burst\n{}",
+        fx.term.dump()
+    );
+    let quote_rows = fx
+        .term
+        .with_screen(|s| lines(s).iter().filter(|l| l.contains("quote>")).count());
+    assert_eq!(
+        quote_rows,
+        1,
+        "PS2 row duplicated or lost during the event burst\n{}",
+        fx.term.dump()
+    );
+    let prompt_rows_after = fx.term.with_screen(|s| {
+        lines(s)
+            .iter()
+            .filter(|l| l.contains(LIVE_PROMPT_MARK))
+            .count()
+    });
+    assert_eq!(
+        prompt_rows_before,
+        prompt_rows_after,
+        "a prompt repaint landed inside the PS2 continuation\n{}",
+        fx.term.dump()
+    );
+
+    // Complete the line. It must execute correctly and reprompt cleanly:
+    // `echo 'abc<newline>def'` prints two output rows, `abc` and `def`.
+    fx.term.send("def'\r");
+    fx.term
+        .wait_for("the completed command's output + a fresh prompt", |s| {
+            let ls = lines(s);
+            ls.iter().any(|l| l == "abc") && ls.iter().any(|l| l == "def") && prompt_ready(s)
+        });
 }
 
 /// chevron-ffu.5: the live prompt survives a daemon restart — a post-restart

@@ -537,6 +537,15 @@ _chevron_start_async() {
     zle -F "$_chevron_async_fd" _chevron_async_callback
 }
 _chevron_async_callback() {
+    # Capture the interactive parser state FIRST, while this function has
+    # pushed nothing onto the prompt-expansion stack: %_ expands to the
+    # constructs the USER has open ("quote", "if", ...) mid-continuation
+    # and to "" at an idle prompt. $CONTEXT cannot stand guard here — ZLE
+    # maps its widget specials (CONTEXT, PREBUFFER, ...) only inside
+    # widgets, so in a `zle -F` fd handler CONTEXT expands empty and a
+    # `!= cont` test always passes. Probed empirically (chevron-ffu.2.1):
+    # CONTEXT=[] PREBUFFER=[unset] %_=[quote ...] during a PS2 edit.
+    local _chevron_cb_parser_ctx="${(%):-%_}"
     local fd=$1
     local fresh
     fresh=$(cat <&$fd 2>/dev/null)
@@ -554,21 +563,28 @@ _chevron_async_callback() {
     # re-renders regardless; the collapse flag brackets exactly that
     # window, so drop the result there.
     [[ -n "$_chevron_transient_collapsed" ]] && return
-    if [[ -n "$fresh" ]]; then
-        _chevron_make_prompt "${fresh%%$'\n'*}"
-        PROMPT="$REPLY"
-        if [[ -n "$TMUX" && "$fresh" == *$'\n'* ]]; then
-            local _chevron_tmux_title="${fresh#*$'\n'}"
-            local _chevron_priority=$(tmux show-options -w -v @priority_title 2>/dev/null)
-            if [[ -z "$_chevron_priority" ]]; then
-                tmux set-option -p @custom_title "" \; set-option -p @dir_title "$_chevron_tmux_title" \; rename-window "$_chevron_tmux_title"
-            fi
+    [[ -n "$fresh" ]] || return
+    _chevron_make_prompt "${fresh%%$'\n'*}"
+    PROMPT="$REPLY"
+    if [[ -n "$TMUX" && "$fresh" == *$'\n'* ]]; then
+        local _chevron_tmux_title="${fresh#*$'\n'}"
+        local _chevron_priority=$(tmux show-options -w -v @priority_title 2>/dev/null)
+        if [[ -z "$_chevron_priority" ]]; then
+            tmux set-option -p @custom_title "" \; set-option -p @dir_title "$_chevron_tmux_title" \; rename-window "$_chevron_tmux_title"
         fi
-        # PS2 continuation lines: reset-prompt there corrupts the
-        # secondary-prompt state (pure guards identically). The fresh
-        # PROMPT still applies at the next repaint.
-        [[ "$CONTEXT" != "cont" ]] && zle reset-prompt
     fi
+    # PS2 continuation lines: a reset-prompt there re-expands PS2 (%_)
+    # MID-HANDLER, so the user's `quote>` visibly mutates into the
+    # handler's own parser stack (`quote then cmdand>`) — and a live
+    # event can land mid-edit at any time (pure guards the same hazard).
+    # The captured %_ stands guard; $CONTEXT stays for widget-context
+    # callers, where it does work. The fresh PROMPT still applies at the
+    # next natural repaint.
+    [[ "$CONTEXT" == "cont" || -n "$_chevron_cb_parser_ctx" ]] && return
+    # A plain statement on a bare stack: for any continuation flavor the
+    # %_ probe cannot see (backslash-newline opens no construct), the
+    # repaint re-expands %_ to exactly what the user already sees.
+    zle reset-prompt
 }
 # Transient prompt: rewrite the just-issued prompt line to a minimal stub
 # (single chevron) so scrollback stays clean and copy-paste captures only
@@ -1331,13 +1347,34 @@ mod tests {
 
     #[test]
     fn zsh_async_reset_prompt_skips_ps2_continuations() {
-        // reset-prompt during a PS2 continuation corrupts the
-        // secondary-prompt state; the async callback must skip it there
-        // (the fresh PROMPT still applies at the next repaint).
+        // reset-prompt during a PS2 continuation corrupts the secondary
+        // prompt — and $CONTEXT alone cannot stand guard: ZLE maps its
+        // widget specials only inside widgets, so in the `zle -F` fd
+        // handler CONTEXT expands empty and `!= cont` always passed
+        // (chevron-ffu.2.1; e2e: shell_pty.rs::
+        // live_event_during_ps2_continuation_is_harmless). The callback
+        // must capture the interactive parser state (%_) on a bare stack
+        // and gate the repaint on both.
         let out = init_zsh();
+        let cb_start = out.find("_chevron_async_callback() {").unwrap();
+        let cb_end = out[cb_start..].find("\n}\n").map(|i| cb_start + i).unwrap();
+        let body = &out[cb_start..cb_end];
+        let capture = body
+            .find(r#"local _chevron_cb_parser_ctx="${(%):-%_}""#)
+            .expect("callback must capture %_ before doing anything else");
+        let read = body
+            .find("cat <&$fd")
+            .expect("callback reads the refresh from the fd");
         assert!(
-            out.contains(r#"[[ "$CONTEXT" != "cont" ]] && zle reset-prompt"#),
-            "async callback must not reset-prompt during PS2"
+            capture < read,
+            "the %_ capture must precede the fd read (a bare stack is the point)"
+        );
+        assert!(
+            body.contains(
+                r#"[[ "$CONTEXT" == "cont" || -n "$_chevron_cb_parser_ctx" ]] && return"#
+            ),
+            "async callback must skip reset-prompt during PS2 (CONTEXT for \
+             widget contexts, captured %_ for fd-handler contexts)"
         );
     }
 

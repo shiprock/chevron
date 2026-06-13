@@ -116,8 +116,17 @@ verification):
   emulators disagree on how the next newline advances (ble.sh's "xenl"
   trap) — the saved row may be off by one (duplicated-chevron glitch).
 - Never `zle reset-prompt` from the async callback during a PS2
-  continuation (`$CONTEXT == cont`) — it corrupts the secondary-prompt
-  state; pure guards identically.
+  continuation — it repaints PS2 re-expanded mid-handler, so `%_`
+  picks up the callback's own parser stack and the user's `quote>`
+  visibly mutates into `quote then cmdand>` (pure guards the same
+  hazard). And `$CONTEXT` alone CANNOT stand guard: ZLE maps its
+  widget specials (CONTEXT, PREBUFFER) only inside widgets, so in a
+  `zle -F` fd handler CONTEXT expands empty and `!= cont` always
+  passes. Capture `${(%):-%_}` as the callback's FIRST statement
+  (bare stack = interactive state only), gate on CONTEXT-or-captured-%_,
+  and execute the surviving `reset-prompt` as a plain top-level
+  statement so flavors the probe can't see (backslash-newline opens
+  no construct) still repaint with correct text.
 - fish: collapse only when the line will execute — gate Enter on
   `commandline --is-valid` / empty buffer and skip when
   `--paging-mode` is active (Enter selects a completion); clear the
@@ -148,13 +157,15 @@ verification):
 
 ## Known gaps
 
-- The duration tag depends on `$EPOCHREALTIME`, which is empty unless
-  `zsh/datetime` is loaded; the init script does not load it yet, so the
-  feature is inert in a bare `.zshrc`.
 - The PTY harness covers zsh only; bash (duration tag, OSC 133) and fish
   (Enter-binding transient) integrations are untested end-to-end.
-- All PTY tests set `CHEVRON_NO_DAEMON=1` and run outside a git repo, so the
-  daemon path and the git segment have no end-to-end coverage.
+- The *default* PTY suite sets `CHEVRON_NO_DAEMON=1` outside a git repo. The
+  daemon path, git segment, and live prompt now have a separate `#[ignore]`d,
+  daemon-backed e2e suite (`LiveFixture` in `tests/shell_pty.rs`): an
+  in-process chevrond in a real repo, events injected via `state_tx`, redraws
+  asserted against the grid. Run with `cargo test --test shell_pty --
+  --ignored`; wiring it into CI and dropping the `#[ignore]` is the live-prompt
+  graduation gate (chevron-ffu).
 - A preexec DSR response that arrives after the 300 ms budget while an
   interactive `read` builtin owns the terminal is consumed as that
   read's input (a pasted secret gets the response prepended). Chevron
