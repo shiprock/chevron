@@ -74,7 +74,7 @@ fn render_recent_commits(repo: &Repository, out: &mut String) {
             continue;
         };
         let short_id = &commit.id().to_string()[..7];
-        let summary = commit.summary().unwrap_or("");
+        let summary = commit.summary().ok().flatten().unwrap_or("");
         let time = commit.time();
         let age = format_age(time.seconds());
 
@@ -254,7 +254,7 @@ fn current_branch(repo: &Repository) -> String {
     }
     repo.head()
         .ok()
-        .and_then(|h| h.shorthand().map(str::to_string))
+        .and_then(|h| h.shorthand().ok().map(str::to_string))
         .unwrap_or_else(|| "HEAD".to_string())
 }
 
@@ -265,7 +265,7 @@ fn ahead_behind(repo: &Repository) -> (u32, u32) {
     let Some(local_oid) = head.target() else {
         return (0, 0);
     };
-    let Some(branch_name) = head.shorthand() else {
+    let Ok(branch_name) = head.shorthand() else {
         return (0, 0);
     };
     let Ok(branch) = repo.find_branch(branch_name, git2::BranchType::Local) else {
