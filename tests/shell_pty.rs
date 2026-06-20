@@ -1029,16 +1029,31 @@ fn resize_during_command_skips_rewrite() {
     // sentinel.
     let wide = format!("sleep 1 && : {}", "x".repeat(133));
     t.send_line(&wide);
-    // Anchor the resize to the command actually starting — preexec's
-    // OSC 133 C on the wire (one per command; this is the second) —
-    // rather than a fixed test-thread sleep: a loaded parallel run can
-    // starve the shell past any fixed budget, landing the resize before
-    // the command starts and stamping a consistent post-resize geometry
-    // (so the guard legitimately doesn't fire and the test lies).
-    t.wait_for_raw("wide command to start", |raw| {
-        count_subslices(raw, b"\x1b]133;C") >= 2
+    // Anchor the resize to the wide command's preexec having MEASURED
+    // its geometry, not merely started. preexec emits OSC-133-C, then a
+    // few lines later queries the cursor row via DSR and saves
+    // "$COLUMNS:$LINES"; precmd skips the rewrite only when that SAVED
+    // geometry (captured at the old width) differs from precmd's. The
+    // old anchor (2nd OSC-133-C + a fixed 100 ms) fired at the very
+    // start of preexec; under load the up-to-300 ms DSR read outran the
+    // 100 ms, so SIGWINCH interrupted the read, $COLUMNS flipped
+    // mid-flight, and the geometry was stamped at the POST-resize width
+    // — the guard misfired and the rewrite ate the sentinel. Wait
+    // instead for the DSR query the wide command's preexec emits just
+    // before the save (the 6n following the 2nd OSC-133-C), then let it
+    // settle so the read finishes and the old width is recorded.
+    t.wait_for_raw("wide command's preexec geometry query", |raw| {
+        let osc = b"\x1b]133;C";
+        let Some(first) = find_subslice(raw, osc) else {
+            return false;
+        };
+        let after_first = &raw[first + osc.len()..];
+        let Some(second) = find_subslice(after_first, osc) else {
+            return false;
+        };
+        find_subslice(&after_first[second + osc.len()..], b"\x1b[6n").is_some()
     });
-    std::thread::sleep(Duration::from_millis(100));
+    t.wait_settled(Duration::from_millis(250));
     t.resize(24, 60);
     t.wait_for("reprompt after mid-command resize", prompt_ready);
     t.wait_settled(Duration::from_millis(200));

@@ -1543,19 +1543,9 @@ fn subscribe_receives_git_event_from_real_daemon() {
         .unwrap();
     let sub_stdout = sub_child.stdout.take().unwrap();
 
-    // Give the subscriber a moment to complete its handshake. Until
-    // its SUBSCRIBE is registered, events would be missed.
-    std::thread::sleep(std::time::Duration::from_millis(150));
-
-    // Fire a synthetic gitdir event: touch a file under .git/. The
-    // notify watcher should pick this up on macOS and Linux.
-    let head_path = repo_path.join(".git").join("HEAD");
-    // Append a byte rather than replace — keeps git happy enough.
-    std::fs::write(&head_path, std::fs::read(&head_path).unwrap()).unwrap();
-
-    // Read one line from the subscriber's stdout within a generous
-    // timeout. Use a separate thread + channel so the test can
-    // bound the wait.
+    // Spawn the stdout reader first so no event can slip through the
+    // window between firing the trigger and starting to read. It
+    // relays the first line the subscriber prints.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(sub_stdout);
@@ -1565,9 +1555,29 @@ fn subscribe_receives_git_event_from_real_daemon() {
         }
     });
 
-    let line = rx
-        .recv_timeout(std::time::Duration::from_secs(3))
-        .expect("expected EVENT line within timeout");
+    // Drive the gitdir event until the subscriber relays it. A single
+    // fixed 150 ms sleep before one touch raced the subscriber's
+    // SUBSCRIBE registration under load: an event fired before the
+    // watch went live is dropped, and the test then waited forever for
+    // a second that never came. Retrigger on a short cadence until one
+    // lands, bounded by a generous deadline. Rewriting HEAD's own bytes
+    // is an idempotent way to raise a notify event each round.
+    let head_path = repo_path.join(".git").join("HEAD");
+    let head_bytes = std::fs::read(&head_path).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let line = loop {
+        std::fs::write(&head_path, &head_bytes).unwrap();
+        match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(line) => break line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => assert!(
+                std::time::Instant::now() < deadline,
+                "expected EVENT line within timeout"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("subscriber reader thread exited without an EVENT line")
+            }
+        }
+    };
     assert!(
         line.starts_with("EVENT type=git"),
         "unexpected line: {line:?}"
