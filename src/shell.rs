@@ -1,7 +1,91 @@
+use std::fmt::Write;
+
+use crate::config::ShellConfig;
+
+/// Returns the zsh init script using `ShellConfig::default()`. Convenience
+/// for callers (tests, the integration suite) that don't care about config.
 #[must_use]
+pub fn init_zsh() -> String {
+    init_zsh_with(&ShellConfig::default())
+}
+
+/// Returns the zsh init script with a config-derived preamble that sets
+/// defaults for the `CHEVRON_*` env vars. Existing env exports still win
+/// (env > config > default) because the preamble uses `${VAR:=value}`,
+/// which assigns only when the variable is unset.
+#[must_use]
+pub fn init_zsh_with(cfg: &ShellConfig) -> String {
+    format!("{}{}", shell_preamble_posix(cfg), BODY_ZSH)
+}
+
+/// Returns the top-of-`.zshrc` snippet that paints the previously cached
+/// prompt before the rest of `.zshrc` finishes loading (chevron-nf8). The
+/// user pastes this verbatim at the very top of their `~/.zshrc`. Activates
+/// only when chevron's main init has not yet loaded, when stdin/stdout are
+/// a tty, and when the cache file looks zsh-shaped.
+#[must_use]
+pub fn init_zsh_instant_prompt() -> &'static str {
+    INSTANT_PROMPT_ZSH
+}
+
+/// Sentinel comment line — used by `chevron doctor` to detect whether the
+/// user has pasted the instant-prompt snippet into their .zshrc.
+pub const INSTANT_PROMPT_MARKER: &str = "chevron-instant-prompt-v1";
+
+const INSTANT_PROMPT_ZSH: &str = r#"# chevron instant prompt — paste this BLOCK at the TOP of ~/.zshrc.
+# Marker: chevron-instant-prompt-v1
+# Paints the previously-rendered prompt from cache in <50ms while .zshrc
+# loads. Any output .zshrc produces is buffered and replayed when the real
+# prompt takes over. To disable, comment out this block.
+if [[ -o interactive && -t 1 ]] \
+    && [[ -z "$_chevron_instant_active" ]] \
+    && ! typeset -f _chevron_make_prompt >/dev/null 2>&1; then
+    _chevron_cache_file="${XDG_RUNTIME_DIR:-/tmp}/chevron-${UID:-$(id -u)}/last-prompt"
+    if [[ -r "$_chevron_cache_file" ]]; then
+        # Pure zsh — no fork. `$(<file)` is the builtin equivalent of cat.
+        local _chevron_cfull="$(<"$_chevron_cache_file")"
+        local _chevron_cprompt="${_chevron_cfull#*$'\n'}"   # drop pwd line
+        _chevron_cprompt="${_chevron_cprompt%%$'\n'*}"       # drop tmux title
+        # Shell-shape heuristic: only paint if the cache looks like a
+        # zsh-bracketed prompt body. Skip bash-style `\[` brackets which
+        # would print as literal characters under `print -P`.
+        if [[ -n "$_chevron_cprompt" \
+            && "$_chevron_cprompt" == *'%{'* \
+            && "$_chevron_cprompt" != *'\['* ]]; then
+            _chevron_instant_buf="${TMPDIR:-/tmp}/chevron-instant-$$"
+            if : > "$_chevron_instant_buf" 2>/dev/null; then
+                _chevron_instant_active=1
+                # Paint the cached prompt. `-P` interprets %{...%} as
+                # zero-width markers so cursor tracking stays correct.
+                print -nP -- "$_chevron_cprompt"
+                # Save original fds, then capture all stdout/stderr from
+                # .zshrc into the buffer. Takeover (or zshexit) restores.
+                exec {_chevron_instant_orig_stdout}>&1 \
+                     {_chevron_instant_orig_stderr}>&2
+                exec >>"$_chevron_instant_buf" 2>&1
+                # Defensive: if .zshrc errors before precmd takes over,
+                # this hook restores fds and flushes the buffer so the
+                # user isn't stuck with a broken terminal.
+                _chevron_instant_zshexit() {
+                    [[ -z "$_chevron_instant_active" ]] && return
+                    # No 2>/dev/null here: exec persists every redirection
+                    # on it, so it would re-point stderr at /dev/null.
+                    exec >&"$_chevron_instant_orig_stdout" \
+                         2>&"$_chevron_instant_orig_stderr"
+                    [[ -s "$_chevron_instant_buf" ]] \
+                        && cat -- "$_chevron_instant_buf" >&2 2>/dev/null
+                    rm -f -- "$_chevron_instant_buf" 2>/dev/null
+                }
+                zshexit_functions+=(_chevron_instant_zshexit)
+            fi
+        fi
+        unset _chevron_cfull _chevron_cprompt
+    fi
+fi
+"#;
+
 #[allow(clippy::too_many_lines)]
-pub fn init_zsh() -> &'static str {
-    r#"_chevron_preexec() {
+const BODY_ZSH: &str = r#"_chevron_preexec() {
     _chevron_cmd_title="$1"
     # OSC 133 C: command output is about to start. Modern terminals
     # (Ghostty, WezTerm, iTerm2, Kitty, VS Code, Windows Terminal) use
@@ -14,21 +98,42 @@ pub fn init_zsh() -> &'static str {
     # while the command runs invalidates every saved coordinate. The
     # query helper owns all tty state and typeahead safety — see
     # _chevron_query_row.
-    if [[ "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
+    # Gated on the collapse having actually painted: alternate accept
+    # widgets (accept-and-hold, accept-line-and-down-history, custom
+    # widgets that call .accept-line directly) bypass the override, so
+    # the FULL prompt is still on screen — a rewrite sized for `❯ cmd`
+    # would erase the wrong span and paint a collapsed line over it.
+    if [[ "${CHEVRON_TRANSIENT:-1}" != "0" && -n "$_chevron_transient_collapsed" ]]; then
         _chevron_query_row
         _chevron_transient_save_row="$REPLY"
         _chevron_transient_save_geom="$COLUMNS:$LINES"
     fi
-    # Timestamp LAST: the DSR exchange and tty bookkeeping above can
-    # cost tens of milliseconds and must not count against the user's
-    # command (precmd takes its end timestamp first, symmetrically).
+    # Command lifecycle hook (chevron-1yn): publish to chevrond so the
+    # query CLI and live segments can consume the history. Disabled by
+    # CHEVRON_HISTORY=0; skipped for empty commands and for commands
+    # that begin with a space (HISTCONTROL=ignorespace discipline — the
+    # convention for transient secrets). cmd-start prints a ULID we
+    # stash in _chevron_cmd_id, then precmd uses that to emit cmd-end.
+    if [[ "${CHEVRON_HISTORY:-1}" != "0" && -n "$1" && "$1" != " "* ]]; then
+        _chevron_cmd_id=$(chevron event cmd-start "$_chevron_session_id" "$PWD" "$1")
+    else
+        unset _chevron_cmd_id
+    fi
+    # Timestamp LAST: the DSR exchange, tty bookkeeping, and the
+    # lifecycle publish above can each cost tens of milliseconds and
+    # must not count against the user's command (precmd takes its end
+    # timestamp first, symmetrically).
     _chevron_cmd_start=$EPOCHREALTIME
 }
 # Query the current cursor row via DSR (\e[6n). Stores the row in REPLY
 # (empty on failure or skip). One `read -d 'R'` call instead of a
 # per-byte loop — fewer dispatch overheads, and the 300 ms timeout
 # covers tmux/SSH round-trip latency that a tight 50 ms-per-byte budget
-# can't.
+# can't. An optional argument gives a linger window (zselect
+# hundredths): on timeout or truncation the helper then drains the
+# straggling response INSIDE its own raw window instead of flagging it
+# for a later sweep — for callers with no sweep point behind them
+# (precmd's rewrite query; the next stop is ZLE).
 #
 # Typeahead safety: `read -d 'R'` consumes every queued byte ahead of
 # the response. If the user has already typed the next command, the
@@ -41,6 +146,15 @@ pub fn init_zsh() -> &'static str {
 # chevron beats racing the user's keystrokes. zselect ships with zsh;
 # if the module is somehow absent the probe fails closed into the old
 # always-query behaviour.
+#
+# The probe must run with the tty already RAW: select on a canonical
+# tty reports readability only at line boundaries, so a partial line —
+# paste leftovers past the newline an interactive `read -rs` consumed,
+# half a typed command — is invisible to a cooked-mode probe. The query
+# then races input the probe swore wasn't there: `read -d 'R'`
+# truncates at the first typed `R` (pasted API keys are full of them)
+# and the real response is left stranded to kernel-echo as literal
+# `^[[68;1R` once echo returns. Raw first makes partials visible.
 #
 # Tty state: -echo must flip BEFORE the query goes out — response bytes
 # arriving ahead of the read are otherwise kernel-echoed at the cursor
@@ -61,39 +175,73 @@ pub fn init_zsh() -> &'static str {
 # instead of vanishing; anything carrying other control bytes — ESC
 # from arrow keys or stray reports, ^C from an interrupt racing the
 # exchange — is dropped rather than pushed into the buffer as garbage.
+# A buffer with NO CSI at all means a typed `R` ended the read before
+# the response existed: the whole buffer is typeahead. Re-inject it
+# (restoring the `R` the delimiter ate) and treat the response as still
+# in flight — silently eating those bytes loses user input.
 _chevron_query_row() {
     REPLY=""
     local fd
-    exec {fd}< /dev/tty 2>/dev/null || return
-    if zselect -t 0 -r $fd 2>/dev/null; then
-        exec {fd}<&-
-        return
-    fi
+    # The braces are load-bearing: a bare `exec` makes EVERY redirection
+    # on it permanent, so a trailing 2>/dev/null — meant only to silence
+    # a failed open — would point the whole shell's stderr at /dev/null
+    # for the rest of the session. Command error output vanishes, and
+    # ncurses tset/reset (which reach the terminal via fd 2) abort
+    # silently: "reset stopped working". The brace group scopes the
+    # suppression to the open; the fd allocated by exec persists anyway.
+    { exec {fd}< /dev/tty } 2>/dev/null || return
     local _chevron_stty=$(stty -g 2>/dev/null)
-    stty -echo -icanon min 0 time 0 2>/dev/null
-    printf '\e[6n' > /dev/tty 2>/dev/null
     local resp
-    if IFS= read -u $fd -d 'R' -s -t 0.3 resp 2>/dev/null; then
-        _chevron_dsr_inflight=""
-        # Double-reporting emulator stacks answer twice; absorb the
-        # trailing duplicate now, while the tty is still raw.
-        _chevron_drain_reports $fd
-    else
-        # The response missed the budget and will land later — possibly
-        # while ZLE owns the terminal, where split arrival across
-        # KEYTIMEOUT lets its tail self-insert into the command line as
-        # literal text (`1R`). Flag it; precmd sweeps it out before the
-        # editor runs.
-        _chevron_dsr_inflight=1
-    fi
-    [[ -n "$_chevron_stty" ]] && stty "$_chevron_stty" 2>/dev/null
-    exec {fd}<&-
+    # try/always: a ^C during the exchange — the zselect, the read, or
+    # a linger drain; windows up to 600 ms on a slow terminal — unwinds
+    # the whole hook chain mid-function. Without the always-block the
+    # stty restore and fd close are skipped: the terminal is left raw
+    # with echo off (typing invisible, interactive reads broken), and
+    # the NEXT exchange saves the wedged state via `stty -g` and
+    # faithfully re-restores it, making the wedge permanent. The
+    # always-list runs on interrupt as well as on every normal exit
+    # path, including the early return.
+    {
+        stty -echo -icanon min 0 time 0 2>/dev/null
+        if zselect -t 0 -r $fd 2>/dev/null; then
+            return
+        fi
+        printf '\e[6n' > /dev/tty 2>/dev/null
+        if IFS= read -u $fd -d 'R' -s -t 0.3 resp 2>/dev/null \
+            && [[ "$resp" == *$'\e['* ]]; then
+            _chevron_dsr_inflight=""
+            # Double-reporting emulator stacks answer twice; absorb the
+            # trailing duplicate now, while the tty is still raw.
+            _chevron_drain_reports $fd
+        else
+            # Timed out, or truncated by a typed `R` before the response
+            # arrived — either way the answer lands later, possibly while
+            # ZLE owns the terminal, where split arrival across KEYTIMEOUT
+            # lets its tail self-insert into the command line as literal
+            # text (`1R`). Flag it; precmd sweeps it out before the editor
+            # runs.
+            _chevron_dsr_inflight=1
+        fi
+        # Linger mode: this caller has no sweep point behind it, so absorb
+        # the straggler now, while -echo still holds. Restoring echo first
+        # would let the response kernel-echo at the cursor as `^[[68;1R`.
+        if [[ -n "$1" && -n "$_chevron_dsr_inflight" ]]; then
+            _chevron_drain_reports $fd "$1"
+            _chevron_dsr_inflight=""
+        fi
+    } always {
+        [[ -n "$_chevron_stty" ]] && stty "$_chevron_stty" 2>/dev/null
+        exec {fd}<&-
+    }
     if [[ "$resp" == *$'\e['* ]]; then
         local pre_esc="${resp%$'\e['*}"
         local payload="${resp##*$'\e['}"
         REPLY="${payload%%;*}"
         [[ "$REPLY" == <-> ]] || REPLY=""
         [[ -n "$pre_esc" && "$pre_esc" != *[^[:print:]$'\t\r\n']* ]] && print -z -- "$pre_esc" 2>/dev/null
+    elif [[ -n "$resp" && "$resp" != *[^[:print:]$'\t\r\n']* ]]; then
+        # CSI-less buffer: pure typeahead, truncated at a typed `R`.
+        print -z -- "${resp}R" 2>/dev/null
     fi
 }
 # Absorb unsolicited ESC-led reports queued on the tty: duplicate DSR
@@ -119,9 +267,31 @@ _chevron_drain_reports() {
 }
 _chevron_precmd() {
     local exit_status=$?
-    # End timestamp FIRST, before the sweep/rewrite machinery below
-    # spends its own time — the duration tag measures the command only.
+    # End timestamp FIRST, before the instant-prompt takeover and the
+    # sweep/rewrite machinery below spend their own time — the duration
+    # tag measures the command only.
     local _chevron_cmd_end=$EPOCHREALTIME
+    # Instant-prompt takeover (chevron-nf8). If the top-of-rc snippet
+    # painted a cached prompt and redirected stdout/stderr to a buffer,
+    # restore the real fds, close the spurious OSC 133 prompt region we
+    # opened, clear the cached prompt line, then replay any output that
+    # .zshrc produced. No-op when the snippet wasn't activated.
+    if [[ -n "$_chevron_instant_active" ]]; then
+        # No error suppression on the restore: redirections apply left to
+        # right and exec persists ALL of them, so a trailing 2>/dev/null
+        # was the FINAL word on fd 2 — every instant-prompt shell ran with
+        # stderr on /dev/null from the first prompt on. A failed restore
+        # prints into the buffer file instead, which is harmless.
+        exec >&"$_chevron_instant_orig_stdout" 2>&"$_chevron_instant_orig_stderr"
+        { exec {_chevron_instant_orig_stdout}>&- {_chevron_instant_orig_stderr}>&- } 2>/dev/null
+        [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;D;0\a'
+        print -n -- $'\r\e[2K'
+        [[ -s "$_chevron_instant_buf" ]] && cat -- "$_chevron_instant_buf"
+        rm -f -- "$_chevron_instant_buf" 2>/dev/null
+        unset _chevron_instant_active _chevron_instant_buf \
+              _chevron_instant_orig_stdout _chevron_instant_orig_stderr \
+              _chevron_cache_file
+    fi
     # OSC 133 D: the just-completed command finished with $exit_status.
     # Emitted first so it closes out the previous command region before
     # we print the duration tag and next prompt's A marker.
@@ -161,12 +331,20 @@ _chevron_precmd() {
     # the escape hatch for those.
     if [[ -n "$_chevron_dsr_inflight" && "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
         local _chevron_sweep_fd
-        if exec {_chevron_sweep_fd}< /dev/tty 2>/dev/null; then
+        # Braced for the same reason as _chevron_query_row's open: a bare
+        # exec would make the 2>/dev/null permanent for the whole shell.
+        if { exec {_chevron_sweep_fd}< /dev/tty } 2>/dev/null; then
             local _chevron_sweep_stty=$(stty -g 2>/dev/null)
-            stty -echo -icanon min 0 time 0 2>/dev/null
-            _chevron_drain_reports $_chevron_sweep_fd 30
-            [[ -n "$_chevron_sweep_stty" ]] && stty "$_chevron_sweep_stty" 2>/dev/null
-            exec {_chevron_sweep_fd}<&-
+            # Interrupt-safe for the same reason as _chevron_query_row:
+            # the 300 ms drain is a wide ^C target, and an unwound hook
+            # would otherwise leave the terminal raw with echo off.
+            {
+                stty -echo -icanon min 0 time 0 2>/dev/null
+                _chevron_drain_reports $_chevron_sweep_fd 30
+            } always {
+                [[ -n "$_chevron_sweep_stty" ]] && stty "$_chevron_sweep_stty" 2>/dev/null
+                exec {_chevron_sweep_fd}<&-
+            }
         fi
         _chevron_dsr_inflight=""
     fi
@@ -184,7 +362,12 @@ _chevron_precmd() {
     if [[ -n "$_chevron_transient_save_row" && "${CHEVRON_TRANSIENT:-1}" != "0" \
           && "$_chevron_transient_save_geom" == "$COLUMNS:$LINES" \
           && "$_chevron_cmd_title" != *$'\n'* ]]; then
-        _chevron_query_row
+        # Linger 300 ms (30 hundredths) on timeout: unlike preexec's
+        # query — whose straggler the sweep above catches a cycle later
+        # — there is NO sweep between this query and ZLE taking the
+        # terminal. An unabsorbed response would kernel-echo as literal
+        # `^[[68;1R` the instant the helper restores echo.
+        _chevron_query_row 30
         if [[ -n "$REPLY" ]]; then
             local _chevron_R_current="$REPLY"
             local _chevron_R_saved="$_chevron_transient_save_row"
@@ -212,7 +395,14 @@ _chevron_precmd() {
             # streaming commands (ps, ls of huge dirs, cargo build)
             # commonly trigger one of these and the user gets a clean
             # gray chevron without a glitched rewrite.
+            # Width an exact multiple of COLUMNS: the painted transient
+            # ends in the auto-margin pending-wrap state, and emulators
+            # DISAGREE on how the following newline advances from there
+            # (one row or two — ble.sh's "xenl" trap). The saved row may
+            # be off by one, which paints the duplicated-chevron glitch;
+            # unknowable from here, so skip honestly.
             if (( _chevron_R_top > 0 \
+                && _chevron_width % _chevron_cols != 0 \
                 && _chevron_R_saved < _chevron_lines \
                 && _chevron_R_current < _chevron_lines \
                 && _chevron_delta >= 0 \
@@ -242,13 +432,24 @@ _chevron_precmd() {
             fi
         fi
     fi
-    unset _chevron_transient_save_row _chevron_transient_save_geom
+    unset _chevron_transient_save_row _chevron_transient_save_geom \
+          _chevron_transient_collapsed
     local duration_ms=0
     if [[ -n "$_chevron_cmd_start" && -n "$_chevron_cmd_end" ]]; then
         duration_ms=$(( (_chevron_cmd_end - _chevron_cmd_start) * 1000 ))
         duration_ms=${duration_ms%.*}
     fi
     unset _chevron_cmd_start
+    # Command lifecycle finish event (chevron-1yn). Mirror of cmd-start
+    # in preexec: only emitted when preexec stashed an id (i.e.
+    # CHEVRON_HISTORY enabled and the command wasn't ignorespace'd).
+    # Synchronous like cmd-start — the chevron binary's UDS publish
+    # path is bounded at ~25 ms, comparable to the prompt-render fork
+    # already in this function.
+    if [[ -n "$_chevron_cmd_id" ]]; then
+        chevron event cmd-end "$_chevron_cmd_id" "$exit_status" "$duration_ms"
+        unset _chevron_cmd_id
+    fi
     # Post-execution duration tag: if the just-completed command took
     # longer than the threshold, emit a dim duration line below its
     # output and above the next prompt. This preserves timing info in
@@ -315,6 +516,11 @@ _chevron_precmd() {
         fi
     fi
     unset _chevron_cmd_title
+    # Phase 3 (chevron-1yn.3): stash exit_status + duration_ms so the
+    # live subscriber callback (which fires between prompts, not from
+    # precmd) can call _chevron_start_async with realistic args.
+    _chevron_last_exit=$exit_status
+    _chevron_last_duration=$duration_ms
 }
 # Async fast-path machinery (chevron-7fs.5). Off by default; enable with
 # CHEVRON_ASYNC=1. The background process renders a fresh prompt and
@@ -331,6 +537,15 @@ _chevron_start_async() {
     zle -F "$_chevron_async_fd" _chevron_async_callback
 }
 _chevron_async_callback() {
+    # Capture the interactive parser state FIRST, while this function has
+    # pushed nothing onto the prompt-expansion stack: %_ expands to the
+    # constructs the USER has open ("quote", "if", ...) mid-continuation
+    # and to "" at an idle prompt. $CONTEXT cannot stand guard here — ZLE
+    # maps its widget specials (CONTEXT, PREBUFFER, ...) only inside
+    # widgets, so in a `zle -F` fd handler CONTEXT expands empty and a
+    # `!= cont` test always passes. Probed empirically (chevron-ffu.2.1):
+    # CONTEXT=[] PREBUFFER=[unset] %_=[quote ...] during a PS2 edit.
+    local _chevron_cb_parser_ctx="${(%):-%_}"
     local fd=$1
     local fresh
     fresh=$(cat <&$fd 2>/dev/null)
@@ -340,23 +555,45 @@ _chevron_async_callback() {
     # the result describes a previous cycle — drop it; the newer cycle
     # owns the prompt now. (The fd is already closed above either way.)
     [[ "$_chevron_async_spawn_gen" == "$_chevron_async_gen" ]] || return
-    if [[ -n "$fresh" ]]; then
-        _chevron_make_prompt "${fresh%%$'\n'*}"
-        PROMPT="$REPLY"
-        if [[ -n "$TMUX" && "$fresh" == *$'\n'* ]]; then
-            local _chevron_tmux_title="${fresh#*$'\n'}"
-            local _chevron_priority=$(tmux show-options -w -v @priority_title 2>/dev/null)
-            if [[ -z "$_chevron_priority" ]]; then
-                tmux set-option -p @custom_title "" \; set-option -p @dir_title "$_chevron_tmux_title" \; rename-window "$_chevron_tmux_title"
-            fi
+    # The generation only bumps in precmd, so a refresh landing in the
+    # accept window — after the collapse painted, before the next
+    # precmd — passes the guard above, and its reset-prompt would draw
+    # a fresh full prompt over the just-collapsed line (chevron-6tc).
+    # The result describes a finished cycle and the next precmd
+    # re-renders regardless; the collapse flag brackets exactly that
+    # window, so drop the result there.
+    [[ -n "$_chevron_transient_collapsed" ]] && return
+    [[ -n "$fresh" ]] || return
+    _chevron_make_prompt "${fresh%%$'\n'*}"
+    PROMPT="$REPLY"
+    if [[ -n "$TMUX" && "$fresh" == *$'\n'* ]]; then
+        local _chevron_tmux_title="${fresh#*$'\n'}"
+        local _chevron_priority=$(tmux show-options -w -v @priority_title 2>/dev/null)
+        if [[ -z "$_chevron_priority" ]]; then
+            tmux set-option -p @custom_title "" \; set-option -p @dir_title "$_chevron_tmux_title" \; rename-window "$_chevron_tmux_title"
         fi
-        zle reset-prompt
     fi
+    # PS2 continuation lines: a reset-prompt there re-expands PS2 (%_)
+    # MID-HANDLER, so the user's `quote>` visibly mutates into the
+    # handler's own parser stack (`quote then cmdand>`) — and a live
+    # event can land mid-edit at any time (pure guards the same hazard).
+    # The captured %_ stands guard; $CONTEXT stays for widget-context
+    # callers, where it does work. The fresh PROMPT still applies at the
+    # next natural repaint.
+    [[ "$CONTEXT" == "cont" || -n "$_chevron_cb_parser_ctx" ]] && return
+    # A plain statement on a bare stack: for any continuation flavor the
+    # %_ probe cannot see (backslash-newline opens no construct), the
+    # repaint re-expands %_ to exactly what the user already sees.
+    zle reset-prompt
 }
 # Transient prompt: rewrite the just-issued prompt line to a minimal stub
 # (single chevron) so scrollback stays clean and copy-paste captures only
 # the command, not the prompt chrome. Disable with CHEVRON_TRANSIENT=0.
 _chevron_accept_line() {
+    # Record that the collapse really painted — preexec's row save (and
+    # with it the precmd rewrite) is gated on this, because execution
+    # paths that bypass this widget leave the full prompt on screen.
+    _chevron_transient_collapsed=1
     # Strip the trailing space from the transient prompt since
     # _chevron_make_prompt re-adds one when wrapping; otherwise we'd get
     # a double space between the chevron and the user's input cursor.
@@ -414,23 +651,116 @@ if [[ "${CHEVRON_TRANSIENT:-1}" != "0" ]]; then
     fi
     zle -N accept-line _chevron_accept_line
 fi
-"#
+# Session id for the command-lifecycle hooks (chevron-1yn). Minted once
+# at init so every command from this shell shares it; sub-shells get
+# their own. Stays unset when CHEVRON_HISTORY=0 so the preexec/precmd
+# bookkeeping short-circuits without forking.
+if [[ "${CHEVRON_HISTORY:-1}" != "0" && -z "$_chevron_session_id" ]]; then
+    _chevron_session_id=$(chevron event new-session 2>/dev/null)
+fi
+# Live subscriber callback (chevron-1yn.3 Phase 3). Fires from zle
+# context when `chevron subscribe`'s background pipe becomes readable
+# — i.e., when chevrond saw a state change (FS-watched .git/ event,
+# command finished elsewhere, etc.). Reads one EVENT line, debounces
+# bursts, and kicks the existing async render path so the prompt
+# redraws with fresh state.
+_chevron_live_callback() {
+    local fd=$1
+    local line
+    # Read available input. On EOF (chevron subscribe died, daemon
+    # restarted, etc.) unregister + close the fd; the user can
+    # re-enable Phase 3 by opening a new shell.
+    if ! IFS= read -r line <&$fd; then
+        zle -F "$fd" 2>/dev/null
+        { exec {fd}<&- } 2>/dev/null
+        unset _chevron_live_fd
+        return
+    fi
+    # The subscriber filters PINGs out, so we should only see EVENT
+    # lines here — but guard defensively in case of future changes.
+    [[ "$line" != EVENT* ]] && return
+    # Scope (chevron-ffu.3). By default redraw only for events in the
+    # current repo, so N shells across M repos don't all re-render on one
+    # repo's change. The daemon's own cwd filter is exact-match (useless
+    # from a subdirectory), so we filter here against live $PWD — which
+    # also makes `cd` Just Work with no re-subscribe. CHEVRON_LIVE_SCOPE=all
+    # opts back into cross-repo events (the cross-pane case, chevron-i1h).
+    if [[ "${CHEVRON_LIVE_SCOPE:-cwd}" != all && "$line" == *cwd=* ]]; then
+        local _ev_cwd="${line#*cwd=}"; _ev_cwd="${_ev_cwd%% *}"
+        # cwd is percent-encoded on the wire; decode only when needed.
+        [[ "$_ev_cwd" == *%* ]] && _ev_cwd=$(printf '%b' "${_ev_cwd//\%/\\x}")
+        # Redraw only when $PWD is inside the event's workdir. Trailing
+        # slashes guard the /repo-vs-/repo2 prefix trap.
+        [[ "$PWD/" == "${_ev_cwd%/}/"* ]] || return
+    fi
+    # Debounce. A single `git commit` fires several FS events that the
+    # daemon coalesces per workdir, but bursts from `git rebase` etc.
+    # can still produce a handful within ms of each other. One redraw
+    # per 100 ms is plenty for human-perceptible liveness.
+    local now_ms=$(( EPOCHREALTIME * 1000 ))
+    now_ms=${now_ms%.*}
+    local last_ms=${_chevron_live_last_ms:-0}
+    if (( now_ms - last_ms < 100 )); then
+        return
+    fi
+    _chevron_live_last_ms=$now_ms
+    # Spawn a background render using the existing async pipeline.
+    # The completion callback (_chevron_async_callback) sets PROMPT
+    # and calls zle reset-prompt, redrawing the prompt in place.
+    local _exit=${_chevron_last_exit:-0}
+    local _dur=${_chevron_last_duration:-0}
+    local _jobs=${(%):-%j}
+    _chevron_start_async "$_exit" "$_dur" "$_jobs"
+}
+# Spawn the subscriber helper and register the zle -F handler when
+# CHEVRON_LIVE != 0 (on by default since the live prompt graduated,
+# chevron-ffu — reconnecting, cwd-scoped, PS2-safe, e2e-proven in CI).
+# The subscriber inherits SIGHUP from this shell on exit, so its
+# lifecycle is bounded — no need to track a PID for cleanup.
+if [[ "${CHEVRON_LIVE:-0}" != "0" ]]; then
+    exec {_chevron_live_fd}< <(chevron subscribe 2>/dev/null)
+    zle -F "$_chevron_live_fd" _chevron_live_callback
+fi
+"#;
+
+/// Bash init using `ShellConfig::default()`.
+#[must_use]
+pub fn init_bash() -> String {
+    init_bash_with(&ShellConfig::default())
 }
 
+/// Bash init with a config-derived preamble.
+///
+/// Bash port intentionally skips the transient prompt that zsh and fish
+/// implement. Bash has no clean equivalent of ZLE's accept-line override,
+/// and the two viable workarounds (`bind -x` with cursor codes; DEBUG trap
+/// with `$BASH_COMMAND`) both break on multi-line input, wrapped lines,
+/// and compound commands. Same reason powerlevel10k stays zsh-only and
+/// Starship's bash init doesn't transient-collapse. The post-exec
+/// duration tag, however, ports cleanly and is enabled here.
 #[must_use]
-pub fn init_bash() -> &'static str {
-    // Bash port intentionally skips the transient prompt that zsh and fish
-    // implement. Bash has no clean equivalent of ZLE's accept-line override,
-    // and the two viable workarounds (bind -x with cursor codes; DEBUG trap
-    // with $BASH_COMMAND) both break on multi-line input, wrapped lines, and
-    // compound commands. Same reason powerlevel10k stays zsh-only and
-    // Starship's bash init doesn't transient-collapse. The post-exec
-    // duration tag, however, ports cleanly and is enabled here.
-    r#"_chevron_preexec() {
+pub fn init_bash_with(cfg: &ShellConfig) -> String {
+    format!("{}{}", shell_preamble_posix(cfg), BODY_BASH)
+}
+
+const BODY_BASH: &str = r#"_chevron_preexec() {
     [[ -n "$_chevron_in_precmd" ]] && return
     _chevron_cmd_start=${_chevron_cmd_start:-$EPOCHREALTIME}
     # OSC 133 C: command output is about to start.
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;C\a'
+    # Command lifecycle hook (chevron-1yn). $BASH_COMMAND is the literal
+    # of the next command bash is about to run via the DEBUG trap. Skip
+    # the publish when CHEVRON_HISTORY=0, when $BASH_COMMAND is empty,
+    # and when it begins with a space (the HISTCONTROL=ignorespace
+    # convention) — matching the zsh/fish opt-out shape. Bash fires the
+    # DEBUG trap once per simple command in a pipeline; we only stash
+    # an id for the first one and rely on cmd-end in precmd to close it.
+    if [[ "${CHEVRON_HISTORY:-1}" != "0" \
+        && -n "$BASH_COMMAND" \
+        && "$BASH_COMMAND" != " "* \
+        && -z "$_chevron_cmd_id" ]]; then
+        _chevron_cmd_id=$(chevron event cmd-start "$_chevron_session_id" "$PWD" "$BASH_COMMAND")
+    fi
 }
 _chevron_precmd() {
     local exit_status=$?
@@ -441,6 +771,15 @@ _chevron_precmd() {
     if [[ -n "$_chevron_cmd_start" ]]; then
         duration_ms=$(LC_ALL=C awk "BEGIN { printf \"%d\", ($EPOCHREALTIME - $_chevron_cmd_start) * 1000 }")
         unset _chevron_cmd_start
+    fi
+    # Command lifecycle finish event (chevron-1yn). Bash counterpart of
+    # the zsh precmd cmd-end emission — exit_status and duration_ms are
+    # already computed above. _chevron_cmd_id is left unset by preexec
+    # when CHEVRON_HISTORY=0 or for ignorespace'd commands, so this
+    # silently skips in those cases.
+    if [[ -n "$_chevron_cmd_id" ]]; then
+        chevron event cmd-end "$_chevron_cmd_id" "$exit_status" "$duration_ms"
+        unset _chevron_cmd_id
     fi
     # Post-execution duration tag: a dim line shown between command output
     # and the next prompt when the command exceeded the threshold (default
@@ -480,12 +819,28 @@ _chevron_precmd() {
 }
 trap '_chevron_preexec' DEBUG
 PROMPT_COMMAND=_chevron_precmd
-"#
+# Session id for the command-lifecycle hooks (chevron-1yn). One per
+# shell process; stays unset when CHEVRON_HISTORY=0 so the trap/PROMPT_COMMAND
+# bookkeeping short-circuits without forking.
+if [[ "${CHEVRON_HISTORY:-1}" != "0" && -z "$_chevron_session_id" ]]; then
+    _chevron_session_id=$(chevron event new-session 2>/dev/null)
+fi
+"#;
+
+/// Fish init using `ShellConfig::default()`.
+#[must_use]
+pub fn init_fish() -> String {
+    init_fish_with(&ShellConfig::default())
 }
 
+/// Fish init with a config-derived preamble. Fish uses a different
+/// set-if-unset idiom (`set -q VAR; or set -gx VAR value`).
 #[must_use]
-pub fn init_fish() -> &'static str {
-    r#"function fish_prompt
+pub fn init_fish_with(cfg: &ShellConfig) -> String {
+    format!("{}{}", shell_preamble_fish(cfg), BODY_FISH)
+}
+
+const BODY_FISH: &str = r#"function fish_prompt
     # Transient branch: short prompt fired when the user hits Enter.
     # _chevron_transient_enter sets the flag and forces a repaint
     # before executing the command. We unset the flag here so the next
@@ -526,6 +881,15 @@ end
 # about to start.
 function _chevron_preexec --on-event fish_preexec
     test "$CHEVRON_OSC133" != "0"; and printf '\e]133;C\a'
+    # Command lifecycle hook (chevron-1yn). fish_preexec passes the
+    # literal command line as $argv[1]. Skip when CHEVRON_HISTORY=0,
+    # empty cmd, or leading-space (ignorespace convention).
+    set -e _chevron_cmd_id
+    if test "$CHEVRON_HISTORY" != "0"
+        and test -n "$argv[1]"
+        and not string match -q ' *' -- "$argv[1]"
+        set -g _chevron_cmd_id (chevron event cmd-start "$_chevron_session_id" "$PWD" "$argv[1]")
+    end
 end
 
 # Post-execution duration tag: fish exposes $CMD_DURATION directly, so we
@@ -533,8 +897,19 @@ end
 function _chevron_postexec --on-event fish_postexec
     # Capture $status FIRST — every later command resets it.
     set -l exit_status $status
+    # Belt-and-suspenders flag clear: fish_prompt normally consumes it
+    # at the repaint, but an execute that skipped the repaint must not
+    # leave it armed for the next prompt.
+    set -e _chevron_transient_show
     # OSC 133 D: previous command finished.
     test "$CHEVRON_OSC133" != "0"; and printf '\e]133;D;%d\a' $exit_status
+    # Command lifecycle finish event (chevron-1yn). Mirrors fish_preexec:
+    # only emit if cmd-start stashed an id (history enabled, non-empty,
+    # non-ignorespace command). $CMD_DURATION is in ms already.
+    if set -q _chevron_cmd_id
+        chevron event cmd-end "$_chevron_cmd_id" "$exit_status" "$CMD_DURATION"
+        set -e _chevron_cmd_id
+    end
     test "$CHEVRON_TRANSIENT" = "0"; and return
     set -l threshold $CHEVRON_TRANSIENT_DURATION_MS
     test -z "$threshold"; and set threshold 2000
@@ -555,21 +930,347 @@ end
 # The deferred-event ordering matters here: `commandline -f` schedules
 # operations to run after the current binding returns, so the flag stays
 # set when fish_prompt fires for the repaint, then the execute follows.
+#
+# Collapse only when the line will actually execute (gating ported from
+# starship and oh-my-posh):
+#   - with the completion pager open, Enter selects an entry — never
+#     collapse;
+#   - an incomplete buffer (open quote, unterminated block) makes
+#     `execute` insert a newline instead of running — collapsing would
+#     strand a bare chevron over a buffer still being edited;
+#   - a syntactically valid or empty line really executes — collapse.
 function _chevron_transient_enter
-    set -g _chevron_transient_show 1
-    commandline -f repaint
+    if commandline --paging-mode
+        commandline -f execute
+        return
+    end
+    if commandline --is-valid; or test -z (commandline --current-buffer | string collect)
+        set -g _chevron_transient_show 1
+        commandline -f repaint
+    end
     commandline -f execute
+end
+# fish_prompt consumes the flag at the repaint; this covers paths where
+# that repaint never happens (line cancelled with ^C) so a stale flag
+# cannot collapse the NEXT prompt.
+function _chevron_transient_cancel --on-event fish_cancel
+    set -e _chevron_transient_show
 end
 if test "$CHEVRON_TRANSIENT" != "0"
     bind \r _chevron_transient_enter
     bind \n _chevron_transient_enter
+    # vi-mode users hit Enter from insert (and occasionally visual)
+    # mode; the default-mode binding above does not cover those maps.
+    bind -M insert \r _chevron_transient_enter
+    bind -M insert \n _chevron_transient_enter
+    bind -M visual \r _chevron_transient_enter
 end
-"#
+# Session id for the command-lifecycle hooks (chevron-1yn). Once per
+# fish process; stays unset when CHEVRON_HISTORY=0 so the hooks
+# short-circuit without forking.
+if test "$CHEVRON_HISTORY" != "0"; and not set -q _chevron_session_id
+    set -g _chevron_session_id (chevron event new-session 2>/dev/null)
+end
+"#;
+
+// ── preamble generators ────────────────────────────────────────────────────
+
+/// Generates a sh/bash/zsh preamble that exports defaults for the
+/// `CHEVRON_*` env vars. `${VAR-default}` returns the existing value if
+/// set (even if empty) and the default otherwise, so an `export` set
+/// before sourcing this script still wins (env > config > default).
+///
+/// We avoid the seemingly-cleaner `: "${VAR:=value}"` idiom because the
+/// `:` builtin is commonly aliased in user dotfiles (e.g., `alias :='cd
+/// ..'` for quick directory-up navigation). Alias expansion in zsh runs
+/// before builtin dispatch, so the `:` lines would expand to `cd ..` and
+/// every preamble line would emit a `string not in pwd: ..` error
+/// (chevron-8dt). Direct assignment bypasses the alias entirely.
+fn shell_preamble_posix(cfg: &ShellConfig) -> String {
+    let mut out = String::with_capacity(384);
+    let _ = writeln!(
+        out,
+        "# Generated by `chevron init` — env vars override these defaults."
+    );
+    write_posix_default(&mut out, "CHEVRON_OSC133", bool_to_shell(cfg.osc133));
+    write_posix_default(&mut out, "CHEVRON_TRANSIENT", bool_to_shell(cfg.transient));
+    write_posix_default(
+        &mut out,
+        "CHEVRON_TRANSIENT_DURATION_MS",
+        &cfg.transient_duration_ms.to_string(),
+    );
+    write_posix_default(&mut out, "CHEVRON_ASYNC", bool_to_shell(cfg.async_render));
+    write_posix_default(&mut out, "CHEVRON_HISTORY", bool_to_shell(cfg.history));
+    write_posix_default(&mut out, "CHEVRON_LIVE", bool_to_shell(cfg.live));
+    write_posix_default(&mut out, "CHEVRON_LIVE_SCOPE", "cwd");
+    out.push('\n');
+    out
+}
+
+fn write_posix_default(out: &mut String, var: &str, value: &str) {
+    let _ = writeln!(out, "export {var}=\"${{{var}-{value}}}\"");
+}
+
+/// Generates the fish equivalent of the posix preamble. fish has no `:=`
+/// expansion, so we use `set -q VAR; or set -gx VAR value`.
+fn shell_preamble_fish(cfg: &ShellConfig) -> String {
+    let mut out = String::with_capacity(512);
+    let _ = writeln!(
+        out,
+        "# Generated by `chevron init` — env vars override these defaults."
+    );
+    write_fish_default(&mut out, "CHEVRON_OSC133", bool_to_shell(cfg.osc133));
+    write_fish_default(&mut out, "CHEVRON_TRANSIENT", bool_to_shell(cfg.transient));
+    write_fish_default(
+        &mut out,
+        "CHEVRON_TRANSIENT_DURATION_MS",
+        &cfg.transient_duration_ms.to_string(),
+    );
+    write_fish_default(&mut out, "CHEVRON_ASYNC", bool_to_shell(cfg.async_render));
+    write_fish_default(&mut out, "CHEVRON_HISTORY", bool_to_shell(cfg.history));
+    write_fish_default(&mut out, "CHEVRON_LIVE", bool_to_shell(cfg.live));
+    write_fish_default(&mut out, "CHEVRON_LIVE_SCOPE", "cwd");
+    out.push('\n');
+    out
+}
+
+fn write_fish_default(out: &mut String, var: &str, value: &str) {
+    let _ = writeln!(out, "set -q {var}; or set -gx {var} {value}");
+}
+
+const fn bool_to_shell(v: bool) -> &'static str {
+    if v { "1" } else { "0" }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{init_bash, init_fish, init_zsh};
+    use super::{
+        init_bash, init_bash_with, init_fish, init_fish_with, init_zsh, init_zsh_with,
+        shell_preamble_fish, shell_preamble_posix,
+    };
+    use crate::config::ShellConfig;
+
+    // ── config-driven preamble ────────────────────────────────────────────
+
+    #[test]
+    fn posix_preamble_defaults_match_today() {
+        let out = shell_preamble_posix(&ShellConfig::default());
+        assert!(out.contains("export CHEVRON_OSC133=\"${CHEVRON_OSC133-1}\""));
+        assert!(out.contains("export CHEVRON_TRANSIENT=\"${CHEVRON_TRANSIENT-1}\""));
+        assert!(out.contains(
+            "export CHEVRON_TRANSIENT_DURATION_MS=\"${CHEVRON_TRANSIENT_DURATION_MS-2000}\""
+        ));
+        assert!(out.contains("export CHEVRON_ASYNC=\"${CHEVRON_ASYNC-0}\""));
+        assert!(out.contains("export CHEVRON_HISTORY=\"${CHEVRON_HISTORY-1}\""));
+        // Live prompt is on by default now (graduated, chevron-ffu).
+        assert!(out.contains("export CHEVRON_LIVE=\"${CHEVRON_LIVE-1}\""));
+        assert!(out.contains("export CHEVRON_LIVE_SCOPE=\"${CHEVRON_LIVE_SCOPE-cwd}\""));
+    }
+
+    #[test]
+    fn posix_preamble_reflects_config_overrides() {
+        let cfg = ShellConfig {
+            osc133: false,
+            transient: false,
+            transient_duration_ms: 500,
+            async_render: true,
+            history: false,
+            live: true,
+        };
+        let out = shell_preamble_posix(&cfg);
+        assert!(out.contains("export CHEVRON_OSC133=\"${CHEVRON_OSC133-0}\""));
+        assert!(out.contains("export CHEVRON_TRANSIENT=\"${CHEVRON_TRANSIENT-0}\""));
+        assert!(out.contains(
+            "export CHEVRON_TRANSIENT_DURATION_MS=\"${CHEVRON_TRANSIENT_DURATION_MS-500}\""
+        ));
+        assert!(out.contains("export CHEVRON_ASYNC=\"${CHEVRON_ASYNC-1}\""));
+        assert!(out.contains("export CHEVRON_HISTORY=\"${CHEVRON_HISTORY-0}\""));
+        assert!(out.contains("export CHEVRON_LIVE=\"${CHEVRON_LIVE-1}\""));
+    }
+
+    #[test]
+    fn posix_preamble_does_not_invoke_colon_builtin() {
+        // Regression: `:` is commonly aliased to `cd ..` in dotfiles.
+        // Lines starting with `:` would alias-expand and break (chevron-8dt).
+        let out = shell_preamble_posix(&ShellConfig::default());
+        for line in out.lines() {
+            let trimmed = line.trim_start();
+            assert!(
+                !trimmed.starts_with(": "),
+                "preamble must not start lines with `: ` (alias collision risk): {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fish_preamble_uses_set_q_or_set_gx() {
+        let out = shell_preamble_fish(&ShellConfig::default());
+        assert!(out.contains("set -q CHEVRON_OSC133; or set -gx CHEVRON_OSC133 1"));
+        assert!(out.contains("set -q CHEVRON_TRANSIENT; or set -gx CHEVRON_TRANSIENT 1"));
+        assert!(out.contains(
+            "set -q CHEVRON_TRANSIENT_DURATION_MS; or set -gx CHEVRON_TRANSIENT_DURATION_MS 2000"
+        ));
+    }
+
+    #[test]
+    fn init_zsh_with_prepends_preamble_before_body() {
+        let out = init_zsh_with(&ShellConfig::default());
+        let preamble_idx = out.find("export CHEVRON_OSC133").expect("preamble missing");
+        let body_idx = out.find("_chevron_preexec").expect("body missing");
+        assert!(preamble_idx < body_idx, "preamble must come before body");
+    }
+
+    #[test]
+    fn init_bash_with_uses_posix_preamble() {
+        let out = init_bash_with(&ShellConfig::default());
+        assert!(out.contains("export CHEVRON_OSC133=\"${CHEVRON_OSC133-1}\""));
+        assert!(out.contains("PROMPT_COMMAND=_chevron_precmd"));
+    }
+
+    #[test]
+    fn init_fish_with_uses_fish_preamble() {
+        let out = init_fish_with(&ShellConfig::default());
+        assert!(out.contains("set -q CHEVRON_OSC133"));
+        assert!(out.contains("function fish_prompt"));
+    }
+
+    #[test]
+    fn init_zsh_zero_arg_matches_default_with() {
+        assert_eq!(init_zsh(), init_zsh_with(&ShellConfig::default()));
+    }
+
+    #[test]
+    fn init_bash_zero_arg_matches_default_with() {
+        assert_eq!(init_bash(), init_bash_with(&ShellConfig::default()));
+    }
+
+    #[test]
+    fn init_fish_zero_arg_matches_default_with() {
+        assert_eq!(init_fish(), init_fish_with(&ShellConfig::default()));
+    }
+
+    // ── instant prompt (chevron-nf8) ──────────────────────────────────────
+
+    #[test]
+    fn instant_prompt_snippet_has_detection_marker() {
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(
+            snippet.contains(super::INSTANT_PROMPT_MARKER),
+            "snippet must contain the marker so doctor can detect it"
+        );
+    }
+
+    #[test]
+    fn instant_prompt_snippet_reads_cache_file_without_forking() {
+        let snippet = super::init_zsh_instant_prompt();
+        // $(<file) is the zsh-builtin file-read — no fork.
+        assert!(
+            snippet.contains("$(<\"$_chevron_cache_file\")"),
+            "snippet must use $(<file) builtin, not sed/cat (perf)"
+        );
+        assert!(
+            !snippet.contains("sed -n"),
+            "snippet must not fork sed (perf)"
+        );
+    }
+
+    #[test]
+    fn instant_prompt_snippet_gates_on_interactive_tty() {
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(snippet.contains("-o interactive"));
+        assert!(snippet.contains("-t 1"));
+    }
+
+    #[test]
+    fn instant_prompt_snippet_skips_when_chevron_already_loaded() {
+        // The `! typeset -f _chevron_make_prompt` guard prevents re-firing
+        // when the user `source ~/.zshrc`s after the shell is up.
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(snippet.contains("typeset -f _chevron_make_prompt"));
+    }
+
+    #[test]
+    fn instant_prompt_snippet_only_paints_zsh_shaped_cache() {
+        // Multi-shell guard: only paint when zsh-style %{ brackets are
+        // present and bash-style square-bracket markers are absent.
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(snippet.contains("*'%{'*"));
+        assert!(snippet.contains("*'\\['*"));
+    }
+
+    #[test]
+    fn instant_prompt_snippet_registers_zshexit_cleanup() {
+        // Critical: if .zshrc errors before precmd fires, this hook must
+        // restore the fds so the user's terminal isn't broken.
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(snippet.contains("zshexit_functions+=(_chevron_instant_zshexit)"));
+        assert!(snippet.contains("_chevron_instant_zshexit()"));
+    }
+
+    #[test]
+    fn instant_prompt_snippet_uses_print_p_for_paint() {
+        // `-P` is essential so %{…%} markers are recognised as zero-width.
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(snippet.contains("print -nP -- \"$_chevron_cprompt\""));
+    }
+
+    #[test]
+    fn zsh_precmd_takeover_block_present_in_body() {
+        // Takeover block must be inside _chevron_precmd, before the OSC 133 D
+        // emission for the just-finished command.
+        let out = init_zsh();
+        assert!(
+            out.contains("Instant-prompt takeover"),
+            "takeover block must be present"
+        );
+        assert!(
+            out.contains("if [[ -n \"$_chevron_instant_active\" ]]"),
+            "takeover must gate on the activation flag"
+        );
+        // exit_status must be captured BEFORE takeover (cat in takeover
+        // would clobber $? otherwise).
+        let body = out;
+        let exit_idx = body
+            .find("local exit_status=$?")
+            .expect("exit_status capture");
+        let takeover_idx = body
+            .find("if [[ -n \"$_chevron_instant_active\" ]]")
+            .expect("takeover gate");
+        assert!(
+            exit_idx < takeover_idx,
+            "exit_status must be captured before the takeover clobbers $?"
+        );
+    }
+
+    #[test]
+    fn zsh_precmd_takeover_emits_osc133_d_under_gate() {
+        let out = init_zsh();
+        assert!(
+            out.contains("printf '\\e]133;D;0\\a'"),
+            "takeover must emit OSC 133 D to close the instant prompt region"
+        );
+    }
+
+    #[test]
+    fn zsh_precmd_takeover_clears_cached_paint() {
+        let out = init_zsh();
+        // \r\e[2K returns to col 1 and clears the cached prompt line.
+        assert!(
+            out.contains("print -n -- $'\\r\\e[2K'"),
+            "takeover must clear the cached prompt line"
+        );
+    }
+
+    #[test]
+    fn zsh_precmd_takeover_unsets_state_vars() {
+        let out = init_zsh();
+        assert!(out.contains("unset _chevron_instant_active"));
+        assert!(out.contains("_chevron_instant_buf"));
+        assert!(out.contains("_chevron_instant_orig_stdout"));
+        assert!(out.contains("_chevron_instant_orig_stderr"));
+    }
+
+    // ── original body assertions (preamble doesn't affect these) ──────────
 
     /// Body of a `name() { ... }` zsh function in the init script, up to
     /// the first un-indented closing brace.
@@ -590,7 +1291,7 @@ mod tests {
         // response behind to mis-row the next cycle's rewrite. The probe
         // must come before the query so we never race user input.
         let out = init_zsh();
-        let body = body_of(out, "_chevron_query_row() {");
+        let body = body_of(&out, "_chevron_query_row() {");
         let probe = body.find("zselect -t 0 -r").expect("pending-input probe");
         let query = body.find(r"printf '\e[6n'").expect("DSR query");
         assert!(probe < query, "probe must run before the query is emitted");
@@ -608,16 +1309,192 @@ mod tests {
         // without this guard — keeping the stty dance inside the helper
         // covers every caller.
         let out = init_zsh();
-        let body = body_of(out, "_chevron_query_row() {");
+        let body = body_of(&out, "_chevron_query_row() {");
         let echo_off = body.find("stty -echo -icanon").expect("echo guard");
         let query = body.find(r"printf '\e[6n'").expect("DSR query");
         assert!(echo_off < query, "-echo must be set before the query");
         // `stty -`/`$(stty` rather than bare `stty`: the preexec comment
         // block legitimately mentions Ghostty.
-        let pre = body_of(out, "_chevron_preexec() {");
+        let pre = body_of(&out, "_chevron_preexec() {");
         assert!(
             !pre.contains("stty -") && !pre.contains("$(stty"),
             "preexec must not duplicate the tty dance outside the helper"
+        );
+    }
+
+    #[test]
+    fn zsh_rewrite_only_after_real_collapse() {
+        // Alternate accept widgets (accept-and-hold, custom widgets
+        // calling .accept-line) bypass the override: the full prompt is
+        // still on screen, and a rewrite sized for the collapsed line
+        // would erase the wrong span over it. The row save (and with it
+        // the rewrite) must be gated on the collapse having painted.
+        let out = init_zsh();
+        let widget = body_of(&out, "_chevron_accept_line() {");
+        assert!(
+            widget.contains("_chevron_transient_collapsed=1"),
+            "accept-line override must record that the collapse painted"
+        );
+        let pre = body_of(&out, "_chevron_preexec() {");
+        assert!(
+            pre.contains(r#"-n "$_chevron_transient_collapsed""#),
+            "preexec row save must be gated on the collapse flag"
+        );
+        assert!(
+            out.contains("_chevron_transient_collapsed\n")
+                || out.contains("_chevron_transient_collapsed "),
+            "the flag must be cleared every cycle"
+        );
+    }
+
+    #[test]
+    fn zsh_async_reset_prompt_skips_ps2_continuations() {
+        // reset-prompt during a PS2 continuation corrupts the secondary
+        // prompt — and $CONTEXT alone cannot stand guard: ZLE maps its
+        // widget specials only inside widgets, so in the `zle -F` fd
+        // handler CONTEXT expands empty and `!= cont` always passed
+        // (chevron-ffu.2.1; e2e: shell_pty.rs::
+        // live_event_during_ps2_continuation_is_harmless). The callback
+        // must capture the interactive parser state (%_) on a bare stack
+        // and gate the repaint on both.
+        let out = init_zsh();
+        let cb_start = out.find("_chevron_async_callback() {").unwrap();
+        let cb_end = out[cb_start..].find("\n}\n").map(|i| cb_start + i).unwrap();
+        let body = &out[cb_start..cb_end];
+        let capture = body
+            .find(r#"local _chevron_cb_parser_ctx="${(%):-%_}""#)
+            .expect("callback must capture %_ before doing anything else");
+        let read = body
+            .find("cat <&$fd")
+            .expect("callback reads the refresh from the fd");
+        assert!(
+            capture < read,
+            "the %_ capture must precede the fd read (a bare stack is the point)"
+        );
+        assert!(
+            body.contains(
+                r#"[[ "$CONTEXT" == "cont" || -n "$_chevron_cb_parser_ctx" ]] && return"#
+            ),
+            "async callback must skip reset-prompt during PS2 (CONTEXT for \
+             widget contexts, captured %_ for fd-handler contexts)"
+        );
+    }
+
+    #[test]
+    fn zsh_async_callback_drops_results_in_accept_window() {
+        // The generation stamp only advances in precmd, so a refresh
+        // landing between accept-line and the next precmd passes the
+        // stale guard — and repainting there draws a full prompt over
+        // the just-collapsed line (chevron-6tc). The collapse flag
+        // brackets that window; the callback must drop results inside
+        // it, before any PROMPT mutation.
+        let out = init_zsh();
+        let cb = body_of(&out, "_chevron_async_callback() {");
+        let gen_guard = cb
+            .find("_chevron_async_spawn_gen")
+            .expect("generation stale guard");
+        let collapse_guard = cb
+            .find(r#"-n "$_chevron_transient_collapsed" ]] && return"#)
+            .expect("accept-window guard");
+        let prompt_set = cb.find("PROMPT=").expect("PROMPT assignment");
+        assert!(
+            gen_guard < collapse_guard && collapse_guard < prompt_set,
+            "accept-window guard must sit between the stale guard and the repaint"
+        );
+    }
+
+    #[test]
+    fn fish_transient_gates_on_validity_and_pager() {
+        // Ported from starship/oh-my-posh: Enter with the completion
+        // pager open selects an entry (never collapse); an incomplete
+        // buffer inserts a newline instead of executing (collapsing
+        // would strand a bare chevron over a live multiline edit); a
+        // cancelled line must drop the armed flag.
+        let out = init_fish();
+        assert!(out.contains("commandline --paging-mode"));
+        assert!(out.contains("commandline --is-valid"));
+        assert!(out.contains("--on-event fish_cancel"));
+        assert!(
+            out.contains(r"bind -M insert \r _chevron_transient_enter"),
+            "vi insert mode needs its own Enter binding"
+        );
+    }
+
+    #[test]
+    fn zsh_tty_dances_are_interrupt_safe() {
+        // ^C during the exchange unwinds the hook chain mid-function;
+        // only an always-block guarantees the stty restore and fd close
+        // still run. Without it the terminal is left raw with echo off,
+        // and the next exchange's `stty -g` save makes the wedge
+        // permanent.
+        let out = init_zsh();
+        let query = body_of(&out, "_chevron_query_row() {");
+        assert!(
+            query.contains("} always {"),
+            "query helper must restore the tty via an always-block"
+        );
+        let precmd = body_of(&out, "_chevron_precmd() {");
+        assert!(
+            precmd.contains("} always {"),
+            "precmd sweep must restore the tty via an always-block"
+        );
+    }
+
+    #[test]
+    fn zsh_query_row_probes_raw_and_lingers_for_precmd() {
+        let out = init_zsh();
+        let body = body_of(&out, "_chevron_query_row() {");
+        // Raw mode must precede the pending-input probe: select on a
+        // canonical tty reports readability only at line boundaries, so
+        // a cooked probe misses partial-line typeahead (paste leftovers
+        // after an interactive `read -rs`) and the query then races
+        // input the probe missed.
+        let raw = body.find("stty -echo -icanon").expect("raw flip");
+        let probe = body.find("zselect -t 0 -r").expect("probe");
+        assert!(raw < probe, "raw mode must precede the probe");
+        // A CSI-less read buffer is typeahead truncated at a typed `R`;
+        // it must be re-injected (with the eaten delimiter restored),
+        // never silently dropped.
+        assert!(
+            body.contains(r#"print -z -- "${resp}R""#),
+            "truncated typeahead must be re-injected"
+        );
+        // precmd's rewrite query must linger on timeout: no sweep runs
+        // between it and ZLE, so an unabsorbed straggler kernel-echoes.
+        assert!(
+            out.contains("_chevron_query_row 30"),
+            "precmd's query must pass a linger window"
+        );
+    }
+
+    #[test]
+    fn zsh_exec_never_persists_stderr_suppression() {
+        // A bare `exec` makes every redirection on it permanent: `exec
+        // {fd}< /dev/tty 2>/dev/null` pointed the whole shell's stderr
+        // at /dev/null from the first prompt cycle — error messages
+        // vanished and ncurses reset/tset (which reach the terminal via
+        // fd 2) aborted silently as "reset stopped working". Error
+        // suppression on an exec must be scoped via a brace group.
+        let out = init_zsh();
+        assert!(
+            out.contains("{ exec {fd}< /dev/tty } 2>/dev/null || return"),
+            "query helper's tty open must scope its 2>/dev/null"
+        );
+        assert!(
+            out.contains("if { exec {_chevron_sweep_fd}< /dev/tty } 2>/dev/null; then"),
+            "precmd sweep's tty open must scope its 2>/dev/null"
+        );
+        // The instant-prompt fd restores must not end with a stderr
+        // redirect: redirections apply left to right, so a trailing
+        // 2>/dev/null is the final word on fd 2 and exec persists it.
+        assert!(
+            !out.contains(r#""$_chevron_instant_orig_stderr" 2>/dev/null"#),
+            "instant takeover restore must not re-point fd 2 at /dev/null"
+        );
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(
+            !snippet.contains(r#""$_chevron_instant_orig_stderr" 2>/dev/null"#),
+            "zshexit restore must not re-point fd 2 at /dev/null"
         );
     }
 
@@ -650,7 +1527,7 @@ mod tests {
         // and never print -z anything containing ESC back into the
         // edit buffer.
         let out = init_zsh();
-        let body = body_of(out, "_chevron_query_row() {");
+        let body = body_of(&out, "_chevron_query_row() {");
         assert!(
             body.contains(r#"payload="${resp##*$'\e['}""#),
             "payload must come from the last CSI in the buffer"
@@ -674,7 +1551,7 @@ mod tests {
         // timeout branch must flag it for precmd's sweep; a successful
         // read must clear the flag and absorb same-instant duplicates.
         let out = init_zsh();
-        let body = body_of(out, "_chevron_query_row() {");
+        let body = body_of(&out, "_chevron_query_row() {");
         assert!(
             body.contains("_chevron_dsr_inflight=1"),
             "timeout branch must flag the in-flight response"
@@ -692,7 +1569,7 @@ mod tests {
     #[test]
     fn zsh_precmd_sweeps_inflight_response_before_zle() {
         let out = init_zsh();
-        let body = body_of(out, "_chevron_precmd() {");
+        let body = body_of(&out, "_chevron_precmd() {");
         assert!(
             body.contains(r#"[[ -n "$_chevron_dsr_inflight""#),
             "precmd must check for an in-flight response"
@@ -709,7 +1586,7 @@ mod tests {
         // data is consumed; the first plain byte is pushed back onto
         // the buffer stack (order-preserving) and draining stops.
         let out = init_zsh();
-        let body = body_of(out, "_chevron_drain_reports() {");
+        let body = body_of(&out, "_chevron_drain_reports() {");
         assert!(body.contains(r"== $'\e'"), "must discriminate on ESC");
         assert!(
             body.contains(r#"print -z -- "$_chevron_first""#),
@@ -922,13 +1799,13 @@ mod tests {
         // builtins measured ~0.2s under a lowered threshold. Start is
         // stamped at the END of preexec, end at the TOP of precmd.
         let out = init_zsh();
-        let pre = body_of(out, "_chevron_preexec() {");
+        let pre = body_of(&out, "_chevron_preexec() {");
         assert!(
             pre.find("_chevron_query_row").unwrap()
                 < pre.find("_chevron_cmd_start=$EPOCHREALTIME").unwrap(),
             "start timestamp must be stamped after the DSR machinery"
         );
-        let pc = body_of(out, "_chevron_precmd() {");
+        let pc = body_of(&out, "_chevron_precmd() {");
         assert!(
             pc.find("_chevron_cmd_end=$EPOCHREALTIME").unwrap()
                 < pc.find("_chevron_query_row").unwrap(),
@@ -1043,7 +1920,7 @@ mod tests {
             out.contains(r#"_chevron_async_spawn_gen="$_chevron_async_gen""#),
             "spawn must stamp the generation it belongs to"
         );
-        let cb = body_of(out, "_chevron_async_callback() {");
+        let cb = body_of(&out, "_chevron_async_callback() {");
         assert!(
             cb.contains(r#"[[ "$_chevron_async_spawn_gen" == "$_chevron_async_gen" ]] || return"#),
             "callback must drop results from older generations"
@@ -1381,5 +2258,232 @@ mod tests {
         assert!(out.contains("60000"), "60s pivot present");
         assert!(out.contains("%dm %ds"), "minute format present");
         assert!(out.contains("%d.%ds"), "sub-minute decimal format present");
+    }
+
+    // ── chevron-1yn Phase 1: command-lifecycle publish ──────────────────
+
+    #[test]
+    fn zsh_publishes_cmd_lifecycle_to_chevrond() {
+        let out = init_zsh();
+        assert!(
+            out.contains("_chevron_cmd_id=$(chevron event cmd-start"),
+            "preexec must capture a cmd id from chevron event cmd-start"
+        );
+        assert!(
+            out.contains(r#"chevron event cmd-end "$_chevron_cmd_id""#),
+            "precmd must publish cmd-end with the captured id"
+        );
+        assert!(
+            out.contains("_chevron_session_id=$(chevron event new-session"),
+            "init must mint a session id once per shell"
+        );
+    }
+
+    #[test]
+    fn zsh_lifecycle_respects_history_opt_out() {
+        let out = init_zsh();
+        // preexec guard: CHEVRON_HISTORY=0 short-circuits.
+        assert!(
+            out.contains(r#""${CHEVRON_HISTORY:-1}" != "0""#),
+            "expected CHEVRON_HISTORY opt-out gate"
+        );
+        // Ignorespace pattern: leading-space commands are excluded.
+        assert!(
+            out.contains(r#""$1" != " "*"#),
+            "leading-space (ignorespace) commands should be excluded"
+        );
+    }
+
+    #[test]
+    fn bash_publishes_cmd_lifecycle_to_chevrond() {
+        let out = init_bash();
+        assert!(
+            out.contains("_chevron_cmd_id=$(chevron event cmd-start"),
+            "DEBUG-trap preexec must capture a cmd id"
+        );
+        assert!(
+            out.contains(r#"chevron event cmd-end "$_chevron_cmd_id""#),
+            "PROMPT_COMMAND must publish cmd-end"
+        );
+        assert!(
+            out.contains("_chevron_session_id=$(chevron event new-session"),
+            "init must mint a session id"
+        );
+    }
+
+    #[test]
+    fn bash_lifecycle_uses_bash_command_for_cmd_text() {
+        // The DEBUG trap fires before the command runs; bash exposes the
+        // literal line as $BASH_COMMAND. Confirm the preexec branch uses
+        // that rather than something stale or invented.
+        let out = init_bash();
+        assert!(
+            out.contains(
+                r#"chevron event cmd-start "$_chevron_session_id" "$PWD" "$BASH_COMMAND""#
+            ),
+            "preexec should pass $BASH_COMMAND as the cmd argument"
+        );
+    }
+
+    #[test]
+    fn bash_lifecycle_skips_when_already_capturing() {
+        // Bash fires DEBUG per simple command in a pipeline; we should
+        // only stash an id on the first one (so cmd-end in precmd has a
+        // single id to close).
+        let out = init_bash();
+        assert!(
+            out.contains(r#"-z "$_chevron_cmd_id""#),
+            "preexec should guard against re-publishing within a single PROMPT_COMMAND cycle"
+        );
+    }
+
+    #[test]
+    fn fish_publishes_cmd_lifecycle_to_chevrond() {
+        let out = init_fish();
+        assert!(
+            out.contains("set -g _chevron_cmd_id (chevron event cmd-start"),
+            "fish_preexec must capture a cmd id"
+        );
+        assert!(
+            out.contains(r#"chevron event cmd-end "$_chevron_cmd_id""#),
+            "fish_postexec must publish cmd-end"
+        );
+        assert!(
+            out.contains("set -g _chevron_session_id (chevron event new-session"),
+            "init must mint a session id"
+        );
+    }
+
+    #[test]
+    fn fish_lifecycle_respects_history_opt_out_and_ignorespace() {
+        let out = init_fish();
+        assert!(
+            out.contains(r#"test "$CHEVRON_HISTORY" != "0""#),
+            "fish lifecycle hook must check CHEVRON_HISTORY"
+        );
+        assert!(
+            out.contains(r#"string match -q ' *' -- "$argv[1]""#),
+            "fish lifecycle hook must skip leading-space (ignorespace) commands"
+        );
+    }
+
+    // ── chevron-1yn.3 Phase 3: live prompt subscriber ───────────────────
+
+    #[test]
+    fn zsh_live_subscriber_gated_on_env() {
+        let out = init_zsh();
+        // The spawn block is gated on CHEVRON_LIVE != 0. The preamble now
+        // defaults it on (graduated, chevron-ffu); CHEVRON_LIVE=0 opts out.
+        assert!(
+            out.contains("${CHEVRON_LIVE:-0}"),
+            "live subscriber should be gated on CHEVRON_LIVE env var"
+        );
+    }
+
+    #[test]
+    fn zsh_live_subscriber_spawns_chevron_subscribe() {
+        let out = init_zsh();
+        assert!(
+            out.contains("exec {_chevron_live_fd}< <(chevron subscribe"),
+            "live mode should spawn `chevron subscribe` via process substitution"
+        );
+        assert!(
+            out.contains(r#"zle -F "$_chevron_live_fd" _chevron_live_callback"#),
+            "live mode should register a zle -F callback on the subscriber's stdout fd"
+        );
+    }
+
+    #[test]
+    fn zsh_live_callback_uses_async_pipeline() {
+        // The live callback reuses the existing async render
+        // pipeline so we don't duplicate prompt-render logic. It
+        // should call _chevron_start_async with stashed exit + duration.
+        let out = init_zsh();
+        let cb_start = out.find("_chevron_live_callback() {").unwrap();
+        let cb_end = out[cb_start..].find("\n}\n").map(|i| cb_start + i).unwrap();
+        let body = &out[cb_start..cb_end];
+        assert!(
+            body.contains("_chevron_start_async"),
+            "live callback should kick the async render path"
+        );
+        assert!(
+            body.contains("_chevron_last_exit"),
+            "live callback should use the precmd-stashed last exit"
+        );
+    }
+
+    #[test]
+    fn zsh_live_callback_debounces_event_bursts() {
+        // A burst of FS events (git rebase, fetch + merge) shouldn't
+        // trigger N renders. The callback should compare timestamps
+        // and bail if within the debounce window.
+        let out = init_zsh();
+        let cb_start = out.find("_chevron_live_callback() {").unwrap();
+        let cb_end = out[cb_start..].find("\n}\n").map(|i| cb_start + i).unwrap();
+        let body = &out[cb_start..cb_end];
+        assert!(
+            body.contains("_chevron_live_last_ms"),
+            "callback should compare against a stashed last-event timestamp"
+        );
+        assert!(
+            body.contains("< 100"),
+            "callback should debounce within 100ms"
+        );
+    }
+
+    #[test]
+    fn zsh_live_callback_unregisters_on_eof() {
+        // When the subscriber pipe closes (daemon restart, helper
+        // died), the callback should unregister itself so we don't
+        // burn CPU on a busy-empty fd.
+        let out = init_zsh();
+        let cb_start = out.find("_chevron_live_callback() {").unwrap();
+        let cb_end = out[cb_start..].find("\n}\n").map(|i| cb_start + i).unwrap();
+        let body = &out[cb_start..cb_end];
+        assert!(
+            body.contains("zle -F \"$fd\""),
+            "callback should call `zle -F fd` (no handler) on EOF to unregister"
+        );
+    }
+
+    #[test]
+    fn zsh_live_callback_scopes_redraws_to_cwd_by_default() {
+        // Without scoping, every shell re-renders on every repo's events
+        // (thundering herd). The callback must filter EVENT lines against
+        // $PWD unless the user opted into cross-repo liveness for the
+        // cross-pane case (CHEVRON_LIVE_SCOPE=all).
+        let out = init_zsh();
+        let cb_start = out.find("_chevron_live_callback() {").unwrap();
+        let cb_end = out[cb_start..].find("\n}\n").map(|i| cb_start + i).unwrap();
+        let body = &out[cb_start..cb_end];
+        assert!(
+            body.contains("CHEVRON_LIVE_SCOPE"),
+            "live callback must honor the scope knob"
+        );
+        assert!(
+            body.contains("!= all"),
+            "scope must be opt-out-able via CHEVRON_LIVE_SCOPE=all (cross-pane)"
+        );
+        assert!(
+            body.contains(r#""$PWD/" == "#),
+            "scoped filter must redraw only when $PWD is inside the event workdir"
+        );
+    }
+
+    #[test]
+    fn zsh_precmd_stashes_last_exit_and_duration() {
+        // The live callback needs realistic args for _chevron_start_async.
+        // precmd is the only place that knows the last command's exit
+        // status and duration, so it must stash them globally for the
+        // callback to read between prompts.
+        let out = init_zsh();
+        assert!(
+            out.contains("_chevron_last_exit=$exit_status"),
+            "precmd should stash exit_status into a module-scope var"
+        );
+        assert!(
+            out.contains("_chevron_last_duration=$duration_ms"),
+            "precmd should stash duration_ms into a module-scope var"
+        );
     }
 }

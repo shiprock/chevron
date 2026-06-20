@@ -30,6 +30,10 @@ use std::time::{Duration, Instant};
 
 const ROWS: u16 = 24;
 const COLS: u16 = 120;
+/// Wide terminal for the daemon-backed live fixture, so a long CI hostname
+/// can't wrap the short test input. See `LiveFixture::spawn_with`.
+#[cfg(feature = "daemon")]
+const LIVE_COLS: u16 = 220;
 /// The chevron glyph used by the transient prompt collapse/rewrite.
 const CHEVRON: char = '\u{276f}'; // ❯
 /// Tail of the live (un-collapsed) prompt: the `$` prompt char followed
@@ -60,6 +64,12 @@ enum Dsr {
     /// multiplexer/emulator stacks that double-report. The duplicate
     /// lingers in the input queue to poison the next exchange.
     DoubleResponse,
+    /// Answer odd-numbered queries (preexec's) immediately and
+    /// even-numbered ones (precmd's rewrite) after a delay past the
+    /// 300 ms read budget — an emulator whose load spikes mid-cycle.
+    /// Exercises the precmd-side straggler, which has no sweep point
+    /// behind it before ZLE takes the terminal.
+    AlternateDelayed(Duration),
 }
 
 /// Prompt-render mode for the spawned shell.
@@ -67,6 +77,10 @@ enum Dsr {
 enum Render {
     /// `CHEVRON_ASYNC` unset: every prompt renders synchronously.
     Sync,
+    /// Synchronous, plus a PATH wrapper delaying every render — holds
+    /// the post-precmd window (echo restored, ZLE not yet up) open so
+    /// straggler-arrival races become deterministic.
+    SyncDelayed(Duration),
     /// `CHEVRON_ASYNC=1`: cached prompt plus background refresh.
     Async,
     /// `CHEVRON_ASYNC=1` plus a PATH wrapper delaying every render —
@@ -140,6 +154,13 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+fn count_subslices(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
 /// These are integration tests of the *zsh* init; environments without
 /// zsh (the nix build sandbox, minimal CI images) skip them — loudly —
 /// instead of failing at PTY spawn.
@@ -167,6 +188,7 @@ fn pump_output(
 ) {
     let mut buf = [0u8; 8192];
     let mut pend: Vec<u8> = Vec::new();
+    let mut query_no: usize = 0;
     loop {
         let n = match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
@@ -182,6 +204,7 @@ fn pump_output(
                 let (row, col) = p.screen().cursor_position();
                 drop(p);
                 pend.drain(..end);
+                query_no += 1;
                 let resp = format!("\x1b[{};{}R", row + 1, col + 1).into_bytes();
                 match dsr {
                     Dsr::Silent => {}
@@ -208,6 +231,14 @@ fn pump_output(
                     Dsr::DoubleResponse => {
                         let _ = tx.send((Instant::now(), resp.clone()));
                         let _ = tx.send((Instant::now(), resp));
+                    }
+                    Dsr::AlternateDelayed(d) => {
+                        let due = if query_no % 2 == 1 {
+                            Instant::now()
+                        } else {
+                            Instant::now() + d
+                        };
+                        let _ = tx.send((due, resp));
                     }
                 }
             } else {
@@ -247,6 +278,21 @@ impl Term {
     }
 
     fn spawn_inner(dsr: Dsr, rows: u16, cols: u16, mode: Render) -> Self {
+        Self::spawn_customized(dsr, rows, cols, mode, |_, _| {})
+    }
+
+    /// Spawn with a fixture hook: `customize(home, path_dirs)` runs
+    /// after the default `.zshenv`/`.zshrc` are written and before zsh
+    /// starts. Tests use it to overwrite `.zshrc` (keep
+    /// `path=({path_dirs} $path)` so the test-built chevron wins over
+    /// /etc/zshenv) or to pre-seed cache files under the hermetic home.
+    fn spawn_customized(
+        dsr: Dsr,
+        rows: u16,
+        cols: u16,
+        mode: Render,
+        customize: impl FnOnce(&std::path::Path, &str),
+    ) -> Self {
         let home = tempfile::TempDir::new().unwrap();
         // macOS tempdirs live behind a /var -> /private/var symlink;
         // canonicalize so $HOME matches what getcwd() reports and the
@@ -264,7 +310,7 @@ impl Term {
         // and sleeps before `prompt` renders, so a background refresh
         // reliably outlives the next prompt cycle.
         let mut path_dirs = bin_dir.display().to_string();
-        if let Render::AsyncDelayed(delay) = mode {
+        if let Render::AsyncDelayed(delay) | Render::SyncDelayed(delay) = mode {
             use std::os::unix::fs::PermissionsExt;
             let wrapper_dir = home_path.join("wrapper-bin");
             std::fs::create_dir_all(&wrapper_dir).unwrap();
@@ -290,6 +336,7 @@ impl Term {
             format!("path=({path_dirs} $path)\neval \"$(chevron init zsh)\"\n"),
         )
         .unwrap();
+        customize(&home_path, &path_dirs);
 
         let pty = native_pty_system();
         let pair = pty
@@ -309,6 +356,11 @@ impl Term {
         cmd.env("LANG", "en_US.UTF-8");
         cmd.env("LC_ALL", "en_US.UTF-8");
         cmd.env("CHEVRON_NO_DAEMON", "1");
+        // Live is on by default now; keep it off for the non-live tests so
+        // they don't each spawn a (daemon-less, immediately-exiting)
+        // `chevron subscribe`. LiveFixture re-exports CHEVRON_LIVE=1 in its
+        // .zshrc, which the init preamble honors.
+        cmd.env("CHEVRON_LIVE", "0");
         // The async prompt cache lives under XDG_RUNTIME_DIR; point it
         // at the test home so parallel tests (and the developer's real
         // shells) never share cache state.
@@ -325,10 +377,11 @@ impl Term {
             "CHEVRON_ASYNC",
             "CHEVRON_CACHE_FILE",
             "CHEVRON_TRANSIENT_DURATION_MS",
+            "CHEVRON_HISTORY",
         ] {
             cmd.env_remove(var);
         }
-        if !matches!(mode, Render::Sync) {
+        if matches!(mode, Render::Async | Render::AsyncDelayed(_)) {
             cmd.env("CHEVRON_ASYNC", "1");
         }
 
@@ -423,6 +476,24 @@ impl Term {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if self.with_screen(&pred) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}\n{}",
+                self.dump()
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+
+    /// Like `wait_for`, but the predicate runs over the raw byte stream
+    /// — for syncing on emissions that never change the rendered grid
+    /// (OSC markers, DSR queries).
+    fn wait_for_raw(&self, what: &str, pred: impl Fn(&[u8]) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if pred(&self.raw.lock().unwrap()) {
                 return;
             }
             assert!(
@@ -956,11 +1027,33 @@ fn resize_during_command_skips_rewrite() {
     // Wide enough to wrap at 120 cols (2 rows) — and at the post-resize
     // 60 cols the naive span recompute says 3 rows, one of which is the
     // sentinel.
-    let wide = format!("sleep 0.4 && : {}", "x".repeat(133));
+    let wide = format!("sleep 1 && : {}", "x".repeat(133));
     t.send_line(&wide);
-    // Collapse + preexec query finish in milliseconds; the resize lands
-    // squarely inside the sleep.
-    std::thread::sleep(Duration::from_millis(200));
+    // Anchor the resize to the wide command's preexec having MEASURED
+    // its geometry, not merely started. preexec emits OSC-133-C, then a
+    // few lines later queries the cursor row via DSR and saves
+    // "$COLUMNS:$LINES"; precmd skips the rewrite only when that SAVED
+    // geometry (captured at the old width) differs from precmd's. The
+    // old anchor (2nd OSC-133-C + a fixed 100 ms) fired at the very
+    // start of preexec; under load the up-to-300 ms DSR read outran the
+    // 100 ms, so SIGWINCH interrupted the read, $COLUMNS flipped
+    // mid-flight, and the geometry was stamped at the POST-resize width
+    // — the guard misfired and the rewrite ate the sentinel. Wait
+    // instead for the DSR query the wide command's preexec emits just
+    // before the save (the 6n following the 2nd OSC-133-C), then let it
+    // settle so the read finishes and the old width is recorded.
+    t.wait_for_raw("wide command's preexec geometry query", |raw| {
+        let osc = b"\x1b]133;C";
+        let Some(first) = find_subslice(raw, osc) else {
+            return false;
+        };
+        let after_first = &raw[first + osc.len()..];
+        let Some(second) = find_subslice(after_first, osc) else {
+            return false;
+        };
+        find_subslice(&after_first[second + osc.len()..], b"\x1b[6n").is_some()
+    });
+    t.wait_settled(Duration::from_millis(250));
     t.resize(24, 60);
     t.wait_for("reprompt after mid-command resize", prompt_ready);
     t.wait_settled(Duration::from_millis(200));
@@ -1548,6 +1641,51 @@ fn async_rapid_typeahead_stays_consistent() {
     );
 }
 
+/// chevron-6tc: a background refresh landing in the accept window —
+/// after accept-line paints the collapsed stub but before the next
+/// precmd bumps the generation — is NOT stale by the generation guard
+/// (the bump hasn't happened yet), so its `zle reset-prompt` repaints
+/// over the collapse and the cycle shows a duplicated line. Sweep the
+/// Enter timing across the refresh's ~150 ms arrival so some cycle
+/// lands inside the window; every cycle must still collapse to exactly
+/// one chevron row.
+#[test]
+fn async_refresh_at_accept_never_duplicates() {
+    if !zsh_available() {
+        return;
+    }
+    // 48 rows: 16 two-row cycles must all stay on screen for the final
+    // glyph count (the default 24 rows scrolls early cycles away).
+    let t = Term::spawn_inner(
+        Dsr::Immediate,
+        48,
+        COLS,
+        Render::AsyncDelayed(Duration::from_millis(150)),
+    );
+    let offsets: [u64; 16] = [
+        110, 130, 137, 140, 143, 146, 149, 152, 155, 158, 161, 164, 167, 170, 180, 195,
+    ];
+    for (i, off) in offsets.iter().enumerate() {
+        // The refresh for the prompt on screen was spawned by the
+        // precmd that painted it; varying the typing offset sweeps the
+        // race window around its arrival.
+        std::thread::sleep(Duration::from_millis(*off));
+        let marker = format!("c{i}-out");
+        t.send_line(&format!("echo {marker}"));
+        t.wait_for("cycle output and reprompt", move |s| {
+            lines(s).iter().any(|l| l == &marker) && prompt_ready(s)
+        });
+    }
+    t.wait_settled(Duration::from_millis(500));
+
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        offsets.len(),
+        "every cycle must keep exactly one collapsed chevron\n{}",
+        t.dump()
+    );
+}
+
 /// tmux/SSH-grade latency that still fits the 300 ms read budget: the
 /// rewrite must work exactly as in the immediate case.
 #[test]
@@ -1626,5 +1764,846 @@ fn terminal_without_dsr_degrades_cleanly() {
         vt100::Color::Default,
         "{}",
         t.dump()
+    );
+}
+
+/// The shell's stderr must stay wired to the terminal. Regression test:
+/// the query helper opened its tty fd with a bare `exec {fd}< /dev/tty
+/// 2>/dev/null` — and exec makes every redirection on it permanent, so
+/// the first prompt cycle pointed the shell's (and every child's) fd 2
+/// at /dev/null. Error messages silently vanished from then on.
+#[test]
+fn command_stderr_stays_visible() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    // A full prompt cycle first, so the query helper's fd dance has run.
+    t.run("true");
+    t.send_line("ls /chevron-no-such-path");
+    t.wait_for("ls's error text to reach the terminal", |s| {
+        lines(s).iter().any(|l| l.starts_with("ls:"))
+    });
+}
+
+/// `reset` (ncurses tset) reads the terminal via stderr and
+/// re-initializes it with RIS (`\ec`), which clears the screen and homes
+/// the cursor between preexec's row save and precmd's rewrite. The
+/// rewrite must skip (the homed cursor sits above the saved row, so the
+/// delta goes negative), a fresh prompt must paint on the cleared
+/// screen, and the shell must stay fully usable afterwards.
+///
+/// Regression test: with the shell's stderr left on /dev/null by the
+/// bare-exec bug above, tset's `tcgetattr(STDERR_FILENO)` failed with
+/// ENOTTY and it exited 1 before emitting a single byte — "the reset
+/// command no longer works", with even its error message swallowed.
+#[test]
+fn reset_command_reinitializes_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.run("/bin/echo before-reset");
+    t.send_line("reset");
+    t.wait_for("RIS to clear the screen and a fresh prompt", |s| {
+        prompt_ready(s) && !lines(s).iter().any(|l| l.contains("before-reset"))
+    });
+    t.run("/bin/echo after-reset");
+    t.wait_settled(Duration::from_millis(200));
+
+    let all = t.with_screen(lines);
+    assert!(
+        all.iter().any(|l| l == "after-reset"),
+        "shell must stay usable after reset\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} /bin/echo after-reset"],
+        "only the post-reset command's collapsed row should remain\n{}",
+        t.dump()
+    );
+}
+
+/// Interactive secret entry (`read -rs "VAR?prompt"`) with paste
+/// leftovers: the paste carries bytes past the newline the read
+/// consumed, with no trailing newline of their own. A cooked-mode
+/// pending-input probe cannot see a partial line (canonical select
+/// reports readability only at line boundaries), so precmd's query
+/// used to race the leftovers: `read -d 'R'` truncated at an `R`
+/// inside them, ate everything before it, and left the real DSR
+/// response stranded to surface as literal `^[[row;1R` garbage — the
+/// shape reported with an Ashby API key paste. The probe now runs raw
+/// (partials visible, query skipped) and truncated typeahead is
+/// re-injected instead of eaten.
+#[test]
+fn paste_leftovers_during_interactive_read_stay_clean() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.send_line("read -rs \"K?key: \"; echo len-${#K}");
+    t.wait_for("the read builtin's prompt", |s| {
+        lines(s).iter().any(|l| l == "key:")
+    });
+    // Paste: the secret, the newline that finishes the read, then a
+    // tail with an interior `R` that stays queued as a partial line.
+    t.send("SECRETKEY9\rTRAILR-MORE");
+    t.wait_for("read to finish with the key intact", |s| {
+        lines(s).iter().any(|l| l.contains("len-10"))
+    });
+    // Poll for the parked leftovers rather than settle-then-assert: on
+    // a loaded parallel run, a 400 ms quiet window can elapse while the
+    // starved shell still has the typeahead pop pending.
+    t.wait_for("paste leftovers parked in the edit buffer", |s| {
+        last_nonempty(s).ends_with("TRAILR-MORE")
+    });
+
+    let all = t.with_screen(lines);
+    assert!(
+        all.iter().all(|l| !l.contains(";1") && !l.contains("^[")),
+        "no DSR response may leak as literal text\n{}",
+        t.dump()
+    );
+}
+
+/// An emulator that answers preexec's query instantly but precmd's
+/// rewrite query past the 300 ms read budget. preexec's stragglers are
+/// covered by the sweep at the top of the NEXT precmd — but behind
+/// precmd's own query there is no sweep, only ZLE: the response used to
+/// arrive just after the helper restored echo and kernel-echo at the
+/// cursor as literal `^[[row;1R` (or self-insert its tail into the
+/// edit buffer). The helper now lingers in its raw window on timeout
+/// and absorbs the straggler before echo returns.
+#[test]
+fn slow_precmd_dsr_response_never_leaks() {
+    if !zsh_available() {
+        return;
+    }
+    // The straggler lands at 400 ms: 100 ms past the read budget (the
+    // helper has definitely given up) and squarely inside the 300 ms
+    // render window the SyncDelayed wrapper holds open — echo is
+    // restored, ZLE is not yet up, so an unabsorbed response
+    // kernel-echoes. The helper's 300 ms linger covers arrivals
+    // through ~600 ms.
+    let t = Term::spawn_inner(
+        Dsr::AlternateDelayed(Duration::from_millis(400)),
+        ROWS,
+        COLS,
+        Render::SyncDelayed(Duration::from_millis(300)),
+    );
+    t.run("true");
+    t.wait_settled(Duration::from_millis(700));
+
+    // The leak is transient on screen (the next prompt can paint over
+    // it), so assert on the raw byte stream: a kernel-echoed response
+    // appears as caret-notation `^[[` — three printable bytes that
+    // never occur in chevron's legitimate output (real CSIs are ESC
+    // bytes, not caret text).
+    let echoed_caret = {
+        let raw = t.raw.lock().unwrap();
+        raw.windows(3).any(|w| w == b"^[[")
+    };
+    assert!(
+        !echoed_caret,
+        "straggling precmd response must never kernel-echo\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true"],
+        "{}",
+        t.dump()
+    );
+}
+
+/// ^C landing inside the precmd sweep's raw-mode window (the 300 ms
+/// drain paid on terminals that never answered preexec's query). The
+/// interrupt unwinds the hook chain mid-function; without an
+/// always-block the stty restore and fd close are skipped, leaving the
+/// terminal raw with echo off — and the NEXT exchange's `stty -g` save
+/// captures the wedged state and faithfully re-restores it, making the
+/// wedge permanent. The tty state after the interrupt must equal the
+/// state before it.
+#[test]
+fn ctrl_c_during_dsr_sweep_leaves_tty_sane() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Silent);
+    t.run("pre_stty=$(stty -g)");
+    t.send_line("true");
+    // precmd announces itself with the third OSC 133 D (spawn cycle,
+    // the stty capture, then `true`); the 300 ms sweep drain starts
+    // just after. Land the interrupt ~100 ms into it.
+    t.wait_for_raw("third OSC 133 D (precmd entered)", |raw| {
+        count_subslices(raw, b"\x1b]133;D") >= 3
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    t.send("\x03");
+    // The unwound precmd never reaches the prompt render, so zsh reuses
+    // the collapsed stub (`❯ `) as the next prompt — cosmetic, repaired
+    // by the next full cycle. Wait for output to settle, not for a full
+    // prompt.
+    t.wait_settled(Duration::from_millis(500));
+
+    t.send_line("[[ \"$(stty -g)\" == \"$pre_stty\" ]] && echo TTY-SANE || echo TTY-WEDGED");
+    t.wait_for("tty verdict", |s| {
+        lines(s)
+            .iter()
+            .any(|l| l == "TTY-SANE" || l == "TTY-WEDGED")
+    });
+    assert!(
+        t.with_screen(|s| lines(s).iter().any(|l| l == "TTY-SANE")),
+        "an interrupted sweep must still restore the tty\n{}",
+        t.dump()
+    );
+    // The cycle after the interrupt repaints the full prompt.
+    t.wait_for("full prompt to return", prompt_ready);
+}
+
+/// End-to-end instant prompt (chevron-nf8): the paste-in snippet paints
+/// the cached prompt before .zshrc finishes, buffers all .zshrc output,
+/// and the first precmd takes over — restoring fds, clearing the cached
+/// line, and replaying the buffer. The snippet had no PTY coverage at
+/// all, despite owning one of the stderr-nuking exec bugs.
+#[test]
+fn instant_prompt_paints_takes_over_and_restores_fds() {
+    if !zsh_available() {
+        return;
+    }
+    let snippet = std::process::Command::new(env!("CARGO_BIN_EXE_chevron"))
+        .args(["init", "zsh", "--instant-prompt"])
+        .output()
+        .unwrap();
+    assert!(snippet.status.success(), "init zsh --instant-prompt failed");
+    let snippet = String::from_utf8(snippet.stdout).unwrap();
+    let uid = String::from_utf8(
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let t = Term::spawn_customized(
+        Dsr::Immediate,
+        ROWS,
+        COLS,
+        Render::Sync,
+        move |home, path_dirs| {
+            // Pre-seed the cache the snippet reads: pwd line, zsh-shaped
+            // prompt body (must contain `%{`), tmux title line.
+            let cache_dir = home.join(format!("chevron-{uid}"));
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            std::fs::write(
+                cache_dir.join("last-prompt"),
+                format!(
+                    "{}\n%{{\x1b[32m%}}CACHED-INSTANT%{{\x1b[0m%}} \ntitle\n",
+                    home.display()
+                ),
+            )
+            .unwrap();
+            // The documented install: snippet at the very top, then the
+            // normal init. The echo runs while fds are buffered and must
+            // be replayed at takeover.
+            std::fs::write(
+                home.join(".zshrc"),
+                format!(
+                    "{snippet}\necho zshrc-noise\npath=({path_dirs} $path)\neval \"$(chevron init zsh)\"\n"
+                ),
+            )
+            .unwrap();
+        },
+    );
+    t.wait_settled(Duration::from_millis(200));
+
+    // The cached prompt was painted. The takeover clears that line, so
+    // assert on the raw stream, not the final grid.
+    assert!(
+        {
+            let raw = t.raw.lock().unwrap();
+            find_subslice(&raw, b"CACHED-INSTANT").is_some()
+        },
+        "cached prompt must be painted while .zshrc loads\n{}",
+        t.dump()
+    );
+    // Output produced while fds were redirected must be replayed.
+    assert!(
+        t.with_screen(lines).iter().any(|l| l == "zshrc-noise"),
+        ".zshrc output must be replayed at takeover\n{}",
+        t.dump()
+    );
+    // fds fully restored: stderr reaches the terminal afterwards.
+    t.send_line("ls /chevron-instant-probe");
+    t.wait_for("stderr to reach the terminal after takeover", |s| {
+        lines(s).iter().any(|l| l.starts_with("ls:"))
+    });
+}
+
+/// A line executed through a widget other than the overridden
+/// accept-line — accept-and-hold, accept-line-and-down-history, or any
+/// custom widget calling `.accept-line` directly. No collapse is
+/// painted, so the precmd rewrite (sized for `❯ cmd`) must not fire:
+/// it would erase the wrong span and paint a collapsed line over the
+/// still-visible full prompt.
+#[test]
+fn alternate_accept_widget_skips_rewrite() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.run("zle -A .accept-line direct-accept; bindkey '^O' direct-accept");
+    t.send("echo bypass-probe\x0f");
+    t.wait_for("bypassed line to execute and reprompt", |s| {
+        lines(s).iter().any(|l| l == "bypass-probe") && prompt_ready(s)
+    });
+    t.wait_settled(Duration::from_millis(300));
+
+    // Only the first (normally accepted) command may carry a chevron;
+    // the bypassed line keeps its full prompt, un-rewritten.
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        1,
+        "the bypassed line must not gain a collapsed chevron\n{}",
+        t.dump()
+    );
+    assert!(
+        t.with_screen(lines)
+            .iter()
+            .any(|l| l.contains(LIVE_PROMPT_MARK) && l.ends_with("echo bypass-probe")),
+        "the bypassed line's full prompt must stay intact\n{}",
+        t.dump()
+    );
+}
+
+/// The collapsed line exactly fills the terminal width (and exactly two
+/// rows) — the cursor ends in the auto-margin pending-wrap state, from
+/// which emulators disagree on how the following newline advances
+/// (ble.sh's "xenl" trap), so the saved row can be off by one. The
+/// rewrite painted a duplicated chevron one row down. It must skip
+/// instead: one neutral chevron per command, no duplicates.
+#[test]
+fn exact_width_input_skips_rewrite_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    // `❯ ` is 2 cells; the command fills the remaining 118 of 120.
+    let one_row = format!("true {}", "a".repeat(113));
+    assert_eq!(one_row.len() + 2, COLS as usize);
+    let two_rows = format!("true {}", "b".repeat(113 + COLS as usize));
+    t.run(&one_row);
+    t.run(&two_rows);
+    t.wait_settled(Duration::from_millis(200));
+
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        2,
+        "exactly one chevron per exact-width command, no duplicates\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(0),
+        vt100::Color::Default,
+        "ambiguous-row rewrite must be skipped, chevron neutral\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(1),
+        vt100::Color::Default,
+        "ambiguous-row rewrite must be skipped, chevron neutral\n{}",
+        t.dump()
+    );
+    assert!(
+        t.with_screen(prompt_ready),
+        "prompt must be intact below the collapsed lines\n{}",
+        t.dump()
+    );
+}
+
+/// `CHEVRON_TRANSIENT=0` is the documented escape hatch for terminals
+/// whose DSR handling misbehaves. It must mean what it says: zero
+/// cursor-position queries on the wire and no accept-line collapse.
+#[test]
+fn transient_disabled_sends_no_dsr_queries() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_customized(
+        Dsr::Immediate,
+        ROWS,
+        COLS,
+        Render::Sync,
+        |home, path_dirs| {
+            std::fs::write(
+                home.join(".zshrc"),
+                format!(
+                    "path=({path_dirs} $path)\nexport CHEVRON_TRANSIENT=0\neval \"$(chevron init zsh)\"\n"
+                ),
+            )
+            .unwrap();
+        },
+    );
+    t.send_line("echo knob-probe");
+    t.wait_for("first command output", |s| {
+        lines(s).iter().any(|l| l == "knob-probe") && prompt_ready(s)
+    });
+    t.send_line("echo knob-two");
+    t.wait_for("second command output", |s| {
+        lines(s).iter().any(|l| l == "knob-two") && prompt_ready(s)
+    });
+    t.wait_settled(Duration::from_millis(300));
+
+    assert!(
+        {
+            let raw = t.raw.lock().unwrap();
+            find_subslice(&raw, DSR_QUERY).is_none()
+        },
+        "CHEVRON_TRANSIENT=0 must suppress every DSR query\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        0,
+        "no transient collapse with the feature off\n{}",
+        t.dump()
+    );
+}
+
+/// `CHEVRON_OSC133=0` must silence every OSC 133 marker: A/B around the
+/// prompt, C at command start, D at command end — including the copies
+/// inside the transient rewrite.
+#[test]
+fn osc133_disabled_emits_no_markers() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_customized(
+        Dsr::Immediate,
+        ROWS,
+        COLS,
+        Render::Sync,
+        |home, path_dirs| {
+            std::fs::write(
+                home.join(".zshrc"),
+                format!(
+                    "path=({path_dirs} $path)\nexport CHEVRON_OSC133=0\neval \"$(chevron init zsh)\"\n"
+                ),
+            )
+            .unwrap();
+        },
+    );
+    t.run("echo osc-probe");
+    t.run("false");
+    t.wait_settled(Duration::from_millis(300));
+
+    assert!(
+        {
+            let raw = t.raw.lock().unwrap();
+            find_subslice(&raw, b"\x1b]133").is_none()
+        },
+        "CHEVRON_OSC133=0 must suppress every OSC 133 emission\n{}",
+        t.dump()
+    );
+}
+
+// ── chevron-ffu.1: daemon-backed live-loop e2e ─────────────────────────
+//
+// The zsh live subscriber (CHEVRON_LIVE=1, src/shell.rs:689) shipped dark
+// because every other PTY test runs CHEVRON_NO_DAEMON=1 and never stands up
+// a daemon, so the event -> redraw path had zero end-to-end coverage. This
+// is the test mode that closes that gap and gates flipping the default on
+// (the parent epic, chevron-ffu).
+
+/// Run `git <args>` in `dir` with a hermetic config (no user/system
+/// gitconfig leaking in), asserting success.
+#[cfg(feature = "daemon")]
+fn git_in(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(feature = "daemon")]
+use chevron::daemon::{
+    listener,
+    proto::{CmdEndEvent, CmdStartEvent},
+    state::{self, StateMsg},
+};
+#[cfg(feature = "daemon")]
+use std::os::unix::net::UnixListener;
+
+/// An in-process chevrond on a hermetic socket plus a live (`CHEVRON_LIVE=1`)
+/// zsh whose `$HOME` is a one-commit git repo on branch `base`. Keeps
+/// `state_tx` so a test can inject daemon events deterministically.
+#[cfg(feature = "daemon")]
+struct LiveFixture {
+    term: Term,
+    home: std::path::PathBuf,
+    state_tx: std::sync::mpsc::Sender<StateMsg>,
+    // Owns the socket dir; declared last so it outlives `term` on drop.
+    sockdir: tempfile::TempDir,
+}
+
+#[cfg(feature = "daemon")]
+impl LiveFixture {
+    fn spawn() -> Self {
+        Self::spawn_with("")
+    }
+
+    /// Like [`Self::spawn`], with extra shell lines (e.g. env exports)
+    /// inserted before the `chevron init` eval.
+    fn spawn_with(extra_env: &str) -> Self {
+        let sockdir = tempfile::TempDir::new().unwrap();
+        let state_tx = Self::start_daemon(sockdir.path());
+
+        let home_slot = Arc::new(Mutex::new(std::path::PathBuf::new()));
+        let socket_dir = sockdir.path().to_path_buf();
+        let home_out = Arc::clone(&home_slot);
+        let extra = extra_env.to_string();
+        let term = Term::spawn_customized(
+            Dsr::Immediate,
+            ROWS,
+            // A wide terminal so the prompt can't wrap the short test input:
+            // CI runners can have very long hostnames (e.g. the macOS
+            // `iad20-...local` ephemeral names), and a wrapped command line
+            // would split assertions like `screen_has("echo 'abc")` across
+            // rows (chevron-ffu.2.1).
+            LIVE_COLS,
+            Render::Sync,
+            move |home, path_dirs| {
+                git_in(home, &["init", "-q", "-b", "base"]);
+                git_in(home, &["config", "user.email", "t@example.com"]);
+                git_in(home, &["config", "user.name", "chevron-test"]);
+                git_in(home, &["commit", "-q", "--allow-empty", "-m", "init"]);
+                std::fs::write(
+                    home.join(".zshrc"),
+                    format!(
+                        "path=({path_dirs} $path)\n\
+                         export CHEVRON_SOCKET_DIR=\"{sd}\"\n\
+                         export CHEVRON_LIVE=1\n\
+                         {extra}\
+                         unset CHEVRON_NO_DAEMON\n\
+                         eval \"$(chevron init zsh)\"\n",
+                        sd = socket_dir.display()
+                    ),
+                )
+                .unwrap();
+                *home_out.lock().unwrap() = home.to_path_buf();
+            },
+        );
+        let home = home_slot.lock().unwrap().clone();
+        let fx = Self {
+            term,
+            home,
+            state_tx,
+            sockdir,
+        };
+        fx.term.wait_for("initial prompt on branch `base`", |s| {
+            lines(s).iter().any(|l| l.contains("base"))
+        });
+        fx
+    }
+
+    /// Bind a fresh listener + state actor at `dir/chevrond.sock`. Uses a
+    /// NO-WATCHER actor: every event is injected via `state_tx`, so the
+    /// event → redraw path is deterministic. A real `notify` watcher would
+    /// fire its own `FsEvent`s off the `git checkout`s these tests do — which
+    /// raced the assertions on fast Linux inotify (CI) while passing on
+    /// slower/coalesced macOS `FSEvents` locally (chevron-ffu.6).
+    fn start_daemon(dir: &std::path::Path) -> std::sync::mpsc::Sender<StateMsg> {
+        let listener_sock = UnixListener::bind(dir.join("chevrond.sock")).unwrap();
+        let db = state::open_db(dir).unwrap();
+        let (state_tx, _join) = state::spawn_no_watcher(state::TTL, db).unwrap();
+        let serve_tx = state_tx.clone();
+        std::thread::spawn(move || listener::serve_loop(&listener_sock, &serve_tx));
+        state_tx
+    }
+
+    /// Restart the daemon on the same socket. Shutting the old state actor
+    /// down drops its subscriber senders, so the helper's relay sees EOF and
+    /// chevron-1mh's reconnect kicks in.
+    ///
+    /// Ordering is deliberate:
+    /// - Sleep AFTER the shutdown (socket still bound) so the old state
+    ///   actor finishes and closes its commands.db before the replacement
+    ///   opens a fresh one — overlapping connections deadlock the open. The
+    ///   live shell's status query during this window connects to the (now
+    ///   stateless) old listener rather than seeing a missing socket.
+    /// - Remove the socket immediately BEFORE rebinding, leaving no window
+    ///   where the path is absent: the shell has `CHEVRON_NO_DAEMON` unset, so
+    ///   a status query against a missing socket would auto-spawn a real
+    ///   chevrond that grabs the path and AddrInUse-s our rebind.
+    ///
+    /// The old listener thread is left stuck accepting a now-unlinked socket;
+    /// it leaks harmlessly and the test process reaps it at exit.
+    fn restart_daemon(&mut self) {
+        let _ = self.state_tx.send(StateMsg::Shutdown);
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = std::fs::remove_file(self.sockdir.path().join("chevrond.sock"));
+        self.state_tx = Self::start_daemon(self.sockdir.path());
+    }
+
+    /// Fire a git `FsEvent` for `$HOME` (its gitdir watch was registered by the
+    /// initial prompt's status query).
+    fn fire_home_git_event(&self) {
+        let head = self.home.join(".git").join("HEAD");
+        let _ = self.state_tx.send(StateMsg::FsEvent(vec![head]));
+    }
+
+    /// Inject a synthetic command-lifecycle event whose broadcast cwd is
+    /// `cwd` — any path, no gitdir watch required. The daemon looks the cwd
+    /// up from the `CmdStart` row and broadcasts a `cmd` EVENT, which is what
+    /// the live callback's cwd-scope filter keys on.
+    fn fire_cmd_event(&self, cwd: &std::path::Path) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let id = format!("evt{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        self.state_tx
+            .send(StateMsg::CmdStart(CmdStartEvent {
+                id: id.clone(),
+                session_id: "test".to_string(),
+                hostname: "test".to_string(),
+                cwd: cwd.to_path_buf(),
+                cmd: "true".to_string(),
+                started_at_ms: 0,
+            }))
+            .unwrap();
+        self.state_tx
+            .send(StateMsg::CmdEnd(CmdEndEvent {
+                id,
+                finished_at_ms: 0,
+                duration_ms: 0,
+                exit_status: 0,
+                output_bytes: None,
+                output_truncated: None,
+            }))
+            .unwrap();
+    }
+
+    /// True if any rendered row contains `needle`.
+    fn screen_has(&self, needle: &str) -> bool {
+        self.term
+            .with_screen(|s| lines(s).iter().any(|l| l.contains(needle)))
+    }
+
+    /// Re-run `fire` each tick until `pred` holds over the screen, or panic
+    /// with a dump. Re-firing covers the subscriber's async attach and the
+    /// callback's 100 ms debounce.
+    fn drive_until(&self, fire: impl Fn(), what: &str, pred: impl Fn(&vt100::Screen) -> bool) {
+        // Generous deadline: the daemon-restart reconnect chain (ffu.5) plus a
+        // loaded CI runner can take several seconds end to end.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            fire();
+            if self.term.with_screen(&pred) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}\n{}",
+                self.term.dump()
+            );
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+}
+
+/// chevron-ffu.6: a cwd-scoped shell must ignore other repos' events while
+/// still redrawing for its own. Bites the ffu.3 cwd filter.
+#[test]
+#[ignore = "daemon-backed live-loop e2e; shake out in CI (chevron-ffu.6)"]
+#[cfg(feature = "daemon")]
+fn live_prompt_ignores_cross_repo_events_when_scoped() {
+    let fx = LiveFixture::spawn();
+
+    // Stage a branch a redraw WOULD surface, but fire NO own-repo event. With
+    // the no-watcher daemon the checkout broadcasts nothing, and nothing else
+    // spawns an async render before the assertion below — so no render can
+    // read `scopedout`. (Deliberately no warmup phase: an own-repo warmup
+    // redraw's trailing async raced this checkout on fast Linux — ffu.6.)
+    git_in(&fx.home, &["checkout", "-q", "-b", "scopedout"]);
+
+    // Hammer foreign-repo cmd events for >1s. With the default
+    // CHEVRON_LIVE_SCOPE=cwd the callback must filter every one — the prompt
+    // must NOT pick up the new branch. The own-repo redraw at the end confirms
+    // the subscriber was live throughout, so a clean screen here means the
+    // events were filtered, not lost.
+    let foreign = std::path::Path::new("/no/such/other-repo");
+    let until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < until {
+        fx.fire_cmd_event(foreign);
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    assert!(
+        !fx.screen_has("scopedout"),
+        "a cross-repo event leaked a redraw past the cwd-scope filter\n{}",
+        fx.term.dump()
+    );
+
+    // Liveness intact: an OWN-repo event still redraws (and proves the
+    // subscriber was connected for the foreign burst above — a dead
+    // subscriber would time out here rather than false-pass the assertion).
+    fx.drive_until(
+        || fx.fire_home_git_event(),
+        "own-repo redraw after the scoped-out foreign burst",
+        |s| lines(s).iter().any(|l| l.contains("scopedout")),
+    );
+}
+
+/// chevron-ffu.2.1: a live event landing during a PS2 continuation must be
+/// harmless — the `CONTEXT == cont` guard (the `zle reset-prompt` skip in
+/// `_chevron_async_callback`) is what stands between a daemon event and a
+/// repaint over the secondary-prompt edit.
+///
+/// Runs with `CHEVRON_TRANSIENT=0` deliberately: with the transient on, the
+/// accept-line collapse flag (set on Enter, cleared only in precmd) already
+/// drops every async result for the whole continuation, shadowing the cont
+/// guard. With it off the widget is never bound, no flag is ever set, and
+/// the cont guard is the SOLE protection — the configuration where it must
+/// bite.
+#[test]
+#[ignore = "daemon-backed live-loop e2e; shake out in CI (chevron-ffu.2.1)"]
+#[cfg(feature = "daemon")]
+fn live_event_during_ps2_continuation_is_harmless() {
+    let fx = LiveFixture::spawn_with("export CHEVRON_TRANSIENT=0\n");
+
+    // Open a PS2 continuation: Enter on an unterminated quote. zsh's
+    // default PS2 (`%_> `) renders as `quote>` inside the open quote.
+    fx.term.send("echo 'abc\r");
+    fx.term.wait_for("PS2 continuation (quote>)", |s| {
+        lines(s).iter().any(|l| l.contains("quote>"))
+    });
+    let prompt_rows_before = fx.term.with_screen(|s| {
+        lines(s)
+            .iter()
+            .filter(|l| l.contains(LIVE_PROMPT_MARK))
+            .count()
+    });
+
+    // Hammer own-repo events while the continuation is open. Each one runs
+    // live callback -> async render -> async callback with CONTEXT == cont;
+    // only the cont guard keeps the result from repainting mid-edit.
+    let until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < until {
+        fx.fire_home_git_event();
+        std::thread::sleep(Duration::from_millis(60));
+    }
+
+    // The edit display must be untouched: the buffer line and exactly one
+    // PS2 row still painted, and no prompt repaint landed mid-continuation.
+    assert!(
+        fx.screen_has("echo 'abc"),
+        "the continuation's buffer line vanished during the event burst\n{}",
+        fx.term.dump()
+    );
+    let quote_rows = fx
+        .term
+        .with_screen(|s| lines(s).iter().filter(|l| l.contains("quote>")).count());
+    assert_eq!(
+        quote_rows,
+        1,
+        "PS2 row duplicated or lost during the event burst\n{}",
+        fx.term.dump()
+    );
+    let prompt_rows_after = fx.term.with_screen(|s| {
+        lines(s)
+            .iter()
+            .filter(|l| l.contains(LIVE_PROMPT_MARK))
+            .count()
+    });
+    assert_eq!(
+        prompt_rows_before,
+        prompt_rows_after,
+        "a prompt repaint landed inside the PS2 continuation\n{}",
+        fx.term.dump()
+    );
+
+    // Complete the line. It must execute correctly and reprompt cleanly:
+    // `echo 'abc<newline>def'` prints two output rows, `abc` and `def`.
+    fx.term.send("def'\r");
+    fx.term
+        .wait_for("the completed command's output + a fresh prompt", |s| {
+            let ls = lines(s);
+            ls.iter().any(|l| l == "abc") && ls.iter().any(|l| l == "def") && prompt_ready(s)
+        });
+}
+
+/// chevron-ffu.5: the live prompt survives a daemon restart — a post-restart
+/// event still redraws, proving the helper reconnected (chevron-1mh).
+#[test]
+#[ignore = "daemon-backed live-loop e2e; shake out in CI (chevron-ffu.5)"]
+#[cfg(feature = "daemon")]
+fn live_prompt_survives_daemon_restart() {
+    let mut fx = LiveFixture::spawn();
+
+    // Liveness before the restart.
+    git_in(&fx.home, &["checkout", "-q", "-b", "before"]);
+    fx.drive_until(
+        || fx.fire_home_git_event(),
+        "redraw before the restart",
+        |s| lines(s).iter().any(|l| l.contains("before")),
+    );
+
+    // Drop the daemon and bring a fresh one up on the same socket.
+    fx.restart_daemon();
+
+    // A post-restart event must still redraw — only possible if the helper
+    // reconnected. Use a cmd event (cwd=$HOME) so we don't depend on the new
+    // daemon re-registering the gitdir watch.
+    git_in(&fx.home, &["checkout", "-q", "-b", "afterrestart"]);
+    let home = fx.home.clone();
+    fx.drive_until(
+        || fx.fire_cmd_event(&home),
+        "redraw after the daemon restart (reconnect)",
+        |s| lines(s).iter().any(|l| l.contains("afterrestart")),
+    );
+}
+
+/// End-to-end proof that the dark-launched live prompt redraws on a
+/// chevrond event with NO keystroke (chevron-ffu.1).
+///
+/// Stands up an in-process chevrond on a hermetic socket, makes `$HOME` a
+/// one-commit git repo on branch `base`, and launches an interactive zsh
+/// wired to that daemon with the live subscriber on. Then — without
+/// sending any input — it switches the on-disk branch to `livebranch` and
+/// injects `FsEvent`s until the prompt repaints. The new branch can reach
+/// the screen only via `chevron subscribe` -> `zle -F` -> async render ->
+/// `reset-prompt`, so its appearance with an untouched keyboard proves the
+/// event-driven redraw path end to end.
+///
+/// `#[ignore]`d pending shake-out across terminals/CI — that hardening *is*
+/// the parent epic (chevron-ffu). Run explicitly with:
+///
+/// ```text
+/// cargo test --test shell_pty -- --ignored live_prompt_redraws_on_daemon_event
+/// ```
+#[test]
+#[ignore = "daemon-backed live-loop e2e; shake out in CI before un-ignoring (chevron-ffu.1)"]
+#[cfg(feature = "daemon")]
+fn live_prompt_redraws_on_daemon_event() {
+    let fx = LiveFixture::spawn();
+    // Switch the branch on disk — NO shell input — then drive daemon events
+    // until the prompt repaints. The new branch reaches the screen only via
+    // subscribe -> zle -F -> async render -> reset-prompt.
+    git_in(&fx.home, &["checkout", "-q", "-b", "livebranch"]);
+    fx.drive_until(
+        || fx.fire_home_git_event(),
+        "the prompt to redraw to the new branch with an untouched keyboard",
+        |s| lines(s).iter().any(|l| l.contains("livebranch")),
     );
 }

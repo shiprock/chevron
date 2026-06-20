@@ -66,6 +66,9 @@
                 || (craneLib.filterCargoSources path type);
             };
           strictDeps = true;
+          # Integration tests (tests/cli.rs) spawn subprocesses that hang
+          # in the Nix sandbox, so only run unit tests during the build.
+          cargoTestExtraArgs = "--lib";
           nativeBuildInputs = [
             pkgs.pkg-config
             pkgs.cmake

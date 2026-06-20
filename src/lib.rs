@@ -19,13 +19,23 @@
 
 #[cfg(feature = "banner")]
 pub mod banner;
+#[cfg(feature = "daemon")]
+pub mod capture;
 pub mod color;
 pub mod config;
+pub mod configure;
 pub mod daemon;
+pub mod doctor;
+#[cfg(feature = "daemon")]
+pub mod event;
 pub mod health;
+#[cfg(feature = "daemon")]
+pub mod history;
 pub mod repo_status;
 pub mod segments;
 pub mod shell;
+#[cfg(feature = "daemon")]
+pub mod subscribe;
 pub mod sysinfo;
 #[cfg(feature = "weather")]
 pub mod weather;

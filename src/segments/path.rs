@@ -2,6 +2,24 @@ use std::fmt::Write;
 use std::path::Path;
 
 use crate::color::{THIN, arrow, fg};
+use crate::config::Config;
+
+/// Resolve whether the path segment should render repo-relative when inside
+/// a git repo. Precedence: env > config > default (true).
+///
+/// Env var: `CHEVRON_REPO_RELATIVE_PATH` (set to `0` to disable).
+/// Config: `[segment.path].repo_relative = false`.
+#[must_use]
+pub fn resolve_repo_relative(config: &Config) -> bool {
+    if let Ok(v) = std::env::var("CHEVRON_REPO_RELATIVE_PATH") {
+        return v != "0";
+    }
+    config
+        .segment
+        .get("path")
+        .and_then(|s| s.repo_relative)
+        .unwrap_or(true)
+}
 
 fn truncate_dir(name: &str, max: usize) -> String {
     if max < 2 || name.chars().count() <= max {
@@ -39,7 +57,8 @@ pub fn render_with(
     max_dir_size: Option<usize>,
     from_bg: Option<u8>,
 ) -> (String, Option<u8>) {
-    render_with_repo(home, pwd, max_dir_size, from_bg, None)
+    // No workdir → repo_relative is irrelevant; pass true as a stable default.
+    render_with_repo(home, pwd, max_dir_size, from_bg, None, true)
 }
 
 #[must_use]
@@ -49,15 +68,15 @@ pub fn render_with_repo(
     max_dir_size: Option<usize>,
     from_bg: Option<u8>,
     repo_workdir: Option<&Path>,
+    repo_relative: bool,
 ) -> (String, Option<u8>) {
-    // Adaptive: inside a git repo, render relative to the repo's parent
-    // dir so the repo name leads. Outside a repo (or when explicitly
-    // disabled via CHEVRON_REPO_RELATIVE_PATH=0), fall through to the
-    // home-collapse behaviour.
-    let repo_rebase = if std::env::var("CHEVRON_REPO_RELATIVE_PATH").ok().as_deref() == Some("0") {
-        None
-    } else {
+    // Adaptive: inside a git repo and when repo_relative is on, render
+    // relative to the repo's parent dir so the repo name leads. Resolution
+    // of env-vs-config happens at the caller via `resolve_repo_relative`.
+    let repo_rebase = if repo_relative {
         try_rebase_to_repo(pwd, repo_workdir)
+    } else {
+        None
     };
 
     // Require an exact match or a `/` immediately after `home` so HOME=/home/user
@@ -150,12 +169,24 @@ pub fn render_aware(home: &str, pwd: &str, max_dir_size: Option<usize>) -> Strin
     let workdir = git2::Repository::discover(pwd)
         .ok()
         .and_then(|r| r.workdir().and_then(|p| p.canonicalize().ok()));
-    render_with_repo(home, pwd, max_dir_size, Some(238), workdir.as_deref()).0
+    let repo_relative = resolve_repo_relative(&Config::load());
+    render_with_repo(
+        home,
+        pwd,
+        max_dir_size,
+        Some(238),
+        workdir.as_deref(),
+        repo_relative,
+    )
+    .0
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{render, render_with, render_with_repo, truncate_dir, try_rebase_to_repo};
+    use super::{
+        render, render_with, render_with_repo, resolve_repo_relative, truncate_dir,
+        try_rebase_to_repo,
+    };
     use serial_test::serial;
     use std::path::Path;
 
@@ -316,6 +347,7 @@ mod tests {
             None,
             Some(238),
             Some(Path::new("/Users/mim/src/chevron")),
+            true,
         )
         .0;
         // Should NOT contain ~ — we used the repo-relative form instead.
@@ -344,6 +376,7 @@ mod tests {
             None,
             Some(238),
             Some(Path::new("/Users/mim/src/chevron")),
+            true,
         )
         .0;
         let visible: String = out
@@ -357,7 +390,15 @@ mod tests {
     #[test]
     fn render_outside_repo_keeps_home_collapse() {
         // No workdir → home-collapse path unchanged.
-        let out = render_with_repo("/Users/mim", "/Users/mim/Documents", None, Some(238), None).0;
+        let out = render_with_repo(
+            "/Users/mim",
+            "/Users/mim/Documents",
+            None,
+            Some(238),
+            None,
+            true,
+        )
+        .0;
         let visible: String = out
             .chars()
             .filter(|c| !c.is_ascii_control() && *c != '\u{1b}')
@@ -369,28 +410,60 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn opt_out_via_env_var_disables_rebase() {
-        // SAFETY: test-only env mutation, serialised.
-        unsafe { std::env::set_var("CHEVRON_REPO_RELATIVE_PATH", "0") };
+    fn opt_out_via_param_disables_rebase() {
+        // Caller passes repo_relative=false (the resolved env/config value).
         let out = render_with_repo(
             "/Users/mim",
             "/Users/mim/src/chevron/src",
             None,
             Some(238),
             Some(Path::new("/Users/mim/src/chevron")),
+            false,
         )
         .0;
-        unsafe { std::env::remove_var("CHEVRON_REPO_RELATIVE_PATH") };
         let visible: String = out
             .chars()
             .filter(|c| !c.is_ascii_control() && *c != '\u{1b}')
             .collect();
-        // With the opt-out, we fall back to home-collapse → ~ appears.
+        // With repo_relative=false, we fall back to home-collapse → ~ appears.
         assert!(
             visible.contains('~'),
             "opt-out should restore home-collapse: {visible}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_repo_relative_env_wins_over_config() {
+        // SAFETY: test-only env mutation, serialised.
+        unsafe { std::env::set_var("CHEVRON_REPO_RELATIVE_PATH", "0") };
+        let toml = r"
+[segment.path]
+repo_relative = true
+";
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        assert!(!resolve_repo_relative(&cfg));
+        unsafe { std::env::remove_var("CHEVRON_REPO_RELATIVE_PATH") };
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_repo_relative_config_wins_when_env_unset() {
+        unsafe { std::env::remove_var("CHEVRON_REPO_RELATIVE_PATH") };
+        let toml = r"
+[segment.path]
+repo_relative = false
+";
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        assert!(!resolve_repo_relative(&cfg));
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_repo_relative_defaults_to_true() {
+        unsafe { std::env::remove_var("CHEVRON_REPO_RELATIVE_PATH") };
+        let cfg = crate::config::Config::default();
+        assert!(resolve_repo_relative(&cfg));
     }
 
     #[test]

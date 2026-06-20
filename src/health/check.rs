@@ -4,6 +4,10 @@ pub enum Severity {
     Warn,
     Critical,
     Unknown,
+    /// Informational row — no judgement, just data. Used by `chevron doctor`
+    /// for self-test output (glyph preview, raw segment renderings, present-
+    /// but-not-our-concern config files). Exits 0; renders as `[info]`.
+    Info,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +69,31 @@ impl Check {
             value: value.into(),
             severity: Severity::Unknown,
             hint: None,
+        }
+    }
+
+    pub fn info(name: &'static str, label: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            name,
+            label,
+            value: value.into(),
+            severity: Severity::Info,
+            hint: None,
+        }
+    }
+
+    pub fn info_hint(
+        name: &'static str,
+        label: &'static str,
+        value: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            name,
+            label,
+            value: value.into(),
+            severity: Severity::Info,
+            hint: Some(hint.into()),
         }
     }
 }
