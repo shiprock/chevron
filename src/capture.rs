@@ -177,42 +177,55 @@ fn run_pty(
         None
     };
 
-    // 5. Spawn the child. std::process::Command handles dup2'ing the
-    //    slave PTY to stdin/stdout/stderr; pre_exec runs in the
-    //    child between fork and exec to make the slave the
-    //    controlling terminal.
-    let mut cmd = std::process::Command::new(&cmd_args[0]);
-    cmd.args(&cmd_args[1..]);
-    cmd.stdin(Stdio::from(slave.try_clone()?));
-    cmd.stdout(Stdio::from(slave.try_clone()?));
-    cmd.stderr(Stdio::from(slave));
+    // 5. Spawn the child with the slave PTY as its stdin/stdout/stderr,
+    //    then drop EVERY parent-side slave fd before the poll loop.
+    //
+    //    The loop below exits only when the master reports EOF/HUP, and
+    //    the master hangs up only once the LAST open slave fd closes.
+    //    `std::process::Command` keeps its own references to the slave
+    //    fds we hand it (a Command may be spawned more than once), so the
+    //    parent goes on holding the slave open for as long as `cmd` is
+    //    alive — the child can exit yet the master never EOFs and the
+    //    loop blocks forever. Linux enforces this strictly (a 6h CI hang
+    //    on `Test/ubuntu`, chevron-alj); macOS happened to tolerate the
+    //    dangling slave. Scoping `cmd` to this block drops it — and thus
+    //    the parent's three slave fds — at spawn time, leaving the child
+    //    as the sole slave holder so its exit hangs up the master. Do
+    //    NOT flatten this block out; the early drop is load-bearing.
+    let mut child = {
+        let mut cmd = std::process::Command::new(&cmd_args[0]);
+        cmd.args(&cmd_args[1..]);
+        cmd.stdin(Stdio::from(slave.try_clone()?));
+        cmd.stdout(Stdio::from(slave.try_clone()?));
+        cmd.stderr(Stdio::from(slave));
 
-    // SAFETY: pre_exec runs in the child between fork and exec. The
-    // operations are async-signal-safe: setsid() and ioctl(TIOCSCTTY).
-    // No allocator or Rust-side state is touched. After exec, the
-    // child's process image is replaced so any Rust state from the
-    // parent is irrelevant.
-    unsafe {
-        cmd.pre_exec(|| {
-            // New session, detach from controlling terminal.
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // Make stdin (which is now the slave PTY post-Stdio dup2) our
-            // controlling terminal. TIOCSCTTY is u32 on macOS (widened to
-            // ioctl's c_ulong request) but already c_ulong on Linux, where
-            // the `.into()` is a no-op — keep it for the macOS build and
-            // allow clippy::useless_conversion, which fires only on Linux.
-            #[allow(clippy::useless_conversion)]
-            let request: libc::c_ulong = libc::TIOCSCTTY.into();
-            if libc::ioctl(0, request, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+        // SAFETY: pre_exec runs in the child between fork and exec. The
+        // operations are async-signal-safe: setsid() and ioctl(TIOCSCTTY).
+        // No allocator or Rust-side state is touched. After exec, the
+        // child's process image is replaced so any Rust state from the
+        // parent is irrelevant.
+        unsafe {
+            cmd.pre_exec(|| {
+                // New session, detach from controlling terminal.
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Make stdin (which is now the slave PTY post-Stdio dup2) our
+                // controlling terminal. TIOCSCTTY is u32 on macOS (widened to
+                // ioctl's c_ulong request) but already c_ulong on Linux, where
+                // the `.into()` is a no-op — keep it for the macOS build and
+                // allow clippy::useless_conversion, which fires only on Linux.
+                #[allow(clippy::useless_conversion)]
+                let request: libc::c_ulong = libc::TIOCSCTTY.into();
+                if libc::ioctl(0, request, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
-    let mut child = cmd.spawn()?;
+        cmd.spawn()?
+    };
 
     // 6. Open the capture file. We hold an OwnedFd via the File so
     //    write() calls amortize via stdlib buffering on drop.
