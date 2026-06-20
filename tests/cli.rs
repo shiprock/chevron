@@ -734,9 +734,7 @@ fn query_row_eventually<T>(label: &str, mut read: impl FnMut() -> rusqlite::Resu
     loop {
         match read() {
             Ok(v) => return v,
-            Err(rusqlite::Error::QueryReturnedNoRows)
-                if std::time::Instant::now() < deadline =>
-            {
+            Err(rusqlite::Error::QueryReturnedNoRows) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
             Err(e) => panic!("{label}: {e}"),
