@@ -719,6 +719,31 @@ impl Drop for DaemonGuard {
     }
 }
 
+/// Read a single row, retrying until it materialises. The daemon's
+/// state actor persists `CMD_START`/`CMD_END` asynchronously, and over a
+/// different connection than the test's STATUS-round-trip flush — so
+/// under load a single read can run ahead of the write and see no row
+/// (the flush is not a hard cross-connection barrier, chevron-8q7).
+/// Poll on `QueryReturnedNoRows` up to a generous deadline instead;
+/// each `query_row` is its own WAL read transaction, so every retry sees
+/// a fresh snapshot. Pair with a completeness predicate in the query
+/// (e.g. `finished_at IS NOT NULL`) to also wait out the intermediate
+/// `CMD_START`-only row, whose `CMD_END` columns read back NULL.
+fn query_row_eventually<T>(label: &str, mut read: impl FnMut() -> rusqlite::Result<T>) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match read() {
+            Ok(v) => return v,
+            Err(rusqlite::Error::QueryReturnedNoRows)
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(e) => panic!("{label}: {e}"),
+        }
+    }
+}
+
 #[test]
 fn event_lifecycle_publishes_to_daemon_and_persists_row() {
     // End-to-end smoke test: spawn the real daemon binary, run the real
@@ -768,21 +793,22 @@ fn event_lifecycle_publishes_to_daemon_and_persists_row() {
     let db_path = daemon.socket_dir().join("commands.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let (session_id, cwd, cmd_text, exit_status, duration_ms): (String, String, String, i64, i64) =
-        conn.query_row(
-            "SELECT session_id, cwd, cmd, exit_status, duration_ms \
-             FROM commands WHERE id = ?1",
-            [&id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
-        .unwrap();
+        query_row_eventually("event_lifecycle commands row", || {
+            conn.query_row(
+                "SELECT session_id, cwd, cmd, exit_status, duration_ms \
+                 FROM commands WHERE id = ?1 AND finished_at IS NOT NULL",
+                [&id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+        });
     assert_eq!(session_id, "sess-int");
     assert_eq!(cwd, "/tmp/some-cwd");
     // cmd-start joins trailing args with a space, so multi-arg `cargo
@@ -1346,15 +1372,16 @@ fn capture_runs_command_and_creates_output_file() {
         .success();
 
     let db = rusqlite::Connection::open(daemon.socket_dir().join("commands.db")).unwrap();
-    let (cmd_text, output_bytes, output_truncated): (String, i64, i64) = db
-        .query_row(
-            "SELECT cmd, output_bytes, output_truncated FROM commands \
-             WHERE cmd LIKE 'echo phase-4-echo-test%' \
-             ORDER BY started_at DESC LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .expect("expected a row");
+    let (cmd_text, output_bytes, output_truncated): (String, i64, i64) =
+        query_row_eventually("capture commands row", || {
+            db.query_row(
+                "SELECT cmd, output_bytes, output_truncated FROM commands \
+                 WHERE cmd LIKE 'echo phase-4-echo-test%' AND finished_at IS NOT NULL \
+                 ORDER BY started_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+        });
     assert_eq!(cmd_text, "echo phase-4-echo-test");
     // Echo's output is "phase-4-echo-test\r\n" (18 bytes after PTY
     // adds \r). Allow some slack for terminal noise.
