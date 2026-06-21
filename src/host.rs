@@ -123,11 +123,11 @@ fn run_pty(cmd_args: &[String], requested_status: bool) -> std::io::Result<i32> 
     let host = hostname();
     let status = requested_status && stdin_is_tty && winsz.is_some();
     let _status_guard = if status {
-        let (cols, rows) = winsz.map_or((80, 24), |w| (w.ws_col, w.ws_row));
+        let rows = winsz.map_or(24, |w| w.ws_row);
         set_scroll_region(rows);
-        // Drop the shell below the bar so its first prompt lands at row 2.
+        // Drop the shell below the bar so its first prompt lands at row 2;
+        // host_io_loop paints the bar itself once it starts.
         let _ = write_all(libc::STDOUT_FILENO, b"\x1b[2;1H");
-        draw_bar(cols, rows, &host, false, None, None);
         Some(StatusGuard)
     } else {
         None
@@ -141,6 +141,16 @@ fn run_pty(cmd_args: &[String], requested_status: bool) -> std::io::Result<i32> 
     let mut child = {
         let mut cmd = std::process::Command::new(&cmd_args[0]);
         cmd.args(&cmd_args[1..]);
+        // Ensure the inner shell resolves the SAME chevron binary as this
+        // host, so its init (OSC 7 cwd, OSC 133) matches what we parse. A
+        // no-op when an installed chevron is already first on PATH.
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(std::path::Path::to_path_buf))
+        {
+            let path = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{}:{}", dir.display(), path));
+        }
         cmd.stdin(Stdio::from(slave.try_clone()?));
         cmd.stdout(Stdio::from(slave.try_clone()?));
         cmd.stderr(Stdio::from(slave));
@@ -191,9 +201,8 @@ fn run_pty(cmd_args: &[String], requested_status: bool) -> std::io::Result<i32> 
 /// → propagate size. With `status`, also redraws the reserved top-row
 /// bar on a timer and tracks alternate-screen entry/exit so full-screen
 /// apps get the whole screen. Breaks when the master EOFs/HUPs.
-// A single poll-dispatch loop reads clearest in one place (cf. `main`'s
-// dispatch, which takes the same allow); the OSC/bar bookkeeping pushes it
-// just over the line budget.
+// A poll-dispatch loop reads clearest in one place (cf. `main`'s dispatch,
+// which takes the same allow).
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -210,14 +219,17 @@ fn host_io_loop(
         get_winsize(libc::STDIN_FILENO).map_or((80, 24), |w| (w.ws_col, w.ws_row));
     let mut alt = false;
     let mut last_draw = Instant::now();
-    // OSC 133 command lifecycle (C → running, D;<n> → finished) drives the
-    // live command-state field in the bar. This scanner is Stage 2's backbone.
+    // The bar carries cwd + git (OSC 7) and command state (OSC 133). It is
+    // built even when !status — construction is cheap (a cwd read, no git)
+    // and it is only refreshed/drawn on the status path. The OSC scanner is
+    // Stage 2's backbone.
     let mut osc = OscScanner::default();
     let mut events: Vec<OscEvent> = Vec::new();
-    let mut running = false;
-    let mut last_exit: Option<i32> = None;
-    let mut cmd_start: Option<Instant> = None;
-    let mut last_dur: Option<Duration> = None;
+    let mut bar = Bar::new(cols, host.to_string());
+    if status {
+        bar.refresh_git();
+        bar.draw();
+    }
     // Poll wakes periodically in status mode so the clock stays live even
     // while the shell sits idle; otherwise it blocks indefinitely.
     let timeout: libc::c_int = if status { 250 } else { -1 };
@@ -262,14 +274,10 @@ fn host_io_loop(
                 set_winsize(master_fd, w);
                 cols = w.ws_col;
                 rows = w.ws_row;
+                bar.cols = cols;
                 if status && !alt {
                     set_scroll_region(rows);
-                    let dur = if running {
-                        cmd_start.map(|s| s.elapsed())
-                    } else {
-                        last_dur
-                    };
-                    draw_bar(cols, rows, host, running, last_exit, dur);
+                    bar.draw();
                     last_draw = Instant::now();
                 }
             }
@@ -304,41 +312,18 @@ fn host_io_loop(
                         } else {
                             // Back to the shell: re-reserve and repaint.
                             set_scroll_region(rows);
-                            let dur = if running {
-                                cmd_start.map(|s| s.elapsed())
-                            } else {
-                                last_dur
-                            };
-                            draw_bar(cols, rows, host, running, last_exit, dur);
+                            bar.draw();
                             last_draw = Instant::now();
                         }
                     }
-                    // OSC 133: C → command running, D;<n> → finished, exit n.
+                    // OSC 7 → cwd/git, OSC 133 → command state.
                     osc.feed(chunk, &mut events);
                     let mut changed = false;
                     for ev in events.drain(..) {
-                        match ev {
-                            OscEvent::OutputStart => {
-                                running = true;
-                                cmd_start = Some(Instant::now());
-                                changed = true;
-                            }
-                            OscEvent::CmdEnd(code) => {
-                                running = false;
-                                last_exit = code;
-                                last_dur = cmd_start.take().map(|s| s.elapsed());
-                                changed = true;
-                            }
-                            OscEvent::PromptStart | OscEvent::CmdStart => {}
-                        }
+                        changed |= bar.apply(ev);
                     }
                     if changed && !alt {
-                        let dur = if running {
-                            cmd_start.map(|s| s.elapsed())
-                        } else {
-                            last_dur
-                        };
-                        draw_bar(cols, rows, host, running, last_exit, dur);
+                        bar.draw();
                         last_draw = Instant::now();
                     }
                 }
@@ -353,12 +338,7 @@ fn host_io_loop(
 
         // Keep the clock — and a running command's live timer — fresh.
         if status && !alt && last_draw.elapsed() >= STATUS_REDRAW {
-            let dur = if running {
-                cmd_start.map(|s| s.elapsed())
-            } else {
-                last_dur
-            };
-            draw_bar(cols, rows, host, running, last_exit, dur);
+            bar.draw();
             last_draw = Instant::now();
         }
     }
@@ -394,43 +374,167 @@ fn reset_scroll_region() {
     let _ = write_all(libc::STDOUT_FILENO, b"\x1b7\x1b[r\x1b8");
 }
 
-/// Render the reserved row from the current bar state: save cursor
-/// (DECSC), home, reverse video, the padded line, reset attrs, restore
-/// cursor (DECRC). Save/restore keeps the child's cursor untouched; row 1
-/// is outside the scroll region so this never scrolls the shell's content.
-fn draw_bar(
+/// The status-bar model: geometry, hostname, the inner shell's working
+/// directory + git summary (from OSC 7), and command state (from OSC 133).
+struct Bar {
     cols: u16,
-    rows: u16,
-    host: &str,
+    host: String,
+    cwd_real: String,
+    cwd_disp: String,
+    git: String,
     running: bool,
     last_exit: Option<i32>,
-    dur: Option<Duration>,
-) {
-    if cols == 0 {
-        return;
+    cmd_start: Option<Instant>,
+    last_dur: Option<Duration>,
+}
+
+impl Bar {
+    /// Cheap to build: reads the process cwd (which equals the inner
+    /// shell's cwd at spawn) but computes no git — call [`Bar::refresh_git`].
+    fn new(cols: u16, host: String) -> Self {
+        let cwd_real = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let cwd_disp = tilde(&cwd_real);
+        Self {
+            cols,
+            host,
+            cwd_real,
+            cwd_disp,
+            git: String::new(),
+            running: false,
+            last_exit: None,
+            cmd_start: None,
+            last_dur: None,
+        }
     }
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let status = cmd_status_text(running, last_exit, dur);
-    let line = bar_line(cols, rows, secs, host, &status);
-    let seq = format!("\x1b7\x1b[1;1H\x1b[7m{line}\x1b[0m\x1b8");
-    let _ = write_all(libc::STDOUT_FILENO, seq.as_bytes());
+
+    fn refresh_git(&mut self) {
+        self.git = git_summary(&self.cwd_real);
+    }
+
+    /// Adopt a new working directory (from OSC 7); recompute git if it
+    /// actually changed. Returns whether anything changed.
+    fn set_cwd(&mut self, path: String) -> bool {
+        if path == self.cwd_real {
+            return false;
+        }
+        self.cwd_disp = tilde(&path);
+        self.cwd_real = path;
+        self.refresh_git();
+        true
+    }
+
+    /// Apply an OSC event; return whether the displayed state changed.
+    fn apply(&mut self, ev: OscEvent) -> bool {
+        match ev {
+            OscEvent::OutputStart => {
+                self.running = true;
+                self.cmd_start = Some(Instant::now());
+                true
+            }
+            OscEvent::CmdEnd(code) => {
+                self.running = false;
+                self.last_exit = code;
+                self.last_dur = self.cmd_start.take().map(|s| s.elapsed());
+                // The command may have changed the tree (commit/edit/checkout).
+                self.refresh_git();
+                true
+            }
+            OscEvent::Cwd(path) => self.set_cwd(path),
+            OscEvent::PromptStart | OscEvent::CmdStart => false,
+        }
+    }
+
+    fn dur(&self) -> Option<Duration> {
+        if self.running {
+            self.cmd_start.map(|s| s.elapsed())
+        } else {
+            self.last_dur
+        }
+    }
+
+    /// Paint the reserved row: save cursor (DECSC), home, reverse video,
+    /// the padded line, reset attrs, restore cursor (DECRC). Save/restore
+    /// keeps the child's cursor untouched; row 1 is outside the scroll
+    /// region, so this never scrolls the shell's content.
+    fn draw(&self) {
+        if self.cols == 0 {
+            return;
+        }
+        let status = cmd_status_text(self.running, self.last_exit, self.dur());
+        let line = bar_line(
+            self.cols,
+            now_secs(),
+            &self.cwd_disp,
+            &self.git,
+            &status,
+            &self.host,
+        );
+        let seq = format!("\x1b7\x1b[1;1H\x1b[7m{line}\x1b[0m\x1b8");
+        let _ = write_all(libc::STDOUT_FILENO, seq.as_bytes());
+    }
 }
 
 /// Compose the bar text and pad/truncate to exactly `cols` cells. Content
 /// is width-1 characters, so cell width equals `chars().count()`.
-fn bar_line(cols: u16, rows: u16, secs: u64, host: &str, status: &str) -> String {
+fn bar_line(cols: u16, secs: u64, cwd: &str, git: &str, status: &str, host: &str) -> String {
     let width = usize::from(cols);
     let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
-    let label =
-        format!(" chevron host   {host}   {status}   {h:02}:{m:02}:{s:02} UTC   {cols}x{rows} ");
+    let place = if git.is_empty() {
+        cwd.to_string()
+    } else {
+        format!("{cwd} {git}")
+    };
+    let label = format!(" chevron host   {place}   {status}   {host}   {h:02}:{m:02}:{s:02} ");
     let mut text: String = label.chars().take(width).collect();
     let len = text.chars().count();
     if len < width {
         text.push_str(&" ".repeat(width - len));
     }
     text
+}
+
+/// Replace a leading `$HOME` with `~`.
+fn tilde(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => tilde_with(path, &home),
+        _ => path.to_string(),
+    }
+}
+
+/// Pure core of [`tilde`]: collapse `home` to `~`, matching only on a path
+/// boundary so `/Users/mimosa` is not treated as under `/Users/mim`.
+fn tilde_with(path: &str, home: &str) -> String {
+    if path == home {
+        return "~".to_string();
+    }
+    match path.strip_prefix(home) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// Branch + dirty marker for the repo containing `path`, or empty if it is
+/// not a git repo. Uses libgit2 directly (no daemon); only called on
+/// cwd-change and command-end, so its cost stays off the byte-forwarding
+/// hot path.
+fn git_summary(path: &str) -> String {
+    let Ok(mut repo) = git2::Repository::discover(path) else {
+        return String::new();
+    };
+    let st = crate::segments::git::RepoStatus::compute(&mut repo);
+    if st.is_dirty() {
+        format!("{}*", st.branch)
+    } else {
+        st.branch
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Format the command-status field from the OSC 133 lifecycle state.
@@ -482,6 +586,8 @@ enum OscEvent {
     CmdStart,
     OutputStart,
     CmdEnd(Option<i32>),
+    /// OSC 7 working-directory report (the absolute path).
+    Cwd(String),
 }
 
 #[derive(Default)]
@@ -521,7 +627,7 @@ impl OscScanner {
                 }
                 OscState::Osc => {
                     if b == 0x07 {
-                        if let Some(ev) = parse_osc_133(&self.buf) {
+                        if let Some(ev) = parse_osc(&self.buf) {
                             out.push(ev);
                         }
                         self.state = OscState::Ground;
@@ -543,23 +649,27 @@ impl OscScanner {
     }
 }
 
-/// Parse an OSC payload (bytes between `ESC]` and the terminator) as an
-/// OSC 133 marker: `133;A|B|C` or `133;D[;<exit>]`.
-fn parse_osc_133(buf: &[u8]) -> Option<OscEvent> {
+/// Parse an OSC payload (bytes between `ESC]` and the terminator). We care
+/// about OSC 133 semantic-prompt markers (`133;A|B|C` / `133;D[;<exit>]`)
+/// and OSC 7 (`7;file://<host><path>` — the working directory).
+fn parse_osc(buf: &[u8]) -> Option<OscEvent> {
     let s = std::str::from_utf8(buf).ok()?;
-    let mut parts = s.split(';');
-    if parts.next()? != "133" {
-        return None;
+    if let Some(rest) = s.strip_prefix("133;") {
+        return match rest {
+            "A" => Some(OscEvent::PromptStart),
+            "B" => Some(OscEvent::CmdStart),
+            "C" => Some(OscEvent::OutputStart),
+            _ => rest
+                .strip_prefix('D')
+                .map(|tail| OscEvent::CmdEnd(tail.strip_prefix(';').and_then(|c| c.parse().ok()))),
+        };
     }
-    match parts.next()? {
-        "A" => Some(OscEvent::PromptStart),
-        "B" => Some(OscEvent::CmdStart),
-        "C" => Some(OscEvent::OutputStart),
-        "D" => Some(OscEvent::CmdEnd(
-            parts.next().and_then(|c| c.parse::<i32>().ok()),
-        )),
-        _ => None,
+    if let Some(url) = s.strip_prefix("7;").and_then(|r| r.strip_prefix("file://")) {
+        // Skip the host part; the absolute path starts at the first '/'.
+        let idx = url.find('/')?;
+        return Some(OscEvent::Cwd(url[idx..].to_string()));
     }
+    None
 }
 
 /// Scan a forwarded chunk for alternate-screen toggles and return the
@@ -662,19 +772,53 @@ mod tests {
     #[test]
     fn bar_line_is_exactly_cols_wide() {
         for cols in [1u16, 10, 40, 80, 200] {
-            let text = bar_line(cols, 24, 45_296, "m-217", "ok 1.2s");
+            let text = bar_line(cols, 45_296, "~/src/chevron", "main*", "ok 1.2s", "m-217");
             assert_eq!(text.chars().count(), usize::from(cols), "width {cols}");
         }
     }
 
     #[test]
-    fn bar_line_renders_clock_host_and_status() {
+    fn bar_line_renders_cwd_git_status_clock_and_host() {
         // 45_296 s = 12:34:56 UTC.
-        let text = bar_line(120, 24, 45_296, "m-217", "running 3.4s");
+        let text = bar_line(
+            160,
+            45_296,
+            "~/src/chevron",
+            "main*",
+            "running 3.4s",
+            "m-217",
+        );
         assert!(text.contains("12:34:56"), "got: {text}");
-        assert!(text.contains("m-217"));
+        assert!(text.contains("~/src/chevron"));
+        assert!(text.contains("main*"));
         assert!(text.contains("running 3.4s"));
-        assert!(text.contains("120x24"));
+        assert!(text.contains("m-217"));
+    }
+
+    #[test]
+    fn tilde_with_collapses_home_on_a_boundary() {
+        assert_eq!(tilde_with("/Users/mim", "/Users/mim"), "~");
+        assert_eq!(
+            tilde_with("/Users/mim/src/chevron", "/Users/mim"),
+            "~/src/chevron"
+        );
+        // mimosa is NOT under mim — must not collapse.
+        assert_eq!(
+            tilde_with("/Users/mimosa/x", "/Users/mim"),
+            "/Users/mimosa/x"
+        );
+        assert_eq!(tilde_with("/etc/hosts", "/Users/mim"), "/etc/hosts");
+    }
+
+    #[test]
+    fn osc_scanner_parses_osc7_cwd() {
+        let mut osc = OscScanner::default();
+        let mut out = Vec::new();
+        osc.feed(b"\x1b]7;file://m-217/Users/mim/src\x07", &mut out);
+        match out.as_slice() {
+            [OscEvent::Cwd(p)] => assert_eq!(p.as_str(), "/Users/mim/src"),
+            other => panic!("expected one Cwd event, got {}", other.len()),
+        }
     }
 
     #[test]
@@ -712,6 +856,7 @@ mod tests {
                 OscEvent::OutputStart => "C",
                 OscEvent::CmdEnd(Some(0)) => "D0",
                 OscEvent::CmdEnd(_) => "D?",
+                OscEvent::Cwd(_) => "cwd",
             })
             .collect();
         assert_eq!(kinds, ["A", "C", "D0", "B"]);

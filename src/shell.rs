@@ -296,6 +296,10 @@ _chevron_precmd() {
     # Emitted first so it closes out the previous command region before
     # we print the duration tag and next prompt's A marker.
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;D;%d\a' $exit_status
+    # OSC 7: report the working directory so terminals (new-tab-here) and
+    # `chevron host` can track it across `cd`. Cursor-neutral, like the
+    # 133 reports above. Default on; opt out with CHEVRON_OSC7=0.
+    [[ "${CHEVRON_OSC7:-1}" != "0" ]] && printf '\e]7;file://%s%s\a' "$HOST" "$PWD"
     # Color-correct the transient prompt (chevron-4xq). preexec captured
     # the absolute row of the line below the painted transient (via
     # DSR). Now we query R_current, erase the transient's rows, write
@@ -1137,6 +1141,21 @@ mod tests {
     #[test]
     fn init_zsh_zero_arg_matches_default_with() {
         assert_eq!(init_zsh(), init_zsh_with(&ShellConfig::default()));
+    }
+
+    #[test]
+    fn zsh_precmd_emits_osc7_cwd_by_default() {
+        // OSC 7 lets `chevron host` (and terminals) track the cwd across
+        // `cd`. Default on, gated for opt-out (chevron-dw5.2.1).
+        let out = init_zsh();
+        assert!(
+            out.contains(r"]7;file://"),
+            "zsh init should emit an OSC 7 cwd report"
+        );
+        assert!(
+            out.contains("CHEVRON_OSC7"),
+            "OSC 7 emission must be opt-out-able via CHEVRON_OSC7"
+        );
     }
 
     #[test]
