@@ -31,6 +31,10 @@ pub mod event;
 pub mod health;
 #[cfg(feature = "daemon")]
 pub mod history;
+#[cfg(feature = "host")]
+pub mod host;
+#[cfg(any(feature = "daemon", feature = "host"))]
+pub mod pty;
 pub mod repo_status;
 pub mod segments;
 pub mod shell;
