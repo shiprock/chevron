@@ -39,8 +39,10 @@ use crate::pty::{
 
 use alacritty_terminal::event::{Event as AcEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config as AcConfig, Term, TermMode};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{Color, Processor};
 
 /// Redraw cadence for the Stage-1 status bar.
 const STATUS_REDRAW: Duration = Duration::from_millis(500);
@@ -839,6 +841,100 @@ impl Grid {
     fn alt_screen(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
+
+    /// Render the grid's visible content into ANSI escape bytes, each row
+    /// positioned at physical `top + line` (1-based). alacritty emits no
+    /// escapes (it is GPU-oriented), so this is chevron's own cell→ANSI
+    /// renderer — the core of compositing: the child writes to this grid and
+    /// chevron paints it into the content region, so the child can never
+    /// touch the bar row (closes the clear/cursor-home seam).
+    // Tested standalone in Inc 3a; wired into the loop (gated compositing) in
+    // Inc 3b — dead_code is allowed until that lands.
+    #[allow(
+        dead_code,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+    )]
+    fn render(&self, top: u16) -> Vec<u8> {
+        let grid = self.term.grid();
+        let lines = grid.screen_lines();
+        let cols = grid.columns();
+        let mut out = Vec::new();
+        for line in 0..lines {
+            let phys = usize::from(top) + line;
+            out.extend_from_slice(format!("\x1b[{phys};1H").as_bytes());
+            let mut prev: Option<(Color, Color, Flags)> = None;
+            for col in 0..cols {
+                let cell = &grid[Line(line as i32)][Column(col)];
+                // A wide char occupies two columns; skip its spacer cell so we
+                // emit the glyph once and keep alignment.
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let key = (cell.fg, cell.bg, cell.flags);
+                if prev != Some(key) {
+                    out.extend_from_slice(sgr_for(cell).as_bytes());
+                    prev = Some(key);
+                }
+                let mut b = [0u8; 4];
+                out.extend_from_slice(cell.c.encode_utf8(&mut b).as_bytes());
+            }
+            // Reset attrs and erase any stale tail to the right edge.
+            out.extend_from_slice(b"\x1b[0m\x1b[K");
+        }
+        out
+    }
+}
+
+/// SGR for a cell: a reset, then its attributes and fg/bg colors. Reset +
+/// reapply on change keeps the renderer simple and correct (at a few extra
+/// bytes vs incremental diffing).
+#[allow(dead_code)] // used by render() — wired into the loop in Inc 3b
+fn sgr_for(cell: &Cell) -> String {
+    let mut s = String::from("\x1b[0");
+    let f = cell.flags;
+    if f.contains(Flags::BOLD) {
+        s.push_str(";1");
+    }
+    if f.contains(Flags::DIM) {
+        s.push_str(";2");
+    }
+    if f.contains(Flags::ITALIC) {
+        s.push_str(";3");
+    }
+    if f.contains(Flags::UNDERLINE) {
+        s.push_str(";4");
+    }
+    if f.contains(Flags::INVERSE) {
+        s.push_str(";7");
+    }
+    s.push_str(&color_sgr(cell.fg, true));
+    s.push_str(&color_sgr(cell.bg, false));
+    s.push('m');
+    s
+}
+
+/// Map a cell color to an SGR fragment (leading `;`), or empty for the
+/// terminal default (covered by the leading reset).
+// `n as u8`: NamedColor's standard 0–15 map to ANSI; higher specials fall
+// through to default, so truncation is intentional.
+#[allow(dead_code, clippy::cast_possible_truncation)]
+fn color_sgr(c: Color, fg: bool) -> String {
+    let base = if fg { 38 } else { 48 };
+    match c {
+        Color::Spec(rgb) => format!(";{base};2;{};{};{}", rgb.r, rgb.g, rgb.b),
+        Color::Indexed(i) => format!(";{base};5;{i}"),
+        Color::Named(n) => {
+            let idx = n as u8;
+            if idx < 8 {
+                format!(";{}", (if fg { 30u16 } else { 40 }) + u16::from(idx))
+            } else if idx < 16 {
+                format!(";{}", (if fg { 90u16 } else { 100 }) + u16::from(idx - 8))
+            } else {
+                String::new()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -887,6 +983,31 @@ mod tests {
         // vim/btop/less use) but NOT legacy ?47/?1047 — so scan_alt_screen
         // stays as the bar's suspend/restore source. The grid is the source
         // of truth for the CURSOR, which is what Stage 2 actually needs.
+    }
+
+    #[test]
+    fn render_positions_rows_and_reproduces_text() {
+        let mut g = Grid::new(20, 3);
+        g.feed(b"hi");
+        let out = g.render(5); // content starts at physical row 5
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b[5;1H"), "row 0 -> physical 5: {s:?}");
+        assert!(s.contains("\x1b[7;1H"), "row 2 -> physical 7 (5+2)");
+        assert!(s.contains("hi"), "reproduces the text");
+    }
+
+    #[test]
+    fn render_emits_sgr_for_a_colored_cell() {
+        let mut g = Grid::new(20, 1);
+        g.feed(b"\x1b[31mR"); // red foreground R
+        let out = g.render(1);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains(";31"), "red fg SGR (;31) present: {s:?}");
+        assert!(s.contains('R'), "reproduces the glyph");
+        assert!(
+            s.ends_with("\x1b[0m\x1b[K"),
+            "row resets attrs + erases tail"
+        );
     }
 
     #[test]
