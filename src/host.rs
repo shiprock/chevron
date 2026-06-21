@@ -37,6 +37,11 @@ use crate::pty::{
     is_tty, openpty_pair, pipe_cloexec_nonblocking, set_winsize, write_all,
 };
 
+use alacritty_terminal::event::{Event as AcEvent, EventListener};
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::term::{Config as AcConfig, Term, TermMode};
+use alacritty_terminal::vte::ansi::Processor;
+
 /// Redraw cadence for the Stage-1 status bar.
 const STATUS_REDRAW: Duration = Duration::from_millis(500);
 
@@ -230,6 +235,11 @@ fn host_io_loop(
         bar.refresh_git();
         bar.draw();
     }
+    // Stage 2 Inc 1: a parallel grid model of the child's screen (only on the
+    // status path). Observational — its cursor/alt-screen are surfaced in the
+    // bar's debug overlay (CHEVRON_HOST_DEBUG) to prove the model tracks reality.
+    let debug = std::env::var_os("CHEVRON_HOST_DEBUG").is_some();
+    let mut grid = status.then(|| Grid::new(cols, rows));
     // Poll wakes periodically in status mode so the clock stays live even
     // while the shell sits idle; otherwise it blocks indefinitely.
     let timeout: libc::c_int = if status { 250 } else { -1 };
@@ -275,6 +285,9 @@ fn host_io_loop(
                 cols = w.ws_col;
                 rows = w.ws_row;
                 bar.cols = cols;
+                if let Some(g) = grid.as_mut() {
+                    g.resize(cols, rows);
+                }
                 if status && !alt {
                     set_scroll_region(rows);
                     bar.draw();
@@ -302,6 +315,17 @@ fn host_io_loop(
             if n > 0 {
                 let chunk = &buf[..n as usize];
                 let _ = write_all(libc::STDOUT_FILENO, chunk);
+                if let Some(g) = grid.as_mut() {
+                    g.feed(chunk);
+                    if debug {
+                        let (r, c) = g.cursor();
+                        bar.debug = if g.alt_screen() {
+                            format!("grid {r}:{c} ALT")
+                        } else {
+                            format!("grid {r}:{c}")
+                        };
+                    }
+                }
                 if status {
                     let now_alt = scan_alt_screen(chunk, alt);
                     if now_alt != alt {
@@ -386,6 +410,8 @@ struct Bar {
     last_exit: Option<i32>,
     cmd_start: Option<Instant>,
     last_dur: Option<Duration>,
+    /// Optional debug overlay (grid cursor + alt flag), Inc 1 observability.
+    debug: String,
 }
 
 impl Bar {
@@ -406,6 +432,7 @@ impl Bar {
             last_exit: None,
             cmd_start: None,
             last_dur: None,
+            debug: String::new(),
         }
     }
 
@@ -470,6 +497,7 @@ impl Bar {
             &self.git,
             &status,
             &self.host,
+            &self.debug,
         );
         let seq = format!("\x1b7\x1b[1;1H\x1b[7m{line}\x1b[0m\x1b8");
         let _ = write_all(libc::STDOUT_FILENO, seq.as_bytes());
@@ -478,7 +506,15 @@ impl Bar {
 
 /// Compose the bar text and pad/truncate to exactly `cols` cells. Content
 /// is width-1 characters, so cell width equals `chars().count()`.
-fn bar_line(cols: u16, secs: u64, cwd: &str, git: &str, status: &str, host: &str) -> String {
+fn bar_line(
+    cols: u16,
+    secs: u64,
+    cwd: &str,
+    git: &str,
+    status: &str,
+    host: &str,
+    debug: &str,
+) -> String {
     let width = usize::from(cols);
     let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
     let place = if git.is_empty() {
@@ -486,7 +522,12 @@ fn bar_line(cols: u16, secs: u64, cwd: &str, git: &str, status: &str, host: &str
     } else {
         format!("{cwd} {git}")
     };
-    let label = format!(" chevron host   {place}   {status}   {host}   {h:02}:{m:02}:{s:02} ");
+    let dbg = if debug.is_empty() {
+        String::new()
+    } else {
+        format!("   {debug}")
+    };
+    let label = format!(" chevron host   {place}   {status}   {host}   {h:02}:{m:02}:{s:02}{dbg} ");
     let mut text: String = label.chars().take(width).collect();
     let len = text.chars().count();
     if len < width {
@@ -712,6 +753,79 @@ impl Drop for StatusGuard {
     }
 }
 
+// ── Stage 2 Inc 1: parallel grid model (alacritty_terminal) ──────────────────
+//
+// A VT screen model of the CHILD's output, fed the forwarded stream. Inc 1
+// uses it observationally: the cursor it tracks (and alt-screen mode) is the
+// foundation that retires the shell.rs DSR machinery — chevron reads the
+// cursor from this grid instead of querying the terminal with ESC[6n. The
+// OscScanner stays for OSC 7/133 (Term does not surface those cleanly).
+
+/// No-op event sink for the embedded Term (we only read its grid).
+struct Sink;
+impl EventListener for Sink {
+    fn send_event(&self, _event: AcEvent) {}
+}
+
+/// Window size the embedded Term renders into. No scrollback for the live
+/// model (`total_lines == screen_lines`).
+#[derive(Clone, Copy)]
+struct GridSize {
+    cols: usize,
+    lines: usize,
+}
+
+impl Dimensions for GridSize {
+    fn columns(&self) -> usize {
+        self.cols
+    }
+    fn screen_lines(&self) -> usize {
+        self.lines
+    }
+    fn total_lines(&self) -> usize {
+        self.lines
+    }
+}
+
+struct Grid {
+    term: Term<Sink>,
+    parser: Processor,
+}
+
+impl Grid {
+    fn new(cols: u16, rows: u16) -> Self {
+        let size = GridSize {
+            cols: cols as usize,
+            lines: rows as usize,
+        };
+        Self {
+            term: Term::new(AcConfig::default(), &size, Sink),
+            parser: Processor::new(),
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        self.parser.advance(&mut self.term, bytes);
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.term.resize(GridSize {
+            cols: cols as usize,
+            lines: rows as usize,
+        });
+    }
+
+    /// Cursor as 0-based (row, col).
+    fn cursor(&self) -> (usize, usize) {
+        let p = self.term.grid().cursor.point;
+        (usize::try_from(p.line.0.max(0)).unwrap_or(0), p.column.0)
+    }
+
+    fn alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,6 +854,20 @@ mod tests {
     #[test]
     fn help_flag_exits_zero() {
         assert_eq!(run(&["--help".to_string()]), 0);
+    }
+
+    #[test]
+    fn grid_tracks_cursor_and_alt_screen() {
+        let mut g = Grid::new(80, 24);
+        g.feed(b"hello");
+        assert_eq!(g.cursor(), (0, 5), "5 printed cells -> col 5, row 0");
+        g.feed(b"\r\n");
+        assert_eq!(g.cursor(), (1, 0), "CR+LF -> row 1, col 0");
+        assert!(!g.alt_screen());
+        g.feed(b"\x1b[?1049h");
+        assert!(g.alt_screen(), "enter alternate screen");
+        g.feed(b"\x1b[?1049l");
+        assert!(!g.alt_screen(), "leave alternate screen");
     }
 
     #[test]
@@ -772,7 +900,15 @@ mod tests {
     #[test]
     fn bar_line_is_exactly_cols_wide() {
         for cols in [1u16, 10, 40, 80, 200] {
-            let text = bar_line(cols, 45_296, "~/src/chevron", "main*", "ok 1.2s", "m-217");
+            let text = bar_line(
+                cols,
+                45_296,
+                "~/src/chevron",
+                "main*",
+                "ok 1.2s",
+                "m-217",
+                "",
+            );
             assert_eq!(text.chars().count(), usize::from(cols), "width {cols}");
         }
     }
@@ -787,12 +923,14 @@ mod tests {
             "main*",
             "running 3.4s",
             "m-217",
+            "grid 3:5",
         );
         assert!(text.contains("12:34:56"), "got: {text}");
         assert!(text.contains("~/src/chevron"));
         assert!(text.contains("main*"));
         assert!(text.contains("running 3.4s"));
         assert!(text.contains("m-217"));
+        assert!(text.contains("grid 3:5"), "debug overlay should appear");
     }
 
     #[test]

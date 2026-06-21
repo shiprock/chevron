@@ -24,11 +24,17 @@ daemon = ["dep:notify", "dep:rusqlite", "dep:ulid"]
 # chevron host: opt-in PTY compositor (own the prompt zone). Stage 0 is a
 # transparent passthrough host (src/host.rs); later stages add a status
 # region and live-zone compositing. Off by default so CI / nix build / the
-# shipping binary are unaffected. Uses only libc — no new dependency. See
-# the chevron-dw5 epic.
-host = []
+# shipping binary are unaffected. The transparent passthrough + status bar
+# use only libc; the Stage 2 grid model pulls in alacritty_terminal (an
+# actively-maintained, resize-robust VT model — vt100 stays a dev-dep for
+# the test harness only). See the chevron-dw5 epic.
+host = ["dep:alacritty_terminal"]
 
 [dependencies]
+# Stage 2 grid model for `chevron host` (opt-in via the `host` feature). The
+# maintained, vtebench-fast VT model from the Alacritty project; chevron
+# drives a Term from the forwarded child stream to know the cursor/grid.
+alacritty_terminal = { version = "0.26", optional = true }
 git2 = { version = "0.21", default-features = false }
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 # `chevron configure` wizard. Default-features pulls in the crossterm
