@@ -229,7 +229,7 @@ fn host_io_loop(
     // and it is only refreshed/drawn on the status path. The OSC scanner is
     // Stage 2's backbone.
     let mut osc = OscScanner::default();
-    let mut events: Vec<OscEvent> = Vec::new();
+    let mut events: Vec<(usize, OscEvent)> = Vec::new();
     let mut bar = Bar::new(cols, host.to_string());
     if status {
         bar.refresh_git();
@@ -240,6 +240,9 @@ fn host_io_loop(
     // bar's debug overlay (CHEVRON_HOST_DEBUG) to prove the model tracks reality.
     let debug = std::env::var_os("CHEVRON_HOST_DEBUG").is_some();
     let mut grid = status.then(|| Grid::new(cols, rows));
+    // Screen row where the current prompt started (grid cursor at the OSC 133 A
+    // marker). Inc 4 will repaint the prompt span from this — no DSR query.
+    let mut prompt_row: usize = 0;
     // Poll wakes periodically in status mode so the clock stays live even
     // while the shell sits idle; otherwise it blocks indefinitely.
     let timeout: libc::c_int = if status { 250 } else { -1 };
@@ -315,17 +318,6 @@ fn host_io_loop(
             if n > 0 {
                 let chunk = &buf[..n as usize];
                 let _ = write_all(libc::STDOUT_FILENO, chunk);
-                if let Some(g) = grid.as_mut() {
-                    g.feed(chunk);
-                    if debug {
-                        let (r, c) = g.cursor();
-                        bar.debug = if g.alt_screen() {
-                            format!("grid {r}:{c} ALT")
-                        } else {
-                            format!("grid {r}:{c}")
-                        };
-                    }
-                }
                 if status {
                     let now_alt = scan_alt_screen(chunk, alt);
                     if now_alt != alt {
@@ -340,11 +332,32 @@ fn host_io_loop(
                             last_draw = Instant::now();
                         }
                     }
-                    // OSC 7 → cwd/git, OSC 133 → command state.
+                    // OSC events carry byte offsets. Feed the grid up to each
+                    // marker so the cursor read there is its TRUE row — that is
+                    // how OSC 133 A anchors the prompt to its screen row, the
+                    // data Inc 4 needs to repaint the prompt without DSR.
+                    // (OSC 7 → cwd/git, OSC 133 → command state.)
                     osc.feed(chunk, &mut events);
                     let mut changed = false;
-                    for ev in events.drain(..) {
+                    let mut fed = 0;
+                    for (offset, ev) in events.drain(..) {
+                        if let Some(g) = grid.as_mut() {
+                            let upto = offset.min(chunk.len());
+                            g.feed(&chunk[fed..upto]);
+                            fed = upto;
+                            if matches!(ev, OscEvent::PromptStart) {
+                                prompt_row = g.cursor().0;
+                            }
+                        }
                         changed |= bar.apply(ev);
+                    }
+                    if let Some(g) = grid.as_mut() {
+                        g.feed(&chunk[fed..]);
+                        if debug {
+                            let (r, c) = g.cursor();
+                            let altmark = if g.alt_screen() { " ALT" } else { "" };
+                            bar.debug = format!("g{r}:{c} p@{prompt_row}{altmark}");
+                        }
                     }
                     if changed && !alt {
                         bar.draw();
@@ -650,8 +663,8 @@ struct OscScanner {
 }
 
 impl OscScanner {
-    fn feed(&mut self, chunk: &[u8], out: &mut Vec<OscEvent>) {
-        for &b in chunk {
+    fn feed(&mut self, chunk: &[u8], out: &mut Vec<(usize, OscEvent)>) {
+        for (i, &b) in chunk.iter().enumerate() {
             match self.state {
                 OscState::Ground => {
                     if b == 0x1b {
@@ -669,7 +682,9 @@ impl OscScanner {
                 OscState::Osc => {
                     if b == 0x07 {
                         if let Some(ev) = parse_osc(&self.buf) {
-                            out.push(ev);
+                            // Offset just past the BEL: feeding the grid up to
+                            // here lands its cursor at the marker's true row.
+                            out.push((i + 1, ev));
                         }
                         self.state = OscState::Ground;
                         self.buf.clear();
@@ -868,6 +883,10 @@ mod tests {
         assert!(g.alt_screen(), "enter alternate screen");
         g.feed(b"\x1b[?1049l");
         assert!(!g.alt_screen(), "leave alternate screen");
+        // NOTE: alacritty's ALT_SCREEN tracks the modern ?1049 form (what
+        // vim/btop/less use) but NOT legacy ?47/?1047 — so scan_alt_screen
+        // stays as the bar's suspend/restore source. The grid is the source
+        // of truth for the CURSOR, which is what Stage 2 actually needs.
     }
 
     #[test]
@@ -954,7 +973,7 @@ mod tests {
         let mut out = Vec::new();
         osc.feed(b"\x1b]7;file://m-217/Users/mim/src\x07", &mut out);
         match out.as_slice() {
-            [OscEvent::Cwd(p)] => assert_eq!(p.as_str(), "/Users/mim/src"),
+            [(_, OscEvent::Cwd(p))] => assert_eq!(p.as_str(), "/Users/mim/src"),
             other => panic!("expected one Cwd event, got {}", other.len()),
         }
     }
@@ -988,7 +1007,7 @@ mod tests {
         osc.feed(b"B\x07", &mut out);
         let kinds: Vec<_> = out
             .iter()
-            .map(|e| match e {
+            .map(|(_, e)| match e {
                 OscEvent::PromptStart => "A",
                 OscEvent::CmdStart => "B",
                 OscEvent::OutputStart => "C",
