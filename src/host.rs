@@ -120,13 +120,14 @@ fn run_pty(cmd_args: &[String], requested_status: bool) -> std::io::Result<i32> 
     // 5. Stage 1: reserve the top row for the status bar (only with a
     //    real TTY and a known size). The guard tears the region back
     //    down on any exit path, including unwind.
+    let host = hostname();
     let status = requested_status && stdin_is_tty && winsz.is_some();
     let _status_guard = if status {
         let (cols, rows) = winsz.map_or((80, 24), |w| (w.ws_col, w.ws_row));
         set_scroll_region(rows);
         // Drop the shell below the bar so its first prompt lands at row 2.
         let _ = write_all(libc::STDOUT_FILENO, b"\x1b[2;1H");
-        draw_status_bar(cols, rows);
+        draw_bar(cols, rows, &host, false, None, None);
         Some(StatusGuard)
     } else {
         None
@@ -168,7 +169,7 @@ fn run_pty(cmd_args: &[String], requested_status: bool) -> std::io::Result<i32> 
     };
 
     // 7. Pump until the child exits.
-    host_io_loop(master_fd, winch_r.as_raw_fd(), status)?;
+    host_io_loop(master_fd, winch_r.as_raw_fd(), status, &host)?;
 
     // 8. Reap and disarm the handler.
     let status_code = child.wait()?;
@@ -190,13 +191,33 @@ fn run_pty(cmd_args: &[String], requested_status: bool) -> std::io::Result<i32> 
 /// → propagate size. With `status`, also redraws the reserved top-row
 /// bar on a timer and tracks alternate-screen entry/exit so full-screen
 /// apps get the whole screen. Breaks when the master EOFs/HUPs.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn host_io_loop(master_fd: RawFd, winch_fd: RawFd, status: bool) -> std::io::Result<()> {
+// A single poll-dispatch loop reads clearest in one place (cf. `main`'s
+// dispatch, which takes the same allow); the OSC/bar bookkeeping pushes it
+// just over the line budget.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
+fn host_io_loop(
+    master_fd: RawFd,
+    winch_fd: RawFd,
+    status: bool,
+    host: &str,
+) -> std::io::Result<()> {
     let mut buf = [0u8; 8192];
     let (mut cols, mut rows) =
         get_winsize(libc::STDIN_FILENO).map_or((80, 24), |w| (w.ws_col, w.ws_row));
     let mut alt = false;
     let mut last_draw = Instant::now();
+    // OSC 133 command lifecycle (C → running, D;<n> → finished) drives the
+    // live command-state field in the bar. This scanner is Stage 2's backbone.
+    let mut osc = OscScanner::default();
+    let mut events: Vec<OscEvent> = Vec::new();
+    let mut running = false;
+    let mut last_exit: Option<i32> = None;
+    let mut cmd_start: Option<Instant> = None;
+    let mut last_dur: Option<Duration> = None;
     // Poll wakes periodically in status mode so the clock stays live even
     // while the shell sits idle; otherwise it blocks indefinitely.
     let timeout: libc::c_int = if status { 250 } else { -1 };
@@ -243,7 +264,12 @@ fn host_io_loop(master_fd: RawFd, winch_fd: RawFd, status: bool) -> std::io::Res
                 rows = w.ws_row;
                 if status && !alt {
                     set_scroll_region(rows);
-                    draw_status_bar(cols, rows);
+                    let dur = if running {
+                        cmd_start.map(|s| s.elapsed())
+                    } else {
+                        last_dur
+                    };
+                    draw_bar(cols, rows, host, running, last_exit, dur);
                     last_draw = Instant::now();
                 }
             }
@@ -278,9 +304,42 @@ fn host_io_loop(master_fd: RawFd, winch_fd: RawFd, status: bool) -> std::io::Res
                         } else {
                             // Back to the shell: re-reserve and repaint.
                             set_scroll_region(rows);
-                            draw_status_bar(cols, rows);
+                            let dur = if running {
+                                cmd_start.map(|s| s.elapsed())
+                            } else {
+                                last_dur
+                            };
+                            draw_bar(cols, rows, host, running, last_exit, dur);
                             last_draw = Instant::now();
                         }
+                    }
+                    // OSC 133: C → command running, D;<n> → finished, exit n.
+                    osc.feed(chunk, &mut events);
+                    let mut changed = false;
+                    for ev in events.drain(..) {
+                        match ev {
+                            OscEvent::OutputStart => {
+                                running = true;
+                                cmd_start = Some(Instant::now());
+                                changed = true;
+                            }
+                            OscEvent::CmdEnd(code) => {
+                                running = false;
+                                last_exit = code;
+                                last_dur = cmd_start.take().map(|s| s.elapsed());
+                                changed = true;
+                            }
+                            OscEvent::PromptStart | OscEvent::CmdStart => {}
+                        }
+                    }
+                    if changed && !alt {
+                        let dur = if running {
+                            cmd_start.map(|s| s.elapsed())
+                        } else {
+                            last_dur
+                        };
+                        draw_bar(cols, rows, host, running, last_exit, dur);
+                        last_draw = Instant::now();
                     }
                 }
             } else {
@@ -292,9 +351,14 @@ fn host_io_loop(master_fd: RawFd, winch_fd: RawFd, status: bool) -> std::io::Res
             break;
         }
 
-        // Keep the clock fresh.
+        // Keep the clock — and a running command's live timer — fresh.
         if status && !alt && last_draw.elapsed() >= STATUS_REDRAW {
-            draw_status_bar(cols, rows);
+            let dur = if running {
+                cmd_start.map(|s| s.elapsed())
+            } else {
+                last_dur
+            };
+            draw_bar(cols, rows, host, running, last_exit, dur);
             last_draw = Instant::now();
         }
     }
@@ -330,35 +394,172 @@ fn reset_scroll_region() {
     let _ = write_all(libc::STDOUT_FILENO, b"\x1b7\x1b[r\x1b8");
 }
 
-/// Render the reserved row: save cursor (DECSC), home, reverse video,
-/// the bar text, reset attrs, restore cursor (DECRC). Save/restore keeps
-/// the child's cursor untouched; row 1 is outside the scroll region so
-/// this never scrolls the shell's content.
-fn draw_status_bar(cols: u16, rows: u16) {
+/// Render the reserved row from the current bar state: save cursor
+/// (DECSC), home, reverse video, the padded line, reset attrs, restore
+/// cursor (DECRC). Save/restore keeps the child's cursor untouched; row 1
+/// is outside the scroll region so this never scrolls the shell's content.
+fn draw_bar(
+    cols: u16,
+    rows: u16,
+    host: &str,
+    running: bool,
+    last_exit: Option<i32>,
+    dur: Option<Duration>,
+) {
     if cols == 0 {
         return;
     }
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let text = status_bar_text(cols, rows, secs);
-    let seq = format!("\x1b7\x1b[1;1H\x1b[7m{text}\x1b[0m\x1b8");
+    let status = cmd_status_text(running, last_exit, dur);
+    let line = bar_line(cols, rows, secs, host, &status);
+    let seq = format!("\x1b7\x1b[1;1H\x1b[7m{line}\x1b[0m\x1b8");
     let _ = write_all(libc::STDOUT_FILENO, seq.as_bytes());
 }
 
-/// Build the bar's text, padded/truncated to exactly `cols` cells. ASCII
-/// only, so byte length equals cell width.
-fn status_bar_text(cols: u16, rows: u16, secs: u64) -> String {
+/// Compose the bar text and pad/truncate to exactly `cols` cells. Content
+/// is width-1 characters, so cell width equals `chars().count()`.
+fn bar_line(cols: u16, rows: u16, secs: u64, host: &str, status: &str) -> String {
     let width = usize::from(cols);
     let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
-    let label = format!(
-        " chevron host   {h:02}:{m:02}:{s:02} UTC   {cols}x{rows}   chevron owns this row; your shell scrolls below "
-    );
+    let label =
+        format!(" chevron host   {host}   {status}   {h:02}:{m:02}:{s:02} UTC   {cols}x{rows} ");
     let mut text: String = label.chars().take(width).collect();
-    if text.len() < width {
-        text.push_str(&" ".repeat(width - text.len()));
+    let len = text.chars().count();
+    if len < width {
+        text.push_str(&" ".repeat(width - len));
     }
     text
+}
+
+/// Format the command-status field from the OSC 133 lifecycle state.
+fn cmd_status_text(running: bool, last_exit: Option<i32>, dur: Option<Duration>) -> String {
+    if running {
+        dur.map_or_else(
+            || "running".to_string(),
+            |d| format!("running {}", fmt_dur(d)),
+        )
+    } else if let Some(code) = last_exit {
+        match (code, dur.map(fmt_dur)) {
+            (0, Some(d)) => format!("ok {d}"),
+            (0, None) => "ok".to_string(),
+            (n, Some(d)) => format!("exit {n} {d}"),
+            (n, None) => format!("exit {n}"),
+        }
+    } else {
+        "idle".to_string()
+    }
+}
+
+/// Human-friendly duration: `350ms`, `1.2s`, `2m05s`.
+fn fmt_dur(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if d.as_secs() < 60 {
+        format!("{:.1}s", d.as_secs_f64())
+    } else {
+        let s = d.as_secs();
+        format!("{}m{:02}s", s / 60, s % 60)
+    }
+}
+
+/// Best-effort hostname for the bar, from the inherited environment.
+fn hostname() -> String {
+    std::env::var("HOST")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "host".to_string())
+}
+
+// ── OSC 133 stream scanner (Stage 2 backbone) ────────────────────────────────
+
+/// Semantic-prompt events parsed from the child's output stream.
+enum OscEvent {
+    PromptStart,
+    CmdStart,
+    OutputStart,
+    CmdEnd(Option<i32>),
+}
+
+#[derive(Default)]
+enum OscState {
+    #[default]
+    Ground,
+    Esc,
+    Osc,
+}
+
+/// Incremental scanner for `ESC ] … BEL` OSC sequences, tolerant of a
+/// sequence split across `read()` chunks. Only BEL-terminated OSCs are
+/// parsed (chevron emits those); an embedded ESC abandons the current OSC,
+/// so an ST-terminated OSC from another program is simply ignored.
+#[derive(Default)]
+struct OscScanner {
+    state: OscState,
+    buf: Vec<u8>,
+}
+
+impl OscScanner {
+    fn feed(&mut self, chunk: &[u8], out: &mut Vec<OscEvent>) {
+        for &b in chunk {
+            match self.state {
+                OscState::Ground => {
+                    if b == 0x1b {
+                        self.state = OscState::Esc;
+                    }
+                }
+                OscState::Esc => {
+                    if b == b']' {
+                        self.state = OscState::Osc;
+                        self.buf.clear();
+                    } else {
+                        self.state = OscState::Ground;
+                    }
+                }
+                OscState::Osc => {
+                    if b == 0x07 {
+                        if let Some(ev) = parse_osc_133(&self.buf) {
+                            out.push(ev);
+                        }
+                        self.state = OscState::Ground;
+                        self.buf.clear();
+                    } else if b == 0x1b {
+                        // ST terminator or a fresh escape: abandon this OSC.
+                        self.state = OscState::Esc;
+                        self.buf.clear();
+                    } else if self.buf.len() < 128 {
+                        self.buf.push(b);
+                    } else {
+                        // Runaway OSC payload — give up on it.
+                        self.state = OscState::Ground;
+                        self.buf.clear();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parse an OSC payload (bytes between `ESC]` and the terminator) as an
+/// OSC 133 marker: `133;A|B|C` or `133;D[;<exit>]`.
+fn parse_osc_133(buf: &[u8]) -> Option<OscEvent> {
+    let s = std::str::from_utf8(buf).ok()?;
+    let mut parts = s.split(';');
+    if parts.next()? != "133" {
+        return None;
+    }
+    match parts.next()? {
+        "A" => Some(OscEvent::PromptStart),
+        "B" => Some(OscEvent::CmdStart),
+        "C" => Some(OscEvent::OutputStart),
+        "D" => Some(OscEvent::CmdEnd(
+            parts.next().and_then(|c| c.parse::<i32>().ok()),
+        )),
+        _ => None,
+    }
 }
 
 /// Scan a forwarded chunk for alternate-screen toggles and return the
@@ -459,20 +660,61 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_text_is_exactly_cols_wide() {
+    fn bar_line_is_exactly_cols_wide() {
         for cols in [1u16, 10, 40, 80, 200] {
-            let text = status_bar_text(cols, 24, 45_296);
+            let text = bar_line(cols, 24, 45_296, "m-217", "ok 1.2s");
             assert_eq!(text.chars().count(), usize::from(cols), "width {cols}");
-            assert_eq!(text.len(), usize::from(cols), "ascii bytes == cells");
         }
     }
 
     #[test]
-    fn status_bar_text_renders_the_clock() {
+    fn bar_line_renders_clock_host_and_status() {
         // 45_296 s = 12:34:56 UTC.
-        let text = status_bar_text(80, 24, 45_296);
+        let text = bar_line(120, 24, 45_296, "m-217", "running 3.4s");
         assert!(text.contains("12:34:56"), "got: {text}");
-        assert!(text.contains("80x24"));
+        assert!(text.contains("m-217"));
+        assert!(text.contains("running 3.4s"));
+        assert!(text.contains("120x24"));
+    }
+
+    #[test]
+    fn cmd_status_text_covers_running_ok_and_failure() {
+        let d = Some(Duration::from_millis(1234));
+        assert_eq!(cmd_status_text(true, None, d), "running 1.2s");
+        assert_eq!(cmd_status_text(false, Some(0), d), "ok 1.2s");
+        assert_eq!(cmd_status_text(false, Some(2), d), "exit 2 1.2s");
+        assert_eq!(cmd_status_text(false, Some(0), None), "ok");
+        assert_eq!(cmd_status_text(false, None, None), "idle");
+    }
+
+    #[test]
+    fn fmt_dur_scales_units() {
+        assert_eq!(fmt_dur(Duration::from_millis(350)), "350ms");
+        assert_eq!(fmt_dur(Duration::from_millis(1234)), "1.2s");
+        assert_eq!(fmt_dur(Duration::from_secs(125)), "2m05s");
+    }
+
+    #[test]
+    fn osc_scanner_parses_133_lifecycle() {
+        let mut osc = OscScanner::default();
+        let mut out = Vec::new();
+        // A prompt + command-output cycle...
+        osc.feed(b"\x1b]133;A\x07prompt\x1b]133;C\x07", &mut out);
+        osc.feed(b"output\x1b]133;D;0\x07", &mut out);
+        // ...plus a marker split across two feeds (the cross-chunk case).
+        osc.feed(b"\x1b]133;", &mut out);
+        osc.feed(b"B\x07", &mut out);
+        let kinds: Vec<_> = out
+            .iter()
+            .map(|e| match e {
+                OscEvent::PromptStart => "A",
+                OscEvent::CmdStart => "B",
+                OscEvent::OutputStart => "C",
+                OscEvent::CmdEnd(Some(0)) => "D0",
+                OscEvent::CmdEnd(_) => "D?",
+            })
+            .collect();
+        assert_eq!(kinds, ["A", "C", "D0", "B"]);
     }
 
     #[test]
