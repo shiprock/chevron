@@ -1370,24 +1370,49 @@ fn suspend_resume_cycle_keeps_rows_intact() {
         return;
     }
     let t = Term::spawn_zsh(Dsr::Immediate);
-    t.send_line("sleep 5");
+    t.send_line("sleep 30");
     t.wait_for("command to collapse and start", |s| {
         chevron_rows(s).len() == 1
     });
-    // The collapse paints before preexec hands the terminal to the
-    // child; ^Z must hit the CHILD's process group. Too early and zsh
-    // (which ignores TSTP) eats it; too late is harmless within the 5 s
-    // sleep window.
-    std::thread::sleep(Duration::from_millis(200));
-    t.send("\x1a"); // Ctrl-Z
-    t.wait_for("suspend message and prompt", |s| {
-        lines(s).iter().any(|l| l.contains("suspended")) && prompt_ready(s)
-    });
+    // Suspend the running child. ^Z must reach the CHILD's process
+    // group; if it arrives during the preexec->child handoff (zsh, which
+    // ignores TSTP, still owns the terminal) it is eaten, so re-send
+    // until the job stops. Detect the stop by the job-control notice in
+    // the RAW stream, NOT the grid (chevron-knh): the transient redraw
+    // that follows the stop wipes "suspended" off the screen within a
+    // frame, so a grid match is missed and the loop fires an EXTRA ^Z at
+    // the now-idle ZLE prompt — where it self-inserts and corrupts the
+    // next command (`^Zfg` -> command not found). A raw match lands
+    // within a poll of the stop, so no stray ^Z escapes. The long sleep
+    // keeps the window open; the resumed job is killed below.
+    let suspend_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        t.send("\x1a"); // Ctrl-Z
+        let attempt = Instant::now() + Duration::from_millis(1500);
+        let mut stopped = false;
+        while Instant::now() < attempt {
+            if find_subslice(&t.raw.lock().unwrap(), b"suspended").is_some() {
+                stopped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        if stopped {
+            break;
+        }
+        assert!(
+            Instant::now() < suspend_deadline,
+            "sleep never suspended after repeated ^Z\n{}",
+            t.dump()
+        );
+    }
+    t.wait_for("prompt after suspend", prompt_ready);
+    // Resume in the foreground. The "continued"/"running" job-control
+    // notice is just as fleeting as "suspended", so match it in the raw
+    // stream too rather than the grid.
     t.send_line("fg");
-    t.wait_for("job to resume in the foreground", |s| {
-        lines(s)
-            .iter()
-            .any(|l| l.contains("continued") || l.contains("running"))
+    t.wait_for_raw("job to resume in the foreground", |raw| {
+        find_subslice(raw, b"continued").is_some() || find_subslice(raw, b"running").is_some()
     });
     t.send("\x03"); // kill the resumed sleep
     t.wait_for("prompt after killing resumed job", prompt_ready);
@@ -1396,14 +1421,15 @@ fn suspend_resume_cycle_keeps_rows_intact() {
     let rows = t.with_screen(chevron_rows);
     assert_eq!(
         rows,
-        vec!["\u{276f} sleep 5", "\u{276f} fg"],
+        vec!["\u{276f} sleep 30", "\u{276f} fg"],
         "suspend/resume must leave exactly one row per command\n{}",
         t.dump()
     );
     assert!(
-        t.with_screen(lines)
-            .iter()
-            .any(|l| l.contains("continued") || l.contains("running")),
+        {
+            let raw = t.raw.lock().unwrap();
+            find_subslice(&raw, b"continued").is_some() || find_subslice(&raw, b"running").is_some()
+        },
         "fg should have resumed the job\n{}",
         t.dump()
     );
