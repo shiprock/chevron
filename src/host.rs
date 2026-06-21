@@ -41,7 +41,7 @@ use alacritty_terminal::event::{Event as AcEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::{Config as AcConfig, Term, TermMode};
+use alacritty_terminal::term::{Config as AcConfig, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, Processor};
 
 /// Redraw cadence for the Stage-1 status bar.
@@ -103,9 +103,18 @@ fn run_pty(cmd_args: &[String], requested_status: bool) -> std::io::Result<i32> 
     let (master, slave) = openpty_pair()?;
     let master_fd = master.as_raw_fd();
 
-    // 2. Seed the slave's window size from the real terminal (if a TTY).
+    // 2. Compute mode, then seed the slave's window size. Compositing
+    //    (opt-in CHEVRON_HOST_COMPOSITE) renders the child's grid into rows
+    //    2..N instead of forwarding bytes, so the child can never reach the
+    //    bar row — for that the child gets N-1 rows (the bar owns row 1).
     let winsz = get_winsize(libc::STDIN_FILENO);
-    if let Some(w) = winsz {
+    let stdin_is_tty = is_tty(libc::STDIN_FILENO);
+    let status = requested_status && stdin_is_tty && winsz.is_some();
+    let compose = status && std::env::var_os("CHEVRON_HOST_COMPOSITE").is_some();
+    if let Some(mut w) = winsz {
+        if compose && w.ws_row > 1 {
+            w.ws_row -= 1;
+        }
         set_winsize(slave.as_raw_fd(), w);
     }
 
@@ -117,7 +126,6 @@ fn run_pty(cmd_args: &[String], requested_status: bool) -> std::io::Result<i32> 
 
     // 4. Real stdin → raw mode. The guard restores cooked mode on drop.
     //    Only when stdin is a TTY (under a pipe it stays cooked).
-    let stdin_is_tty = is_tty(libc::STDIN_FILENO);
     let _termios_guard = if stdin_is_tty {
         Some(TermiosGuard::install_raw_mode(libc::STDIN_FILENO)?)
     } else {
@@ -128,7 +136,6 @@ fn run_pty(cmd_args: &[String], requested_status: bool) -> std::io::Result<i32> 
     //    real TTY and a known size). The guard tears the region back
     //    down on any exit path, including unwind.
     let host = hostname();
-    let status = requested_status && stdin_is_tty && winsz.is_some();
     let _status_guard = if status {
         let rows = winsz.map_or(24, |w| w.ws_row);
         set_scroll_region(rows);
@@ -186,7 +193,7 @@ fn run_pty(cmd_args: &[String], requested_status: bool) -> std::io::Result<i32> 
     };
 
     // 7. Pump until the child exits.
-    host_io_loop(master_fd, winch_r.as_raw_fd(), status, &host)?;
+    host_io_loop(master_fd, winch_r.as_raw_fd(), status, compose, &host)?;
 
     // 8. Reap and disarm the handler.
     let status_code = child.wait()?;
@@ -219,6 +226,7 @@ fn host_io_loop(
     master_fd: RawFd,
     winch_fd: RawFd,
     status: bool,
+    compose: bool,
     host: &str,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 8192];
@@ -237,11 +245,16 @@ fn host_io_loop(
         bar.refresh_git();
         bar.draw();
     }
-    // Stage 2 Inc 1: a parallel grid model of the child's screen (only on the
-    // status path). Observational — its cursor/alt-screen are surfaced in the
-    // bar's debug overlay (CHEVRON_HOST_DEBUG) to prove the model tracks reality.
+    // The grid models the child's screen. In compose mode chevron RENDERS it
+    // into rows 2..N (the child gets N-1 rows, so it can never touch row 1);
+    // otherwise it is observational (cursor/alt via CHEVRON_HOST_DEBUG).
     let debug = std::env::var_os("CHEVRON_HOST_DEBUG").is_some();
-    let mut grid = status.then(|| Grid::new(cols, rows));
+    let grid_rows = if compose {
+        rows.saturating_sub(1).max(1)
+    } else {
+        rows
+    };
+    let mut grid = status.then(|| Grid::new(cols, grid_rows, master_fd));
     // Screen row where the current prompt started (grid cursor at the OSC 133 A
     // marker). Inc 4 will repaint the prompt span from this — no DSR query.
     let mut prompt_row: usize = 0;
@@ -286,14 +299,24 @@ fn host_io_loop(
                 libc::read(winch_fd, drain.as_mut_ptr().cast(), drain.len());
             }
             if let Some(w) = get_winsize(libc::STDIN_FILENO) {
-                set_winsize(master_fd, w);
+                // The child gets N-1 rows in compose mode (the bar owns row 1).
+                let mut child_w = w;
+                if compose && child_w.ws_row > 1 {
+                    child_w.ws_row -= 1;
+                }
+                set_winsize(master_fd, child_w);
                 cols = w.ws_col;
                 rows = w.ws_row;
                 bar.cols = cols;
                 if let Some(g) = grid.as_mut() {
-                    g.resize(cols, rows);
+                    g.resize(cols, child_w.ws_row);
                 }
-                if status && !alt {
+                if compose && !alt {
+                    if let Some(g) = grid.as_mut() {
+                        compose_frame(g, &bar);
+                    }
+                    last_draw = Instant::now();
+                } else if status && !alt {
                     set_scroll_region(rows);
                     bar.draw();
                     last_draw = Instant::now();
@@ -319,26 +342,11 @@ fn host_io_loop(
             let n = unsafe { libc::read(master_fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
                 let chunk = &buf[..n as usize];
-                let _ = write_all(libc::STDOUT_FILENO, chunk);
                 if status {
                     let now_alt = scan_alt_screen(chunk, alt);
-                    if now_alt != alt {
-                        alt = now_alt;
-                        if alt {
-                            // Full-screen app takes over: release the row.
-                            reset_scroll_region();
-                        } else {
-                            // Back to the shell: re-reserve and repaint.
-                            set_scroll_region(rows);
-                            bar.draw();
-                            last_draw = Instant::now();
-                        }
-                    }
-                    // OSC events carry byte offsets. Feed the grid up to each
-                    // marker so the cursor read there is its TRUE row — that is
-                    // how OSC 133 A anchors the prompt to its screen row, the
-                    // data Inc 4 needs to repaint the prompt without DSR.
-                    // (OSC 7 → cwd/git, OSC 133 → command state.)
+                    // OSC events carry byte offsets; feed the grid up to each
+                    // marker so the cursor read there is its TRUE row (OSC 133
+                    // A anchors the prompt row; OSC 7 → cwd/git, 133 → state).
                     osc.feed(chunk, &mut events);
                     let mut changed = false;
                     let mut fed = 0;
@@ -361,10 +369,46 @@ fn host_io_loop(
                             bar.debug = format!("g{r}:{c} p@{prompt_row}{altmark}");
                         }
                     }
-                    if changed && !alt {
-                        bar.draw();
-                        last_draw = Instant::now();
+
+                    if compose {
+                        // chevron renders the grid; the child's bytes are NOT
+                        // forwarded — except alt-screen apps, which get the raw
+                        // terminal (punt-to-passthrough).
+                        let was_alt = alt;
+                        alt = now_alt;
+                        if now_alt || was_alt {
+                            let _ = write_all(libc::STDOUT_FILENO, chunk);
+                            if was_alt && !now_alt {
+                                if let Some(g) = grid.as_mut() {
+                                    compose_frame(g, &bar);
+                                }
+                                last_draw = Instant::now();
+                            }
+                        } else if let Some(g) = grid.as_mut() {
+                            compose_frame(g, &bar);
+                            last_draw = Instant::now();
+                        }
+                    } else {
+                        // Stage 1/2: passthrough + bar overlay.
+                        let _ = write_all(libc::STDOUT_FILENO, chunk);
+                        if now_alt != alt {
+                            alt = now_alt;
+                            if alt {
+                                reset_scroll_region();
+                            } else {
+                                set_scroll_region(rows);
+                                bar.draw();
+                                last_draw = Instant::now();
+                            }
+                        }
+                        if changed && !alt {
+                            bar.draw();
+                            last_draw = Instant::now();
+                        }
                     }
+                } else {
+                    // !status: pure passthrough.
+                    let _ = write_all(libc::STDOUT_FILENO, chunk);
                 }
             } else {
                 // EOF/EIO: child exited and the slave closed.
@@ -779,9 +823,20 @@ impl Drop for StatusGuard {
 // OscScanner stays for OSC 7/133 (Term does not surface those cleanly).
 
 /// No-op event sink for the embedded Term (we only read its grid).
-struct Sink;
+struct Sink {
+    master_fd: RawFd,
+}
 impl EventListener for Sink {
-    fn send_event(&self, _event: AcEvent) {}
+    fn send_event(&self, event: AcEvent) {
+        // alacritty answers terminal queries (DSR cursor position, device
+        // attributes, …) by emitting PtyWrite — forward it to the child so its
+        // DSR-driven transient prompt works against OUR grid, no real-terminal
+        // round-trip. (This is also why compose felt slow: the shell timed out
+        // ~300ms per DSR query chevron never answered.)
+        if let AcEvent::PtyWrite(data) = event {
+            let _ = write_all(self.master_fd, data.as_bytes());
+        }
+    }
 }
 
 /// Window size the embedded Term renders into. No scrollback for the live
@@ -810,13 +865,13 @@ struct Grid {
 }
 
 impl Grid {
-    fn new(cols: u16, rows: u16) -> Self {
+    fn new(cols: u16, rows: u16, master_fd: RawFd) -> Self {
         let size = GridSize {
             cols: cols as usize,
             lines: rows as usize,
         };
         Self {
-            term: Term::new(AcConfig::default(), &size, Sink),
+            term: Term::new(AcConfig::default(), &size, Sink { master_fd }),
             parser: Processor::new(),
         }
     }
@@ -842,45 +897,63 @@ impl Grid {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
-    /// Render the grid's visible content into ANSI escape bytes, each row
-    /// positioned at physical `top + line` (1-based). alacritty emits no
-    /// escapes (it is GPU-oriented), so this is chevron's own cell→ANSI
-    /// renderer — the core of compositing: the child writes to this grid and
-    /// chevron paints it into the content region, so the child can never
-    /// touch the bar row (closes the clear/cursor-home seam).
-    // Tested standalone in Inc 3a; wired into the loop (gated compositing) in
-    // Inc 3b — dead_code is allowed until that lands.
-    #[allow(
-        dead_code,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap
-    )]
-    fn render(&self, top: u16) -> Vec<u8> {
+    /// Render one grid line into `out`, positioned at physical `top + line`
+    /// (1-based). alacritty emits no escapes (it is GPU-oriented), so this is
+    /// chevron's own cell→ANSI renderer — the core of compositing: the child
+    /// writes to this grid and chevron paints it into the content region, so
+    /// the child can never touch the bar row (closes the clear/home seam).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn render_line(&self, line: usize, top: u16, out: &mut Vec<u8>) {
         let grid = self.term.grid();
-        let lines = grid.screen_lines();
         let cols = grid.columns();
-        let mut out = Vec::new();
-        for line in 0..lines {
-            let phys = usize::from(top) + line;
-            out.extend_from_slice(format!("\x1b[{phys};1H").as_bytes());
-            let mut prev: Option<(Color, Color, Flags)> = None;
-            for col in 0..cols {
-                let cell = &grid[Line(line as i32)][Column(col)];
-                // A wide char occupies two columns; skip its spacer cell so we
-                // emit the glyph once and keep alignment.
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    continue;
-                }
-                let key = (cell.fg, cell.bg, cell.flags);
-                if prev != Some(key) {
-                    out.extend_from_slice(sgr_for(cell).as_bytes());
-                    prev = Some(key);
-                }
-                let mut b = [0u8; 4];
-                out.extend_from_slice(cell.c.encode_utf8(&mut b).as_bytes());
+        let phys = usize::from(top) + line;
+        out.extend_from_slice(format!("\x1b[{phys};1H").as_bytes());
+        let mut prev: Option<(Color, Color, Flags)> = None;
+        for col in 0..cols {
+            let cell = &grid[Line(line as i32)][Column(col)];
+            // A wide char occupies two columns; skip its spacer cell.
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
             }
-            // Reset attrs and erase any stale tail to the right edge.
-            out.extend_from_slice(b"\x1b[0m\x1b[K");
+            let key = (cell.fg, cell.bg, cell.flags);
+            if prev != Some(key) {
+                out.extend_from_slice(sgr_for(cell).as_bytes());
+                prev = Some(key);
+            }
+            let mut b = [0u8; 4];
+            out.extend_from_slice(cell.c.encode_utf8(&mut b).as_bytes());
+        }
+        // Reset attrs and erase any stale tail to the right edge.
+        out.extend_from_slice(b"\x1b[0m\x1b[K");
+    }
+
+    /// Render every grid line, offset to physical `top..`. Test-only — the
+    /// production path is `render_damage` (the changed lines only).
+    #[cfg(test)]
+    fn render(&self, top: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        for line in 0..self.term.grid().screen_lines() {
+            self.render_line(line, top, &mut out);
+        }
+        out
+    }
+
+    /// Render only the lines damaged since the last call — the perf half of
+    /// double-buffering: re-emit just the diff (dirty-line blitting), not the
+    /// whole screen. The first call (and a full clear) reports Full damage.
+    fn render_damage(&mut self, top: u16) -> Vec<u8> {
+        // Collect damaged line indices, then drop the damage borrow before we
+        // read cells to render them.
+        let damaged: Option<Vec<usize>> = match self.term.damage() {
+            TermDamage::Full => None,
+            TermDamage::Partial(iter) => Some(iter.map(|b| b.line).collect()),
+        };
+        self.term.reset_damage();
+        let lines =
+            damaged.unwrap_or_else(|| (0..self.term.grid().screen_lines()).collect::<Vec<_>>());
+        let mut out = Vec::new();
+        for line in lines {
+            self.render_line(line, top, &mut out);
         }
         out
     }
@@ -889,7 +962,6 @@ impl Grid {
 /// SGR for a cell: a reset, then its attributes and fg/bg colors. Reset +
 /// reapply on change keeps the renderer simple and correct (at a few extra
 /// bytes vs incremental diffing).
-#[allow(dead_code)] // used by render() — wired into the loop in Inc 3b
 fn sgr_for(cell: &Cell) -> String {
     let mut s = String::from("\x1b[0");
     let f = cell.flags;
@@ -916,25 +988,42 @@ fn sgr_for(cell: &Cell) -> String {
 
 /// Map a cell color to an SGR fragment (leading `;`), or empty for the
 /// terminal default (covered by the leading reset).
-// `n as u8`: NamedColor's standard 0–15 map to ANSI; higher specials fall
-// through to default, so truncation is intentional.
-#[allow(dead_code, clippy::cast_possible_truncation)]
 fn color_sgr(c: Color, fg: bool) -> String {
     let base = if fg { 38 } else { 48 };
     match c {
         Color::Spec(rgb) => format!(";{base};2;{};{};{}", rgb.r, rgb.g, rgb.b),
         Color::Indexed(i) => format!(";{base};5;{i}"),
         Color::Named(n) => {
-            let idx = n as u8;
+            // `as usize`, NOT `as u8`: the special variants (Foreground=256,
+            // Background=257, …) must not truncate into the 0–15 color range,
+            // or every default cell paints as a real color (the "all red" bug).
+            let idx = n as usize;
             if idx < 8 {
-                format!(";{}", (if fg { 30u16 } else { 40 }) + u16::from(idx))
+                format!(";{}", (if fg { 30 } else { 40 }) + idx)
             } else if idx < 16 {
-                format!(";{}", (if fg { 90u16 } else { 100 }) + u16::from(idx - 8))
+                format!(";{}", (if fg { 90 } else { 100 }) + idx - 8)
             } else {
                 String::new()
             }
         }
     }
+}
+
+/// Paint one composite frame: the bar at row 1 and the child's grid at rows
+/// 2..N, wrapped in synchronized output (DEC 2026) so the terminal swaps it
+/// atomically — no tearing or half-drawn frames (the terminal's own
+/// front/back-buffer swap). The cursor is placed at the child's grid cursor,
+/// offset into the content region (grid (0,0) → physical (2,1)).
+fn compose_frame(grid: &mut Grid, bar: &Bar) {
+    let _ = write_all(libc::STDOUT_FILENO, b"\x1b[?2026h");
+    bar.draw();
+    let _ = write_all(libc::STDOUT_FILENO, &grid.render_damage(2));
+    let (cr, cc) = grid.cursor();
+    let _ = write_all(
+        libc::STDOUT_FILENO,
+        format!("\x1b[{};{}H", cr + 2, cc + 1).as_bytes(),
+    );
+    let _ = write_all(libc::STDOUT_FILENO, b"\x1b[?2026l");
 }
 
 #[cfg(test)]
@@ -969,7 +1058,7 @@ mod tests {
 
     #[test]
     fn grid_tracks_cursor_and_alt_screen() {
-        let mut g = Grid::new(80, 24);
+        let mut g = Grid::new(80, 24, -1);
         g.feed(b"hello");
         assert_eq!(g.cursor(), (0, 5), "5 printed cells -> col 5, row 0");
         g.feed(b"\r\n");
@@ -987,7 +1076,7 @@ mod tests {
 
     #[test]
     fn render_positions_rows_and_reproduces_text() {
-        let mut g = Grid::new(20, 3);
+        let mut g = Grid::new(20, 3, -1);
         g.feed(b"hi");
         let out = g.render(5); // content starts at physical row 5
         let s = String::from_utf8_lossy(&out);
@@ -998,7 +1087,7 @@ mod tests {
 
     #[test]
     fn render_emits_sgr_for_a_colored_cell() {
-        let mut g = Grid::new(20, 1);
+        let mut g = Grid::new(20, 1, -1);
         g.feed(b"\x1b[31mR"); // red foreground R
         let out = g.render(1);
         let s = String::from_utf8_lossy(&out);
@@ -1008,6 +1097,47 @@ mod tests {
             s.ends_with("\x1b[0m\x1b[K"),
             "row resets attrs + erases tail"
         );
+    }
+
+    #[test]
+    fn render_round_trips_through_vt100() {
+        // Render the alacritty grid, feed the bytes into vt100 (an independent
+        // VT model), and assert vt100 reproduces the same text AND colors.
+        // Two emulators agreeing is a strong renderer-correctness check.
+        let mut g = Grid::new(40, 4, -1);
+        g.feed(b"hello\r\n\x1b[31mred\x1b[0m world");
+        let out = g.render(1); // grid row k -> physical row k+1 -> vt100 row k
+
+        let mut vt = vt100::Parser::new(4, 40, 0);
+        vt.process(&out);
+        let screen = vt.screen();
+        let text = screen.contents();
+        assert!(text.contains("hello"), "row 0 text round-trips: {text:?}");
+        assert!(text.contains("red"));
+        assert!(text.contains("world"));
+        // The 'r' of "red" on row 1, col 0 must be red foreground.
+        let cell = screen.cell(1, 0).expect("cell (1,0)");
+        assert_eq!(cell.contents(), "r");
+        assert_eq!(
+            cell.fgcolor(),
+            vt100::Color::Idx(1),
+            "red foreground round-trips through the renderer"
+        );
+    }
+
+    #[test]
+    fn render_keeps_default_cells_default() {
+        // The "all red" bug: NamedColor::Background (256+) truncated by `as u8`
+        // into the color range, painting default cells. Plain text must stay
+        // default fg AND bg.
+        let mut g = Grid::new(20, 1, -1);
+        g.feed(b"plain text");
+        let out = g.render(1);
+        let mut vt = vt100::Parser::new(1, 20, 0);
+        vt.process(&out);
+        let cell = vt.screen().cell(0, 0).expect("cell (0,0)");
+        assert_eq!(cell.fgcolor(), vt100::Color::Default, "default fg");
+        assert_eq!(cell.bgcolor(), vt100::Color::Default, "default bg");
     }
 
     #[test]
