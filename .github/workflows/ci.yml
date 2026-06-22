@@ -28,7 +28,7 @@ jobs:
     name: Cargo Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -50,7 +50,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
@@ -70,7 +70,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
       # Run tests several times so parallel-test-isolation flakes are likelier
@@ -102,7 +102,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
       # macOS ships zsh; Ubuntu runners may not. Install explicitly so the
@@ -136,7 +136,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # Vendor-neutral installer; deliberately not DeterminateSystems' since
       # the FlakeHub auth handshake fails noisily and the build doesn't
       # benefit from their magic-nix-cache for a single-binary repo like
@@ -171,7 +171,7 @@ jobs:
             target: aarch64-apple-darwin
             artifact: chevron-macos-aarch64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: ${{ matrix.target }}
