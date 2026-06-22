@@ -17,7 +17,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 # Rust is pinned to 1.96.0 (not floating `stable`) in every
-# dtolnay/rust-toolchain@1.96.0 ref below, so a new stable release can't red
+# dtolnay/rust-toolchain@1.100.0 ref below, so a new stable release can't red
 # the build on newly-enforced clippy lints (1.96 surfaced two that 1.95
 # didn't). Bump all four refs together when adopting a newer compiler.
 jobs:
@@ -51,7 +51,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -71,7 +71,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
       # Run tests several times so parallel-test-isolation flakes are likelier
       # to surface in CI. A single run of a 20%-flake test passes 80% of the
@@ -103,7 +103,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
       # macOS ships zsh; Ubuntu runners may not. Install explicitly so the
       # harness runs rather than skipping silently (a false green).
@@ -172,7 +172,7 @@ jobs:
             artifact: chevron-macos-aarch64
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
