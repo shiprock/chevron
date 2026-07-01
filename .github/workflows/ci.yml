@@ -58,7 +58,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        # --all-features so the non-default `host` feature (src/host.rs, the
+        # Stage 2 compositor) is linted too; it is otherwise never checked.
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   # Unit + integration tests on both target platforms.
   test:
@@ -84,6 +86,11 @@ jobs:
             cargo test
             echo "::endgroup::"
           done
+      # The `host` feature (Stage 2 compositor, src/host.rs) is not default, so
+      # the loop above never builds it. Run its unit + cross-model tests here;
+      # these need no zsh — the host e2e tests do, and run in the live-e2e job.
+      - name: Run host-feature unit tests
+        run: cargo test --features host --lib
 
   # Daemon-backed live-prompt e2e (chevron-ffu). These stand up an
   # in-process chevrond and a real interactive zsh in a PTY, asserting
@@ -120,6 +127,19 @@ jobs:
           for i in 1 2 3; do
             echo "::group::live e2e run $i/3"
             cargo test --test shell_pty -- --ignored --test-threads=1
+            echo "::endgroup::"
+          done
+      # Compose-mode host transient e2e (Inc 4, chevron-dw5.3.5): a real zsh
+      # under `chevron host` in a PTY, asserting the composited grid. Behind
+      # --features host (the subcommand exists only there); reuses this job's
+      # installed zsh. Not #[ignore]'d, so selected by name rather than
+      # --ignored.
+      - name: Run host compose e2e (3x for flake detection)
+        run: |
+          set -e
+          for i in 1 2 3; do
+            echo "::group::host compose e2e run $i/3"
+            cargo test --features host --test shell_pty host_compose
             echo "::endgroup::"
           done
 

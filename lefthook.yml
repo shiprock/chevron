@@ -4,7 +4,9 @@ pre-commit:
       run: cargo fmt --check
       fail_text: "Run `cargo fmt` to fix formatting"
     clippy:
-      run: cargo clippy --all-targets -- -D warnings
+      # --all-features so the non-default `host` feature (src/host.rs) is
+      # linted too; it is otherwise never checked locally or in CI.
+      run: cargo clippy --all-targets --all-features -- -D warnings
       fail_text: "Fix clippy warnings before committing"
 
 pre-push:
@@ -19,6 +21,10 @@ pre-push:
           echo "=== run $i/5 ==="
           cargo test --quiet
         done
+        # The default set omits `host` (Stage 2 compositor); run its unit +
+        # cross-model tests too. The host e2e tests need zsh and run in CI.
+        echo "=== host-feature unit tests ==="
+        cargo test --features host --lib --quiet
       fail_text: "Tests must pass before pushing (5x stress run for flake detection)"
     nix-build:
       # Build in the Nix sandbox to catch environment-specific issues that
