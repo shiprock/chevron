@@ -2633,3 +2633,208 @@ fn live_prompt_redraws_on_daemon_event() {
         |s| lines(s).iter().any(|l| l.contains("livebranch")),
     );
 }
+
+// ── Inc 4: host compose-mode transient (end-to-end) ──────────────────────────
+//
+// These spawn the test-built `chevron host` binary (only present under
+// --features host) running a REAL zsh child in compose mode, and assert
+// against the COMPOSITED grid chevron paints — the loop integration the
+// cross-model host.rs unit tests can't reach: env plumbing (CHEVRON_TRANSIENT=0
+// in the child), the DECSTBM bar, and the collapse/recolor rendered through
+// chevron's own cell→ANSI. Dark until CI runs --features host (chevron-7w3).
+#[cfg(feature = "host")]
+impl Term {
+    /// Spawn `chevron host --status -- zsh -i` in compose mode: chevron owns
+    /// the screen, reserves row 1 for its bar, and does the transient itself
+    /// (the shell's is disabled in the child). The test plays the outer
+    /// terminal; chevron answers the child's DSR from its own grid, so the
+    /// outer side never sees a query (`Dsr::Silent`).
+    fn spawn_host_compose(rows: u16, cols: u16) -> Self {
+        let home = tempfile::TempDir::new().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        let bin = std::path::Path::new(env!("CARGO_BIN_EXE_chevron"));
+        let bin_dir = bin.parent().unwrap();
+
+        std::fs::write(home_path.join(".zshenv"), "setopt no_global_rcs\n").unwrap();
+        std::fs::write(
+            home_path.join(".zshrc"),
+            format!(
+                "path=({} $path)\neval \"$(chevron init zsh)\"\n",
+                bin_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+
+        // The test-built binary carries `chevron host` only under --features
+        // host; it prepends its own dir to the child's PATH so the inner
+        // zsh's `chevron init` resolves the same binary.
+        let mut cmd = CommandBuilder::new(bin);
+        cmd.args(["host", "--status", "--", "zsh", "-i"]);
+        cmd.cwd(&home_path);
+        cmd.env("HOME", &home_path);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("LANG", "en_US.UTF-8");
+        cmd.env("LC_ALL", "en_US.UTF-8");
+        cmd.env("CHEVRON_NO_DAEMON", "1");
+        cmd.env("CHEVRON_LIVE", "0");
+        cmd.env("XDG_RUNTIME_DIR", &home_path);
+        // The whole point: chevron does the transient itself here.
+        cmd.env("CHEVRON_HOST_COMPOSITE", "1");
+        for var in [
+            "TMUX",
+            "TMUX_PANE",
+            "ZDOTDIR",
+            "CHEVRON_TRANSIENT",
+            "CHEVRON_OSC133",
+            "CHEVRON_ASYNC",
+            "CHEVRON_CACHE_FILE",
+            "CHEVRON_TRANSIENT_DURATION_MS",
+            "CHEVRON_HISTORY",
+        ] {
+            cmd.env_remove(var);
+        }
+
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 200)));
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+        let mut reader = pair.master.try_clone_reader().unwrap();
+
+        // Kept for pump_output's signature; compose emits no outer DSR, so the
+        // responder never fires.
+        let (tx, rx) = mpsc::channel::<(Instant, Vec<u8>)>();
+        std::thread::spawn(move || while rx.recv().is_ok() {});
+        let reader_parser = Arc::clone(&parser);
+        let reader_raw = Arc::clone(&raw);
+        std::thread::spawn(move || {
+            pump_output(&mut reader, &reader_parser, &reader_raw, Dsr::Silent, &tx);
+        });
+
+        let term = Term {
+            parser,
+            raw,
+            writer,
+            child,
+            master: pair.master,
+            _home: home,
+        };
+        // Wait for chevron's bar (row 1) AND the composited live prompt.
+        term.wait_for("initial composited prompt", |s| {
+            let ls = lines(s);
+            ls.first().is_some_and(|b| b.contains("chevron host"))
+                && ls.iter().any(|l| l.contains(LIVE_PROMPT_MARK))
+        });
+        term
+    }
+
+    /// Send `cmd`, then wait until it has collapsed to `❯ cmd` as the
+    /// bottom-most glyph row with the next prompt below. Robust once the
+    /// screen scrolls: the collapsed-row COUNT plateaus (old rows scroll off
+    /// as new ones arrive), so `run`'s count test can't be used, but the
+    /// bottom glyph row still flips when the commands alternate.
+    fn collapse_expect(&self, cmd: &str) {
+        self.send_line(cmd);
+        let want = format!("{CHEVRON} {cmd}");
+        self.wait_for(&format!("`{cmd}` collapsed at the bottom"), move |s| {
+            prompt_ready(s) && chevron_rows(s).last().map(String::as_str) == Some(want.as_str())
+        });
+    }
+}
+
+#[cfg(feature = "host")]
+#[test]
+fn host_compose_collapses_and_recolors_by_exit_status() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_host_compose(ROWS, COLS);
+
+    // chevron reserves row 1 for its own bar (the child scrolls below it).
+    let bar = t.with_screen(|s| lines(s).first().cloned().unwrap_or_default());
+    assert!(bar.contains("chevron host"), "status bar on row 1: {bar:?}");
+
+    // A failing command: chevron collapses the prompt to `❯ false` and, on
+    // OSC 133 D;1, recolors the glyph red — no shell DSR transient involved.
+    t.run("false");
+    t.wait_settled(Duration::from_millis(250));
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        1,
+        "exactly one collapsed glyph, no duplicate\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(0),
+        RED,
+        "exit 1 recolors the collapsed glyph red\n{}",
+        t.dump()
+    );
+
+    // A succeeding command: a second collapsed line, glyph green.
+    t.run("true");
+    t.wait_settled(Duration::from_millis(250));
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        2,
+        "two collapsed glyphs after two commands\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(1),
+        GREEN,
+        "exit 0 recolors the collapsed glyph green\n{}",
+        t.dump()
+    );
+}
+
+#[cfg(feature = "host")]
+#[test]
+fn host_compose_recolor_survives_scrolling() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_host_compose(ROWS, COLS);
+    // Enough commands to overflow the 24-row screen so the earliest collapsed
+    // lines scroll off the top. The glyphs still on screen were recolored on
+    // OSC 133 D at rows that had since scrolled — the case the DSR transient's
+    // stale absolute row cannot follow. Exit status alternates so a
+    // mis-tracked recolor would leave a glyph neutral or the wrong color.
+    for i in 0..26 {
+        t.collapse_expect(if i % 2 == 0 { "true" } else { "false" });
+    }
+    t.wait_settled(Duration::from_millis(250));
+
+    let count = t.with_screen(|s| chevron_rows(s).len());
+    let colors: Vec<vt100::Color> = (0..count).map(|n| t.chevron_color_on_nth(n)).collect();
+    assert!(
+        count >= 4,
+        "several collapsed lines survived the scroll\n{}",
+        t.dump()
+    );
+    for c in &colors {
+        assert!(
+            *c == RED || *c == GREEN,
+            "every on-screen glyph keeps a status color (never a neutral stale-recolor), got {c:?}\n{}",
+            t.dump()
+        );
+    }
+    // The last command (i = 25, odd) was `false` → the bottom-most glyph red.
+    assert_eq!(
+        *colors.last().unwrap(),
+        RED,
+        "the most recent command (false) recolored red at its scrolled row\n{}",
+        t.dump()
+    );
+}
