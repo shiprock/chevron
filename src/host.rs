@@ -165,6 +165,15 @@ fn run_pty(cmd_args: &[String], requested_status: bool) -> std::io::Result<i32> 
             let path = std::env::var("PATH").unwrap_or_default();
             cmd.env("PATH", format!("{}:{}", dir.display(), path));
         }
+        // Compose mode owns the transient itself (Inc 4): disable the shell's
+        // DSR collapse/recolor in the child so the two don't both fire, and
+        // force OSC 133 on (chevron drives the collapse from those markers).
+        // `chevron init` honours a pre-set env var (export VAR="${VAR-…}"), so
+        // these win over the user's config without editing it.
+        if compose {
+            cmd.env("CHEVRON_TRANSIENT", "0");
+            cmd.env("CHEVRON_OSC133", "1");
+        }
         cmd.stdin(Stdio::from(slave.try_clone()?));
         cmd.stdout(Stdio::from(slave.try_clone()?));
         cmd.stderr(Stdio::from(slave));
@@ -256,8 +265,12 @@ fn host_io_loop(
     };
     let mut grid = status.then(|| Grid::new(cols, grid_rows, master_fd));
     // Screen row where the current prompt started (grid cursor at the OSC 133 A
-    // marker). Inc 4 will repaint the prompt span from this — no DSR query.
+    // marker) — the observational debug overlay; compose drives the transient
+    // off `Transient` instead.
     let mut prompt_row: usize = 0;
+    // Compose-mode transient: collapse the prompt on accept, recolor on done,
+    // all from the grid + OSC 133 (Inc 4). Inert outside compose.
+    let mut transient = Transient::default();
     // Poll wakes periodically in status mode so the clock stays live even
     // while the shell sits idle; otherwise it blocks indefinitely.
     let timeout: libc::c_int = if status { 250 } else { -1 };
@@ -355,7 +368,9 @@ fn host_io_loop(
                             let upto = offset.min(chunk.len());
                             g.feed(&chunk[fed..upto]);
                             fed = upto;
-                            if matches!(ev, OscEvent::PromptStart) {
+                            if compose {
+                                drive_transient(&mut transient, g, &ev);
+                            } else if matches!(ev, OscEvent::PromptStart) {
                                 prompt_row = g.cursor().0;
                             }
                         }
@@ -957,6 +972,84 @@ impl Grid {
         }
         out
     }
+
+    // ── Inc 4: the transient's scroll odometer + command capture ─────────────
+    //
+    // The DSR transient saves an ABSOLUTE row that goes stale the moment
+    // output scrolls it away (the scroll-skip). chevron owns the grid, so it
+    // tracks the prompt as a logical row that moves WITH the content: the
+    // collapsed glyph sits on the prompt's first row, whose current screen row
+    // is `row_at_clear - history_size()` at any later point. One re-base per
+    // prompt (`clear_history` at OSC 133 A) keeps that odometer honest.
+
+    /// Scrollback lines currently populated — chevron's scroll odometer.
+    /// Grows by one per line scrolled off the top; [`Grid::clear_history`]
+    /// re-bases it to zero. alacritty's own `history_size` is private, but
+    /// `total_lines - screen_lines` is the public equivalent.
+    fn history_size(&self) -> usize {
+        let g = self.term.grid();
+        g.total_lines().saturating_sub(g.screen_lines())
+    }
+
+    /// Visible screen height in rows.
+    fn screen_lines(&self) -> usize {
+        self.term.grid().screen_lines()
+    }
+
+    /// Drop scrollback so [`Grid::history_size`] re-bases to zero. Invisible:
+    /// chevron renders only the visible screen, so the dropped history was
+    /// never on display (owning scrollback is a later Fork-B concern).
+    fn clear_history(&mut self) {
+        self.term.grid_mut().clear_history();
+    }
+
+    /// Text of grid `row` from `start_col` to its last cell, plus whether the
+    /// row soft-wrapped (WRAPLINE on the final cell). A wrapped row's content
+    /// runs to the right edge (kept verbatim so the next row joins seamlessly);
+    /// an unwrapped row is right-trimmed.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn row_slice(&self, row: usize, start_col: usize) -> (String, bool) {
+        let grid = self.term.grid();
+        let cols = grid.columns();
+        let line = &grid[Line(row as i32)];
+        let wrapped = cols > 0 && line[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+        let mut s = String::new();
+        for col in start_col..cols {
+            let cell = &line[Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            s.push(cell.c);
+        }
+        if wrapped {
+            (s, true)
+        } else {
+            (s.trim_end().to_string(), false)
+        }
+    }
+
+    /// Reconstruct the typed command from the grid: the cells from
+    /// `(start_row, start_col)` down to the end of `last_row`, joining
+    /// soft-wrapped rows. Returns `None` on a hard line break before the last
+    /// row — true multi-line / PS2 input, which collapses ambiguously, so (as
+    /// the shell transient also does) we skip it.
+    fn capture_command(
+        &self,
+        start_row: usize,
+        start_col: usize,
+        last_row: usize,
+    ) -> Option<String> {
+        let mut cmd = String::new();
+        for row in start_row..=last_row {
+            let col0 = if row == start_row { start_col } else { 0 };
+            let (text, wrapped) = self.row_slice(row, col0);
+            cmd.push_str(&text);
+            if row < last_row && !wrapped {
+                return None;
+            }
+        }
+        Some(cmd)
+    }
 }
 
 /// SGR for a cell: a reset, then its attributes and fg/bg colors. Reset +
@@ -1006,6 +1099,155 @@ fn color_sgr(c: Color, fg: bool) -> String {
                 String::new()
             }
         }
+    }
+}
+
+// ── Stage 2 Inc 4: chevron-owned transient prompt (compose mode) ─────────────
+//
+// In compose mode chevron does the transient itself from the grid + OSC 133,
+// retiring the shell's DSR transient in the child (CHEVRON_TRANSIENT=0). The
+// shell still draws the FULL prompt and emits the 133 lifecycle; chevron
+// collapses prompt+command to `❯ cmd` on accept (OSC 133 C) and recolors the
+// glyph by exit status on done (OSC 133 D). Two guest-mode artifacts dissolve
+// here: the scroll-skip (the glyph is a tracked grid row, never a stale
+// absolute one) and the gray→color flicker (the color commit is deferred to
+// D, and a fast command's C+D land in one rendered frame).
+
+/// The transient glyph — the collapsed prompt's chevron (matches the shell
+/// transient's `❯`).
+const TRANSIENT_GLYPH: char = '❯';
+
+/// Bytes that collapse a prompt+command span to a single neutral `❯ cmd`
+/// line, fed to the GRID (compose renders the grid, never the raw stream):
+/// home to the prompt's top row, erase to end of screen, write the collapsed
+/// line in default attrs, newline so command output flows directly below it.
+fn collapse_seq(top_row: usize, cmd: &str) -> Vec<u8> {
+    format!(
+        "\x1b[{};1H\x1b[J\x1b[0m{TRANSIENT_GLYPH} {cmd}\r\n",
+        top_row + 1
+    )
+    .into_bytes()
+}
+
+/// Bytes that recolor the collapsed glyph by exit status, cursor-neutral
+/// (DECSC/DECRC) so the position the next prompt draws from is untouched.
+/// Green on success, red on failure; empty for an unknown code (leave it
+/// neutral rather than guess).
+fn recolor_seq(row: usize, exit: Option<i32>) -> Vec<u8> {
+    let code = match exit {
+        Some(0) => 2, // green
+        Some(_) => 1, // red
+        None => return Vec::new(),
+    };
+    format!(
+        "\x1b7\x1b[{};1H\x1b[3{code}m{TRANSIENT_GLYPH}\x1b[0m\x1b8",
+        row + 1
+    )
+    .into_bytes()
+}
+
+/// Per-command lifecycle tracker driving the compose-mode transient. Rows are
+/// held in "absolute" coordinates — screen row plus lines scrolled into
+/// history since the OSC 133 A re-base — so `absolute - history_size()`
+/// recovers the current screen row through any amount of scrolling.
+#[derive(Default)]
+struct Transient {
+    /// Prompt's first row (absolute). `None` until OSC 133 A.
+    prompt_abs: Option<usize>,
+    /// Command input's first row (absolute). `None` until OSC 133 B.
+    input_abs: Option<usize>,
+    /// Command input's first column (on `input_abs`'s row).
+    input_col: usize,
+    /// Whether this cycle actually collapsed (gates the OSC 133 D recolor:
+    /// alternate accept paths may leave nothing collapsed to recolor).
+    collapsed: bool,
+}
+
+impl Transient {
+    /// OSC 133 A — prompt start. Record the prompt's first row and re-base the
+    /// scroll odometer so it can be tracked as `prompt_abs - history_size()`.
+    fn on_prompt_start(&mut self, grid: &mut Grid) {
+        grid.clear_history();
+        self.prompt_abs = Some(grid.cursor().0);
+        self.input_abs = None;
+        self.input_col = 0;
+        self.collapsed = false;
+    }
+
+    /// OSC 133 B — command input start. Record where the typed command begins.
+    fn on_cmd_start(&mut self, grid: &Grid) {
+        let (row, col) = grid.cursor();
+        self.input_abs = Some(row + grid.history_size());
+        self.input_col = col;
+    }
+
+    /// OSC 133 C — output start (the user accepted the line). Collapse the
+    /// prompt+command span to `❯ cmd`. Returns grid bytes, or empty when the
+    /// collapse is skipped (no prompt/input tracked, nothing typed, or
+    /// multi-line input).
+    fn on_output_start(&mut self, grid: &Grid) -> Vec<u8> {
+        let (Some(prompt_abs), Some(input_abs)) = (self.prompt_abs, self.input_abs) else {
+            return Vec::new();
+        };
+        let hist = grid.history_size();
+        let top = prompt_abs.saturating_sub(hist);
+        let input_row = input_abs.saturating_sub(hist);
+        // At C the cursor sits on the line BELOW the command (the shell printed
+        // the accept newline first; see shell.rs OSC 133 C), so the command's
+        // last row is one above it.
+        let last = grid.cursor().0.saturating_sub(1);
+        if last < input_row {
+            return Vec::new();
+        }
+        let Some(cmd) = grid.capture_command(input_row, self.input_col, last) else {
+            return Vec::new();
+        };
+        let cmd = cmd.trim_end();
+        if cmd.is_empty() {
+            return Vec::new();
+        }
+        self.collapsed = true;
+        collapse_seq(top, cmd)
+    }
+
+    /// OSC 133 D — command done. Recolor the collapsed glyph by exit status at
+    /// its CURRENT screen row (`prompt_abs - history_size()` — follows the
+    /// content through scrolling, where the DSR transient's saved row would be
+    /// stale). Empty when nothing was collapsed or the glyph scrolled off the
+    /// top (it cannot be recolored on-screen). Resets for the next cycle.
+    fn on_cmd_end(&mut self, grid: &Grid, exit: Option<i32>) -> Vec<u8> {
+        // `checked_sub` is the off-screen test: when more lines have scrolled
+        // than the glyph's starting row, it has gone above row 0 and cannot be
+        // recolored on-screen.
+        let out = match self.prompt_abs {
+            Some(abs) if self.collapsed => match abs.checked_sub(grid.history_size()) {
+                Some(row) if row < grid.screen_lines() => recolor_seq(row, exit),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        *self = Self::default();
+        out
+    }
+}
+
+/// Drive the transient from one OSC 133 lifecycle marker, feeding any
+/// collapse/recolor rewrite back into the grid. Compose renders the grid, so
+/// feeding the rewrite there is how it reaches the screen. Shared by the io
+/// loop and the cross-model tests so both exercise the same path.
+fn drive_transient(transient: &mut Transient, grid: &mut Grid, ev: &OscEvent) {
+    match ev {
+        OscEvent::PromptStart => transient.on_prompt_start(grid),
+        OscEvent::CmdStart => transient.on_cmd_start(grid),
+        OscEvent::OutputStart => {
+            let seq = transient.on_output_start(grid);
+            grid.feed(&seq);
+        }
+        OscEvent::CmdEnd(code) => {
+            let seq = transient.on_cmd_end(grid, *code);
+            grid.feed(&seq);
+        }
+        OscEvent::Cwd(_) => {}
     }
 }
 
@@ -1289,6 +1531,216 @@ mod tests {
         assert_eq!(last_index_of(b"abc", b"xyz"), None);
         assert_eq!(last_index_of(b"ab", b"abc"), None);
         assert_eq!(last_index_of(b"aaa", b"a"), Some(2));
+    }
+
+    // ── Inc 4: compose-mode transient ────────────────────────────────────────
+
+    const OSC_A: &[u8] = b"\x1b]133;A\x07";
+    const OSC_B: &[u8] = b"\x1b]133;B\x07";
+    const OSC_C: &[u8] = b"\x1b]133;C\x07";
+
+    fn osc_d(code: i32) -> Vec<u8> {
+        format!("\x1b]133;D;{code}\x07").into_bytes()
+    }
+
+    /// Drive a chunk through the compose pipeline exactly as `host_io_loop`
+    /// does: scan OSC markers, advance the grid to each, run the transient
+    /// (via the shared `drive_transient`, which feeds any rewrite back into
+    /// the grid), then feed the tail.
+    fn feed_compose(g: &mut Grid, tr: &mut Transient, osc: &mut OscScanner, chunk: &[u8]) {
+        let mut events = Vec::new();
+        osc.feed(chunk, &mut events);
+        let mut fed = 0;
+        for (offset, ev) in events.drain(..) {
+            let upto = offset.min(chunk.len());
+            g.feed(&chunk[fed..upto]);
+            fed = upto;
+            drive_transient(tr, g, &ev);
+        }
+        g.feed(&chunk[fed..]);
+    }
+
+    /// Render the grid and read it back through vt100 (an independent VT
+    /// model). With `top = 1`, grid row `k` lands on vt100 row `k`.
+    fn readback(g: &Grid, rows: u16, cols: u16) -> vt100::Parser {
+        let mut vt = vt100::Parser::new(rows, cols, 0);
+        vt.process(&g.render(1));
+        vt
+    }
+
+    #[test]
+    fn collapse_seq_homes_erases_and_writes_the_command() {
+        let seq = String::from_utf8(collapse_seq(4, "git status")).unwrap();
+        assert_eq!(seq, "\x1b[5;1H\x1b[J\x1b[0m❯ git status\r\n");
+    }
+
+    #[test]
+    fn recolor_seq_is_cursor_neutral_and_status_colored() {
+        // Success → green (3-2), failure → red (3-1), wrapped in DECSC/DECRC.
+        assert_eq!(
+            String::from_utf8(recolor_seq(2, Some(0))).unwrap(),
+            "\x1b7\x1b[3;1H\x1b[32m❯\x1b[0m\x1b8"
+        );
+        assert_eq!(
+            String::from_utf8(recolor_seq(0, Some(1))).unwrap(),
+            "\x1b7\x1b[1;1H\x1b[31m❯\x1b[0m\x1b8"
+        );
+        // Unknown exit code stays neutral (no rewrite).
+        assert!(recolor_seq(0, None).is_empty());
+    }
+
+    #[test]
+    fn capture_command_joins_soft_wrapped_rows() {
+        // "P " prompt, then a 14-char command wrapping a 10-col grid.
+        let mut g = Grid::new(10, 4, -1);
+        g.feed(b"P abcdefghijklmn");
+        // Command input starts at row 0, col 2; its last row is 1.
+        assert_eq!(
+            g.capture_command(0, 2, 1).as_deref(),
+            Some("abcdefghijklmn")
+        );
+    }
+
+    #[test]
+    fn capture_command_rejects_hard_newline_multiline() {
+        // A hard line break before the last row is PS2/multi-line input.
+        let mut g = Grid::new(40, 4, -1);
+        g.feed(b"P line one\r\nline two");
+        assert_eq!(g.capture_command(0, 2, 1), None);
+    }
+
+    #[test]
+    fn transient_collapses_prompt_and_command() {
+        let mut g = Grid::new(40, 6, -1);
+        let mut tr = Transient::default();
+        let mut osc = OscScanner::default();
+        // A prompt "myprompt ", command "ls -la", accepted (CRLF), then C.
+        let stream = [OSC_A, b"myprompt ", OSC_B, b"ls -la\r\n", OSC_C].concat();
+        feed_compose(&mut g, &mut tr, &mut osc, &stream);
+
+        let text = readback(&g, 6, 40).screen().contents();
+        assert!(
+            text.contains("❯ ls -la"),
+            "collapsed line present: {text:?}"
+        );
+        assert!(!text.contains("myprompt"), "prompt chrome gone: {text:?}");
+    }
+
+    #[test]
+    fn transient_recolors_glyph_green_on_success_red_on_failure() {
+        for (code, want) in [(0, vt100::Color::Idx(2)), (2, vt100::Color::Idx(1))] {
+            let mut g = Grid::new(40, 6, -1);
+            let mut tr = Transient::default();
+            let mut osc = OscScanner::default();
+            let stream = [
+                OSC_A,
+                b"P ",
+                OSC_B,
+                b"echo hi\r\n",
+                OSC_C,
+                b"hi\r\n",
+                &osc_d(code),
+            ]
+            .concat();
+            feed_compose(&mut g, &mut tr, &mut osc, &stream);
+
+            let vt = readback(&g, 6, 40);
+            let screen = vt.screen();
+            let cell = screen.cell(0, 0).expect("glyph cell (0,0)");
+            assert_eq!(cell.contents(), "❯", "collapsed glyph at row 0");
+            assert_eq!(cell.fgcolor(), want, "exit {code} recolors the glyph");
+            assert!(screen.contents().contains("hi"), "output preserved");
+        }
+    }
+
+    #[test]
+    fn transient_recolors_at_the_scrolled_row_not_the_stale_one() {
+        // THE scroll-skip fix, as a test: the DSR transient saves an absolute
+        // row that output scrolls away, so its recolor lands on stale content.
+        // chevron tracks the glyph as a grid row, so the recolor follows it.
+        let mut g = Grid::new(40, 6, -1);
+        let mut tr = Transient::default();
+        let mut osc = OscScanner::default();
+
+        // Two lines of prior output push the prompt down to row 2, so a later
+        // scroll moves the glyph UP but keeps it on-screen (row 0 would scroll
+        // straight off).
+        g.feed(b"line0\r\nline1\r\n");
+        // Prompt + command at row 2, accepted.
+        let cycle = [OSC_A, b"P ", OSC_B, b"job\r\n", OSC_C].concat();
+        feed_compose(&mut g, &mut tr, &mut osc, &cycle);
+        // Output that scrolls the screen by one (fills to the bottom + 1).
+        feed_compose(&mut g, &mut tr, &mut osc, b"a\r\nb\r\nc\r\n");
+        // Command done: recolor must find the glyph at its NEW row.
+        feed_compose(&mut g, &mut tr, &mut osc, &osc_d(0));
+
+        let vt = readback(&g, 6, 40);
+        let screen = vt.screen();
+        // The one scroll moved the collapsed line from row 2 to row 1.
+        let glyph = screen.cell(1, 0).expect("glyph cell (1,0)");
+        assert_eq!(glyph.contents(), "❯", "glyph followed the scroll to row 1");
+        assert_eq!(
+            glyph.fgcolor(),
+            vt100::Color::Idx(2),
+            "recolored green at the scrolled row"
+        );
+        // The stale row (2) now holds output, NOT a mis-placed green glyph.
+        assert_eq!(
+            screen.cell(2, 0).unwrap().contents(),
+            "a",
+            "stale row is output"
+        );
+    }
+
+    #[test]
+    fn transient_skips_multiline_input() {
+        // Multi-line (PS2) input collapses ambiguously; like the shell
+        // transient, chevron leaves it uncollapsed.
+        let mut g = Grid::new(40, 6, -1);
+        let mut tr = Transient::default();
+        let mut osc = OscScanner::default();
+        let stream = [
+            OSC_A,
+            b"P ",
+            OSC_B,
+            b"for x in a b\r\ndo echo\r\n",
+            OSC_C,
+            &osc_d(0),
+        ]
+        .concat();
+        feed_compose(&mut g, &mut tr, &mut osc, &stream);
+
+        let text = readback(&g, 6, 40).screen().contents();
+        assert!(
+            !text.contains("❯"),
+            "no collapse for multi-line input: {text:?}"
+        );
+        assert!(text.contains("for x in a b"), "input left intact: {text:?}");
+        assert!(
+            text.contains("do echo"),
+            "continuation left intact: {text:?}"
+        );
+    }
+
+    #[test]
+    fn transient_defers_color_so_fast_commands_do_not_flicker() {
+        // A command with no output: C and D arrive in one chunk, so the glyph
+        // is already exit-colored the first time the frame is rendered — no
+        // neutral-then-color repaint.
+        let mut g = Grid::new(40, 6, -1);
+        let mut tr = Transient::default();
+        let mut osc = OscScanner::default();
+        let stream = [OSC_A, b"P ", OSC_B, b"true\r\n", OSC_C, &osc_d(0)].concat();
+        feed_compose(&mut g, &mut tr, &mut osc, &stream);
+
+        let vt = readback(&g, 6, 40);
+        let cell = vt.screen().cell(0, 0).expect("glyph cell");
+        assert_eq!(cell.contents(), "❯");
+        assert_eq!(
+            cell.fgcolor(),
+            vt100::Color::Idx(2),
+            "single rendered frame already carries the final color"
+        );
     }
 
     #[test]
