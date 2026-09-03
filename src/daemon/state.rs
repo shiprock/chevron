@@ -52,6 +52,42 @@ pub const TTL: Duration = Duration::from_millis(100);
 /// works on simultaneously.
 pub const MAX_WATCHES: usize = 64;
 
+/// Minimum interval between `git` broadcasts for the same workdir.
+///
+/// A broadcast wakes every subscribed shell, and each wake-up costs a
+/// `zle -F` callback plus (for shells in that repo) a re-render. Without
+/// a floor, one churning gitdir pins every live shell on the machine at
+/// 100% CPU; see [`is_transient_gitdir_path`] for how that churn arises.
+/// Invalidation stays immediate; only the notification is paced, and a
+/// suppressed event is remembered and flushed (see `pending_broadcasts`)
+/// rather than dropped, so no state change goes unannounced.
+pub const BROADCAST_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Paths inside a gitdir whose churn describes no prompt-visible state
+/// change, and which therefore must neither invalidate the cache nor
+/// wake subscribers.
+///
+/// - `fsmonitor--daemon/`: in a repo with `core.fsmonitor` set, EVERY
+///   `git` invocation creates and deletes a cookie file here to
+///   handshake with `git fsmonitor--daemon`. It never settles: a repo
+///   with the setting churns on every `git status` forever, whereas a
+///   repo without it goes quiet after the first. Because the gitdir is
+///   watched recursively, that handshake landed inside the watched set
+///   and turned any external `git status` poller (an editor's git
+///   integration, say) into an unbounded prompt-refresh storm.
+/// - `*.lock`: index/ref lockfiles are created and renamed away by
+///   every write. The rename onto the real path fires its own event, so
+///   the lock itself carries no information.
+fn is_transient_gitdir_path(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|c| c.as_os_str() == "fsmonitor--daemon")
+    {
+        return true;
+    }
+    path.extension().is_some_and(|e| e == "lock")
+}
+
 struct CacheEntry {
     status: RepoStatus,
     computed_at: Instant,
@@ -146,6 +182,13 @@ struct State {
     /// next broadcast attempt.
     subscribers: HashMap<u64, Subscriber>,
     next_subscriber_id: u64,
+    /// `workdir → last git broadcast`. Enforces [`BROADCAST_MIN_INTERVAL`].
+    last_broadcast: HashMap<PathBuf, Instant>,
+    /// Workdirs whose change was suppressed by the rate limiter and
+    /// still owes subscribers a notification. Flushed by the actor loop
+    /// once the interval elapses, so pacing delays a redraw but never
+    /// loses one.
+    pending_broadcasts: Vec<PathBuf>,
 }
 
 impl State {
@@ -158,6 +201,8 @@ impl State {
             db,
             subscribers: HashMap::new(),
             next_subscriber_id: 1,
+            last_broadcast: HashMap::new(),
+            pending_broadcasts: Vec::new(),
         }
     }
 
@@ -197,6 +242,12 @@ impl State {
         // from deduping.
         let mut affected: Vec<PathBuf> = Vec::new();
         for p in paths {
+            // Bookkeeping churn inside the gitdir is not a state change;
+            // dropping it here keeps both the cache and the subscribers
+            // undisturbed.
+            if is_transient_gitdir_path(p) {
+                continue;
+            }
             if let Some(workdir) = resolve_workdir(&self.watches, p) {
                 let workdir = workdir.clone();
                 self.cache.remove(&workdir);
@@ -205,13 +256,57 @@ impl State {
                 }
             }
         }
+        let now = Instant::now();
         for workdir in affected {
-            self.broadcast(&EventPayload {
-                topic: "git".to_string(),
-                cwd: Some(workdir),
-                id: None,
-            });
+            self.broadcast_git_paced(workdir, now);
         }
+    }
+
+    /// Broadcast a `git` event for `workdir` unless one went out within
+    /// [`BROADCAST_MIN_INTERVAL`]; in that case queue it for the actor
+    /// loop to flush when the interval expires.
+    fn broadcast_git_paced(&mut self, workdir: PathBuf, now: Instant) {
+        if let Some(last) = self.last_broadcast.get(&workdir)
+            && now.duration_since(*last) < BROADCAST_MIN_INTERVAL
+        {
+            if !self.pending_broadcasts.contains(&workdir) {
+                self.pending_broadcasts.push(workdir);
+            }
+            return;
+        }
+        self.last_broadcast.insert(workdir.clone(), now);
+        self.pending_broadcasts.retain(|p| *p != workdir);
+        self.broadcast(&EventPayload {
+            topic: "git".to_string(),
+            cwd: Some(workdir),
+            id: None,
+        });
+    }
+
+    /// Emit any broadcast the rate limiter deferred whose interval has
+    /// now elapsed. Called from the actor loop's idle tick.
+    fn flush_pending_broadcasts(&mut self) {
+        let now = Instant::now();
+        let ready: Vec<PathBuf> = self
+            .pending_broadcasts
+            .iter()
+            .filter(|w| {
+                self.last_broadcast
+                    .get(*w)
+                    .is_none_or(|last| now.duration_since(*last) >= BROADCAST_MIN_INTERVAL)
+            })
+            .cloned()
+            .collect();
+        for workdir in ready {
+            self.broadcast_git_paced(workdir, now);
+        }
+    }
+
+    /// Whether the actor loop needs an idle tick to flush deferred
+    /// broadcasts. Lets the loop block indefinitely when nothing is
+    /// pending instead of waking on a timer forever.
+    fn has_pending_broadcasts(&self) -> bool {
+        !self.pending_broadcasts.is_empty()
     }
 
     fn register_watch(&mut self, git_dir: &Path, workdir: &Path) {
@@ -450,7 +545,25 @@ fn run_inner(
 ) {
     let mut state = State::new(watcher, db);
 
-    while let Ok(msg) = rx.recv() {
+    loop {
+        // Block indefinitely when idle; only wait on a timer while the
+        // rate limiter owes someone a broadcast, so a quiet daemon stays
+        // genuinely asleep.
+        let msg = if state.has_pending_broadcasts() {
+            match rx.recv_timeout(BROADCAST_MIN_INTERVAL) {
+                Ok(msg) => msg,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    state.flush_pending_broadcasts();
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(msg) => msg,
+                Err(_) => break,
+            }
+        };
         match msg {
             StateMsg::Get { workdir, reply } => {
                 let hit = state.get(&workdir, ttl);
@@ -1209,6 +1322,130 @@ mod tests {
 
         tx.send(StateMsg::Shutdown).unwrap();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn fsmonitor_cookie_churn_does_not_invalidate_or_broadcast() {
+        // Regression: in a repo with `core.fsmonitor` set, EVERY git
+        // invocation creates and deletes a cookie under
+        // .git/fsmonitor--daemon/cookies/. The gitdir is watched
+        // recursively, so before this fix each cookie invalidated the
+        // cache and woke every subscribed shell, so an external `git
+        // status` poller drove an unbounded prompt-refresh storm.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let git_dir = workdir.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
+        insert(&tx, &workdir, &git_dir, "master");
+        let (event_rx, _id) = subscribe(&tx);
+
+        tx.send(StateMsg::FsEvent(vec![
+            git_dir.join("fsmonitor--daemon/cookies/1072610-166"),
+            git_dir.join("index.lock"),
+        ]))
+        .unwrap();
+
+        let got = event_rx.recv_timeout(Duration::from_millis(300));
+        assert!(got.is_err(), "transient churn must not broadcast: {got:?}");
+        // ...and the cached status must survive it.
+        assert!(
+            query(&tx, workdir).is_some(),
+            "transient churn must not invalidate the cache"
+        );
+
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn real_change_alongside_transient_churn_still_broadcasts() {
+        // The filter must not swallow a genuine change that arrives in
+        // the same batch as cookie/lock noise.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let git_dir = workdir.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
+        insert(&tx, &workdir, &git_dir, "master");
+        let (event_rx, _id) = subscribe(&tx);
+
+        tx.send(StateMsg::FsEvent(vec![
+            git_dir.join("fsmonitor--daemon/cookies/1-2"),
+            git_dir.join("refs/heads/master"),
+        ]))
+        .unwrap();
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a real ref change must still broadcast");
+        assert_eq!(event.cwd, Some(workdir));
+
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn rapid_events_are_rate_limited_then_flushed() {
+        // Defense in depth for any churn the path filter doesn't know
+        // about: bursts must not wake subscribers once per event. The
+        // suppressed change is still owed a notification, so the actor
+        // flushes it after BROADCAST_MIN_INTERVAL rather than dropping
+        // it: pacing delays a redraw, never loses one.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let git_dir = workdir.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
+        insert(&tx, &workdir, &git_dir, "master");
+        let (event_rx, _id) = subscribe(&tx);
+
+        // 50 separate batches, each a genuine change to the same repo.
+        for _ in 0..50 {
+            tx.send(StateMsg::FsEvent(vec![git_dir.join("HEAD")]))
+                .unwrap();
+        }
+
+        // Leading edge fires immediately.
+        event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first change should broadcast immediately");
+
+        // The remaining 49 collapse into at most a couple of paced
+        // follow-ups rather than 49 wake-ups.
+        let mut extra = 0;
+        while event_rx.recv_timeout(BROADCAST_MIN_INTERVAL * 3).is_ok() {
+            extra += 1;
+            assert!(extra < 10, "rate limiter failed: {extra} follow-up events");
+        }
+        assert!(
+            extra >= 1,
+            "the suppressed change must still be flushed, not dropped"
+        );
+
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn transient_gitdir_paths_are_classified() {
+        assert!(is_transient_gitdir_path(Path::new(
+            "/r/.git/fsmonitor--daemon/cookies/123-4"
+        )));
+        assert!(is_transient_gitdir_path(Path::new("/r/.git/index.lock")));
+        assert!(is_transient_gitdir_path(Path::new(
+            "/r/.git/refs/heads/main.lock"
+        )));
+        // Real state changes must not be classified as transient.
+        assert!(!is_transient_gitdir_path(Path::new("/r/.git/HEAD")));
+        assert!(!is_transient_gitdir_path(Path::new("/r/.git/index")));
+        assert!(!is_transient_gitdir_path(Path::new(
+            "/r/.git/refs/heads/main"
+        )));
+        assert!(!is_transient_gitdir_path(Path::new("/r/.git/packed-refs")));
     }
 
     #[test]
