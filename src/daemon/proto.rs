@@ -112,12 +112,15 @@ pub struct CmdEndEvent {
 
 /// `SUBSCRIBE` payload. Phase 3 (chevron-1yn.3): a long-lived
 /// subscriber connection that the daemon writes `EVENT` and `PING`
-/// lines to as state changes. The optional cwd filter narrows
-/// broadcasts to a single workdir; omitted means "all events the
-/// daemon emits".
+/// lines to as state changes. `cwd` matches an exact directory;
+/// `shell_cwd` matches events from that directory or an ancestor. With
+/// neither filter, the subscriber receives all events the daemon emits.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SubscribeSpec {
     pub cwd: Option<PathBuf>,
+    /// Physical shell cwd: accept events from this directory or its ancestors.
+    /// Separate from exact `cwd` so older daemons ignore it and send all events.
+    pub shell_cwd: Option<PathBuf>,
 }
 
 /// `EVENT` payload. Topic is intentionally a free-form string
@@ -252,6 +255,9 @@ fn encode_subscribe(s: &SubscribeSpec) -> String {
     out.push_str("SUBSCRIBE");
     if let Some(cwd) = &s.cwd {
         write_kv_str(&mut out, "cwd", &cwd.to_string_lossy());
+    }
+    if let Some(cwd) = &s.shell_cwd {
+        write_kv_str(&mut out, "shell_cwd", &cwd.to_string_lossy());
     }
     out
 }
@@ -459,6 +465,7 @@ fn decode_cmd_start(rest: &str) -> Result<CmdStartEvent, ProtoError> {
 
 fn decode_subscribe(rest: &str) -> Result<SubscribeSpec, ProtoError> {
     let mut cwd: Option<String> = None;
+    let mut shell_cwd: Option<String> = None;
     for tok in rest.split_ascii_whitespace() {
         let (k, v) = tok
             .split_once('=')
@@ -466,12 +473,15 @@ fn decode_subscribe(rest: &str) -> Result<SubscribeSpec, ProtoError> {
         // Forward-compat: ignore unknown keys so future filter axes
         // (topics, session) can land without breaking older daemons
         // that don't yet know them.
-        if k == "cwd" {
-            cwd = Some(percent_decode(v)?);
+        match k {
+            "cwd" => cwd = Some(percent_decode(v)?),
+            "shell_cwd" => shell_cwd = Some(percent_decode(v)?),
+            _ => {}
         }
     }
     Ok(SubscribeSpec {
         cwd: cwd.map(PathBuf::from),
+        shell_cwd: shell_cwd.map(PathBuf::from),
     })
 }
 
@@ -1311,16 +1321,28 @@ mod tests {
 
     #[test]
     fn encode_decode_subscribe_no_filter() {
-        let req = Request::Subscribe(SubscribeSpec { cwd: None });
+        let req = Request::Subscribe(SubscribeSpec::default());
         let line = encode_request(&req);
         assert_eq!(line, "SUBSCRIBE");
         assert_eq!(decode_request(&line).unwrap(), req);
     }
 
     #[test]
+    fn encode_decode_subscribe_with_shell_cwd() {
+        let req = Request::Subscribe(SubscribeSpec {
+            shell_cwd: Some(PathBuf::from("/repo/sub dir%")),
+            ..SubscribeSpec::default()
+        });
+        let encoded = encode_request(&req);
+        assert_eq!(encoded, "SUBSCRIBE shell_cwd=/repo/sub%20dir%25");
+        assert_eq!(decode_request(&encoded).unwrap(), req);
+    }
+
+    #[test]
     fn encode_decode_subscribe_with_cwd() {
         let req = Request::Subscribe(SubscribeSpec {
             cwd: Some(PathBuf::from("/Users/mim/src/chevron")),
+            ..SubscribeSpec::default()
         });
         let line = encode_request(&req);
         assert_eq!(line, "SUBSCRIBE cwd=/Users/mim/src/chevron");
@@ -1331,6 +1353,7 @@ mod tests {
     fn encode_decode_subscribe_with_space_in_cwd() {
         let req = Request::Subscribe(SubscribeSpec {
             cwd: Some(PathBuf::from("/Users/mim/My Project")),
+            ..SubscribeSpec::default()
         });
         let line = encode_request(&req);
         assert!(line.contains("cwd=/Users/mim/My%20Project"));

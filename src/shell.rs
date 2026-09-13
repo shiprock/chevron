@@ -667,9 +667,8 @@ fi
 _chevron_live_callback() {
     local fd=$1
     local line
-    # Read available input. On EOF (chevron subscribe died, daemon
-    # restarted, etc.) unregister + close the fd; the user can
-    # re-enable Phase 3 by opening a new shell.
+    # The helper reconnects across daemon restarts. If it exits, close
+    # the pipe; the next precmd will establish a fresh subscription.
     if ! IFS= read -r line <&$fd; then
         zle -F "$fd" 2>/dev/null
         { exec {fd}<&- } 2>/dev/null
@@ -679,19 +678,15 @@ _chevron_live_callback() {
     # The subscriber filters PINGs out, so we should only see EVENT
     # lines here — but guard defensively in case of future changes.
     [[ "$line" != EVENT* ]] && return
-    # Scope (chevron-ffu.3). By default redraw only for events in the
-    # current repo, so N shells across M repos don't all re-render on one
-    # repo's change. The daemon's own cwd filter is exact-match (useless
-    # from a subdirectory), so we filter here against live $PWD — which
-    # also makes `cd` Just Work with no re-subscribe. CHEVRON_LIVE_SCOPE=all
-    # opts back into cross-repo events (the cross-pane case, chevron-i1h).
+    # Defense in depth for older daemons that ignore shell_cwd, and for
+    # events already queued when a directory change replaces the subscription.
     if [[ "${CHEVRON_LIVE_SCOPE:-cwd}" != all && "$line" == *cwd=* ]]; then
         local _ev_cwd="${line#*cwd=}"; _ev_cwd="${_ev_cwd%% *}"
         # cwd is percent-encoded on the wire; decode only when needed.
         [[ "$_ev_cwd" == *%* ]] && _ev_cwd=$(printf '%b' "${_ev_cwd//\%/\\x}")
         # Redraw only when $PWD is inside the event's workdir. Trailing
         # slashes guard the /repo-vs-/repo2 prefix trap.
-        [[ "$PWD/" == "${_ev_cwd%/}/"* ]] || return
+        [[ "${PWD:A}/" == "${_ev_cwd%/}/"* ]] || return
     fi
     # Debounce. A single `git commit` fires several FS events that the
     # daemon coalesces per workdir, but bursts from `git rebase` etc.
@@ -712,15 +707,42 @@ _chevron_live_callback() {
     local _jobs=${(%):-%j}
     _chevron_start_async "$_exit" "$_dur" "$_jobs"
 }
-# Spawn the subscriber helper and register the zle -F handler when
-# CHEVRON_LIVE != 0 (on by default since the live prompt graduated,
-# chevron-ffu — reconnecting, cwd-scoped, PS2-safe, e2e-proven in CI).
-# The subscriber inherits SIGHUP from this shell on exit, so its
-# lifecycle is bounded — no need to track a PID for cleanup.
-if [[ "${CHEVRON_LIVE:-0}" != "0" ]]; then
-    exec {_chevron_live_fd}< <(chevron subscribe 2>/dev/null)
+# Re-subscribe only when the physical directory or scope changes. Filtering
+# in the daemon prevents unrelated events from waking this shell at all.
+_chevron_stop_live() {
+    if [[ -n "${_chevron_live_fd:-}" ]]; then
+        zle -F "$_chevron_live_fd" 2>/dev/null
+        { exec {_chevron_live_fd}<&- } 2>/dev/null
+        unset _chevron_live_fd
+    fi
+    if [[ -n "${_chevron_live_pid:-}" ]]; then
+        kill "$_chevron_live_pid" 2>/dev/null
+        wait "$_chevron_live_pid" 2>/dev/null
+        unset _chevron_live_pid
+    fi
+}
+_chevron_refresh_live() {
+    local scope=${CHEVRON_LIVE_SCOPE:-cwd}
+    local cwd=${PWD:A}
+    if [[ "${CHEVRON_LIVE:-0}" == 0 ]]; then
+        _chevron_stop_live
+        return
+    fi
+    [[ -n "${_chevron_live_fd:-}" && "${_chevron_live_cwd:-}" == "$cwd" && "${_chevron_live_scope:-}" == "$scope" ]] && return
+    _chevron_stop_live
+    local -a args
+    [[ "$scope" != all ]] && args=(--shell-cwd "$cwd")
+    exec {_chevron_live_fd}< <(chevron subscribe "${args[@]}" 2>/dev/null)
+    _chevron_live_pid=$!
+    _chevron_live_cwd=$cwd
+    _chevron_live_scope=$scope
     zle -F "$_chevron_live_fd" _chevron_live_callback
-fi
+}
+add-zsh-hook chpwd _chevron_refresh_live
+add-zsh-hook precmd _chevron_refresh_live
+add-zsh-hook zshexit _chevron_stop_live
+_chevron_refresh_live
+
 "#;
 
 /// Bash init using `ShellConfig::default()`.
@@ -2465,7 +2487,7 @@ mod tests {
             "scope must be opt-out-able via CHEVRON_LIVE_SCOPE=all (cross-pane)"
         );
         assert!(
-            body.contains(r#""$PWD/" == "#),
+            body.contains(r#""${PWD:A}/" == "#),
             "scoped filter must redraw only when $PWD is inside the event workdir"
         );
     }

@@ -2270,13 +2270,17 @@ impl LiveFixture {
     /// Like [`Self::spawn`], with extra shell lines (e.g. env exports)
     /// inserted before the `chevron init` eval.
     fn spawn_with(extra_env: &str) -> Self {
+        Self::spawn_mode(extra_env, false)
+    }
+
+    fn spawn_mode(extra_env: &str, real_watcher: bool) -> Self {
         let sockdir = tempfile::TempDir::new().unwrap();
         // Match the real daemon's ownership lock. A status query exceeding
         // its 10 ms budget otherwise auto-spawns a real daemon, which
         // unlinks our socket and steals the reconnecting subscriber.
         let daemon_lock =
             lifecycle::try_lock_exclusive(&sockdir.path().join("chevrond.lock")).unwrap();
-        let (state_tx, state_join) = Self::start_daemon(sockdir.path());
+        let (state_tx, state_join) = Self::start_daemon(sockdir.path(), real_watcher);
 
         let home_slot = Arc::new(Mutex::new(std::path::PathBuf::new()));
         let socket_dir = sockdir.path().to_path_buf();
@@ -2328,6 +2332,41 @@ impl LiveFixture {
         fx
     }
 
+    /// Another interactive shell on the same daemon, starting at `cwd`.
+    /// Count callback entries, including events discarded by the shell filter.
+    fn peer(&self, cwd: &std::path::Path, scope: &str) -> (Term, std::path::PathBuf) {
+        let log_slot = Arc::new(Mutex::new(std::path::PathBuf::new()));
+        let log_out = Arc::clone(&log_slot);
+        let socket = self.sockdir.path().to_path_buf();
+        let cwd = cwd.to_path_buf();
+        let scope = scope.to_string();
+        let term = Term::spawn_customized(
+            Dsr::Immediate,
+            ROWS,
+            LIVE_COLS,
+            Render::Sync,
+            move |home, path_dirs| {
+                let log = home.join("callbacks");
+                *log_out.lock().unwrap() = log;
+                std::fs::write(home.join(".zshrc"), format!(
+                    "path=({path_dirs} $path)\n\
+                     export CHEVRON_SOCKET_DIR='{}' CHEVRON_LIVE=1 CHEVRON_LIVE_SCOPE={scope} CHEVRON_HISTORY=0\n\
+                     unset CHEVRON_NO_DAEMON\n\
+                     cd '{}'\n\
+                     eval \"$(chevron init zsh)\"\n\
+                     functions[_live_original]=$functions[_chevron_live_callback]\n\
+                     _chevron_live_callback() {{ print -r -- event >> \"$HOME/callbacks\"; _live_original \"$@\"; }}\n",
+                    socket.display(), cwd.display(),
+                )).unwrap();
+            },
+        );
+        let log = log_slot.lock().unwrap().clone();
+        term.wait_for("peer prompt", |s| {
+            lines(s).iter().any(|l| l.contains("base"))
+        });
+        (term, log)
+    }
+
     /// Bind a fresh listener + state actor at `dir/chevrond.sock`. Uses a
     /// NO-WATCHER actor: every event is injected via `state_tx`, so the
     /// event → redraw path is deterministic. A real `notify` watcher would
@@ -2336,6 +2375,7 @@ impl LiveFixture {
     /// slower/coalesced macOS `FSEvents` locally (chevron-ffu.6).
     fn start_daemon(
         dir: &std::path::Path,
+        real_watcher: bool,
     ) -> (
         std::sync::mpsc::Sender<StateMsg>,
         std::thread::JoinHandle<()>,
@@ -2345,7 +2385,11 @@ impl LiveFixture {
         let next_socket = dir.join("chevrond-next.sock");
         let listener_sock = UnixListener::bind(&next_socket).unwrap();
         let db = state::open_db(dir).unwrap();
-        let (state_tx, join) = state::spawn_no_watcher(state::TTL, db).unwrap();
+        let (state_tx, join) = if real_watcher {
+            state::spawn(state::TTL, db).unwrap()
+        } else {
+            state::spawn_no_watcher(state::TTL, db).unwrap()
+        };
         let serve_tx = state_tx.clone();
         std::thread::spawn(move || listener::serve_loop(&listener_sock, &serve_tx));
         std::fs::rename(next_socket, dir.join("chevrond.sock")).unwrap();
@@ -2363,7 +2407,7 @@ impl LiveFixture {
     fn restart_daemon(&mut self) {
         self.state_tx.send(StateMsg::Shutdown).unwrap();
         self.state_join.take().unwrap().join().unwrap();
-        let (state_tx, join) = Self::start_daemon(self.sockdir.path());
+        let (state_tx, join) = Self::start_daemon(self.sockdir.path(), false);
         self.state_tx = state_tx;
         self.state_join = Some(join);
     }
@@ -2431,6 +2475,223 @@ impl LiveFixture {
             std::thread::sleep(Duration::from_millis(150));
         }
     }
+}
+
+#[cfg(feature = "daemon")]
+fn callback_count(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// Shell-side filtering alone hides redraws but still wakes every shell.
+#[test]
+#[ignore = "daemon-backed live-loop e2e; run by the live-e2e CI job"]
+#[cfg(feature = "daemon")]
+fn live_subscription_filters_before_waking_and_follows_cd() {
+    let fx = LiveFixture::spawn();
+    let other = tempfile::TempDir::new().unwrap();
+    let other = other.path().canonicalize().unwrap();
+    git_in(&other, &["init", "-q", "-b", "base"]);
+    git_in(
+        &other,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    );
+    let subdir = fx.home.join("sub dir % space");
+    std::fs::create_dir(&subdir).unwrap();
+    let (peer, callbacks) = fx.peer(&subdir, "cwd");
+    let (all, all_callbacks) = fx.peer(&other, "all");
+    // A matching event proves registration completed, including from a subdir.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while callback_count(&callbacks) == 0 || callback_count(&all_callbacks) == 0 {
+        fx.fire_cmd_event(&fx.home);
+        assert!(Instant::now() < deadline, "peer did not subscribe");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // Drain prior matching events before measuring foreign traffic.
+    peer.send_line("print READY > $HOME/ready");
+    peer.wait_for("peer command", |s| {
+        lines(s).iter().any(|l| l.contains("print READY"))
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let before = callback_count(&callbacks);
+    let all_before = callback_count(&all_callbacks);
+    for _ in 0..30 {
+        fx.fire_cmd_event(&other);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        callback_count(&callbacks),
+        before,
+        "foreign events must not enter the shell callback"
+    );
+    assert!(
+        callback_count(&all_callbacks) > all_before,
+        "all-scope shell must still receive foreign events"
+    );
+    // Change repositories through a symlink: the new physical cwd must be used.
+    let link = fx.home.join("other-link");
+    std::os::unix::fs::symlink(&other, &link).unwrap();
+    peer.send_line(&format!("cd '{}'", link.display()));
+    peer.wait_for("changed directory", |s| {
+        lines(s)
+            .iter()
+            .any(|l| l.contains(other.file_name().unwrap().to_str().unwrap()) && !l.contains("cd "))
+    });
+    git_in(&other, &["checkout", "-q", "-b", "newplace"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        fx.fire_cmd_event(&other);
+        if peer.with_screen(|s| lines(s).iter().any(|l| l.contains("newplace"))) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "subscription did not follow cd\n{}",
+            peer.dump()
+        );
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    // The last own-directory trigger can still be queued behind its redraw.
+    // Let it drain before measuring callbacks from the old directory.
+    std::thread::sleep(Duration::from_millis(250));
+    let moved_count = callback_count(&callbacks);
+    for _ in 0..20 {
+        fx.fire_cmd_event(&fx.home);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        callback_count(&callbacks),
+        moved_count,
+        "old directory subscription survived cd"
+    );
+    drop(all);
+}
+
+#[cfg(feature = "daemon")]
+struct Monitor(std::path::PathBuf);
+#[cfg(feature = "daemon")]
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("git")
+            .args(["fsmonitor--daemon", "stop"])
+            .current_dir(&self.0)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output();
+    }
+}
+
+/// Reproduce an editor polling fsmonitor while three shells share a daemon.
+#[test]
+#[ignore = "real fsmonitor + PTY e2e; run by the live-e2e CI job"]
+#[cfg(feature = "daemon")]
+fn live_multiple_shells_remain_responsive_under_fsmonitor_polling() {
+    let fx = LiveFixture::spawn_mode("export CHEVRON_HISTORY=0\n", true);
+    git_in(&fx.home, &["config", "core.fsmonitor", "true"]);
+    let started = std::process::Command::new("git")
+        .args(["fsmonitor--daemon", "start"])
+        .current_dir(&fx.home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    if !started.status.success() {
+        eprintln!(
+            "SKIP: native git fsmonitor unavailable: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        return;
+    }
+    let _monitor = Monitor(fx.home.clone());
+    let foreign = tempfile::TempDir::new().unwrap();
+    let foreign = foreign.path().canonicalize().unwrap();
+    git_in(&foreign, &["init", "-q", "-b", "base"]);
+    git_in(
+        &foreign,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    );
+    let (same_repo, same_log) = fx.peer(&fx.home, "cwd");
+    let (other_repo, other_log) = fx.peer(&foreign, "cwd");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while callback_count(&same_log) == 0 || callback_count(&other_log) == 0 {
+        fx.fire_cmd_event(&fx.home);
+        fx.fire_cmd_event(&foreign);
+        assert!(Instant::now() < deadline, "peers did not subscribe");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Warm up the index and drain setup events before measuring the workload.
+    git_in(&fx.home, &["status", "--porcelain"]);
+    std::thread::sleep(Duration::from_millis(500));
+    let before = callback_count(&same_log);
+    let foreign_before = callback_count(&other_log);
+    same_repo.send("echo LIVE_INPUT_");
+    other_repo.send("echo FOREIGN_INPUT_");
+    let measured_at = Instant::now();
+    let root = fx.home.clone();
+    let poller = std::thread::spawn(move || {
+        for i in 0..50 {
+            git_in(&root, &["status", "--porcelain"]);
+            if i == 20 {
+                git_in(&root, &["checkout", "-q", "-b", "pollchanged"]);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    // Wait for an actual background redraw with partially typed input.
+    same_repo.wait_for("branch redraw preserves partial input", |s| {
+        lines(s)
+            .iter()
+            .any(|l| l.contains("pollchanged") && l.contains("echo LIVE_INPUT_"))
+    });
+    // Complete and execute that same buffer while the external poller runs.
+    same_repo.send("OK\n");
+    other_repo.send("OK\n");
+    same_repo.wait_for("responsive same-repo input", |s| {
+        lines(s).iter().any(|l| l.trim() == "LIVE_INPUT_OK")
+    });
+    other_repo.wait_for("responsive foreign-repo input", |s| {
+        lines(s).iter().any(|l| l.trim() == "FOREIGN_INPUT_OK")
+    });
+    poller.join().unwrap();
+    same_repo.wait_for("final state after polling", |s| {
+        lines(s).iter().any(|l| l.contains("pollchanged"))
+    });
+    fx.term.wait_for("final state in original shell", |s| {
+        lines(s).iter().any(|l| l.contains("pollchanged"))
+    });
+    // One event per 100 ms at most, with generous scheduling tolerance.
+    assert!(
+        (callback_count(&same_log) - before) as u128
+            <= measured_at.elapsed().as_millis() / state::BROADCAST_MIN_INTERVAL.as_millis() + 5,
+        "polling caused a callback storm"
+    );
+    assert_eq!(
+        callback_count(&other_log),
+        foreign_before,
+        "unrelated shell woke for polled repository"
+    );
 }
 
 /// chevron-ffu.6: a cwd-scoped shell must ignore other repos' events while

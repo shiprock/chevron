@@ -84,11 +84,11 @@ enum Action {
 /// - 2: initial connect/handshake failure (no daemon at startup)
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
-    let cwd_filter = match parse_args(args) {
+    let spec = match parse_args(args) {
         Ok(c) => c,
         Err(msg) => {
             eprintln!("chevron subscribe: {msg}");
-            eprintln!("Usage: chevron subscribe [--cwd PATH]");
+            eprintln!("Usage: chevron subscribe [--cwd PATH | --shell-cwd PATH]");
             return 1;
         }
     };
@@ -96,7 +96,7 @@ pub fn run(args: &[String]) -> i32 {
     let mut ever_subscribed = false;
     let mut failed_attempts = 0u32;
     loop {
-        let outcome = connect_and_relay(cwd_filter.clone());
+        let outcome = connect_and_relay(spec.clone());
         match next_action(&outcome, &mut ever_subscribed, &mut failed_attempts) {
             Action::Exit(code) => {
                 if code == 2 {
@@ -161,7 +161,7 @@ fn backoff_delay(attempt: u32) -> Option<Duration> {
 /// connection ends, classifying why so [`run`] can decide whether to
 /// reconnect. Stays quiet on failure (the caller owns user-facing
 /// messaging) so reconnect attempts don't spam stderr.
-fn connect_and_relay(cwd_filter: Option<PathBuf>) -> Outcome {
+fn connect_and_relay(spec: proto::SubscribeSpec) -> Outcome {
     let Ok(conn) = UnixStream::connect(paths::socket_path()) else {
         return Outcome::ConnectFailed;
     };
@@ -192,9 +192,7 @@ fn connect_and_relay(cwd_filter: Option<PathBuf>) -> Outcome {
     line.clear();
     if write_line(
         &conn,
-        &proto::encode_request(&proto::Request::Subscribe(proto::SubscribeSpec {
-            cwd: cwd_filter,
-        })),
+        &proto::encode_request(&proto::Request::Subscribe(spec)),
     )
     .is_err()
     {
@@ -248,16 +246,26 @@ fn connect_and_relay(cwd_filter: Option<PathBuf>) -> Outcome {
     }
 }
 
-fn parse_args(args: &[String]) -> Result<Option<PathBuf>, String> {
-    let mut cwd: Option<PathBuf> = None;
+fn parse_args(args: &[String]) -> Result<proto::SubscribeSpec, String> {
+    let mut spec = proto::SubscribeSpec::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--cwd" => {
+            "--cwd" | "--shell-cwd" => {
                 let Some(val) = args.get(i + 1) else {
-                    return Err("--cwd requires a path".to_string());
+                    return Err(format!("{} requires a path", args[i]));
                 };
-                cwd = Some(PathBuf::from(val));
+                if spec.cwd.is_some() || spec.shell_cwd.is_some() {
+                    return Err("specify only one cwd filter".to_string());
+                }
+                if args[i] == "--shell-cwd" {
+                    spec.shell_cwd = Some(
+                        std::fs::canonicalize(val)
+                            .map_err(|e| format!("cannot resolve shell cwd: {e}"))?,
+                    );
+                } else {
+                    spec.cwd = Some(PathBuf::from(val));
+                }
                 i += 2;
             }
             "-h" | "--help" => {
@@ -268,7 +276,7 @@ fn parse_args(args: &[String]) -> Result<Option<PathBuf>, String> {
             }
         }
     }
-    Ok(cwd)
+    Ok(spec)
 }
 
 fn write_line(mut conn: &UnixStream, line: &str) -> std::io::Result<()> {
@@ -285,13 +293,37 @@ mod tests {
 
     #[test]
     fn args_default_no_cwd() {
-        assert_eq!(parse_args(&[]).unwrap(), None);
+        assert_eq!(parse_args(&[]).unwrap(), proto::SubscribeSpec::default());
+    }
+
+    #[test]
+    fn shell_cwd_is_canonical_and_filters_are_exclusive() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real dir%");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut args = vec!["--shell-cwd".into(), link.to_string_lossy().into_owned()];
+        assert_eq!(
+            parse_args(&args).unwrap().shell_cwd,
+            Some(real.canonicalize().unwrap())
+        );
+        args.extend(["--cwd".into(), "/repo".into()]);
+        assert!(parse_args(&args).is_err());
+        assert!(parse_args(&["--shell-cwd".into()]).is_err());
+        assert!(
+            parse_args(&[
+                "--shell-cwd".into(),
+                real.join("missing").to_string_lossy().into_owned()
+            ])
+            .is_err()
+        );
     }
 
     #[test]
     fn args_with_cwd() {
         let args = vec!["--cwd".to_string(), "/x".to_string()];
-        assert_eq!(parse_args(&args).unwrap(), Some(PathBuf::from("/x")));
+        assert_eq!(parse_args(&args).unwrap().cwd, Some(PathBuf::from("/x")));
     }
 
     #[test]
