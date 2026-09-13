@@ -73,6 +73,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.98.1
       - uses: Swatinem/rust-cache@v2
+      - name: Install zsh (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh
       # Run tests several times so parallel-test-isolation flakes are likelier
       # to surface in CI. A single run of a 20%-flake test passes 80% of the
       # time; 5 runs drop that to ~33%.

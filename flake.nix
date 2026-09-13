@@ -69,6 +69,7 @@
           # Integration tests (tests/cli.rs) spawn subprocesses that hang
           # in the Nix sandbox, so only run unit tests during the build.
           cargoTestExtraArgs = "--lib";
+          nativeCheckInputs = [ pkgs.zsh ];
           nativeBuildInputs = [
             pkgs.pkg-config
             pkgs.cmake
