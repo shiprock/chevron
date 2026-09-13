@@ -150,6 +150,7 @@ pub fn handle_connection(conn: UnixStream, state_tx: &Sender<StateMsg>) {
                         subscriber: Subscriber {
                             sender: event_tx,
                             cwd_filter: spec.cwd,
+                            shell_cwd: spec.shell_cwd,
                         },
                         reply: reply_tx,
                     })
@@ -158,11 +159,12 @@ pub fn handle_connection(conn: UnixStream, state_tx: &Sender<StateMsg>) {
                     let _ = send_resp(&conn, &Response::Err("state thread gone".into()));
                     return;
                 }
-                if reply_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+                let Ok(id) = reply_rx.recv_timeout(Duration::from_secs(1)) else {
                     let _ = send_resp(&conn, &Response::Err("subscribe timed out".into()));
                     return;
-                }
+                };
                 if send_resp(&conn, &Response::Ack).is_err() {
+                    let _ = state_tx.send(StateMsg::Unsubscribe(id));
                     return;
                 }
                 // Clear the per-message read timeout — relay loop
@@ -172,6 +174,7 @@ pub fn handle_connection(conn: UnixStream, state_tx: &Sender<StateMsg>) {
                 // mid-PING.
                 let _ = conn.set_read_timeout(None);
                 relay_loop(&event_rx, &conn, HEARTBEAT_INTERVAL);
+                let _ = state_tx.send(StateMsg::Unsubscribe(id));
                 return;
             }
         }

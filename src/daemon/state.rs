@@ -110,11 +110,13 @@ pub const SUBSCRIBER_CHANNEL_CAP: usize = 32;
 /// Per-subscriber registration. `sender` is the actor's end of a
 /// bounded channel; the listener-side relay thread owns the receiver
 /// and writes each message to the socket. `cwd_filter` narrows
-/// broadcasts; `None` means "all events". The id is opaque, just for
+/// broadcasts to an exact cwd; `shell_cwd` instead uses ancestor matching.
+/// With neither filter, all events match. The id is opaque, just for
 /// debugging logs and the actor's bookkeeping.
 pub struct Subscriber {
     pub sender: SyncSender<EventPayload>,
     pub cwd_filter: Option<PathBuf>,
+    pub shell_cwd: Option<PathBuf>,
 }
 
 pub enum StateMsg {
@@ -155,6 +157,9 @@ pub enum StateMsg {
         subscriber: Subscriber,
         reply: Sender<u64>,
     },
+    /// Remove a subscription when its relay exits, even if no matching
+    /// event ever arrives again to trigger lazy pruning.
+    Unsubscribe(u64),
     /// Stop the actor. Mainly for tests; production exits via signal.
     Shutdown,
 }
@@ -420,8 +425,8 @@ impl State {
         id
     }
 
-    /// Broadcast `payload` to subscribers whose `cwd_filter` matches
-    /// (or is None). Lazy-prunes subscribers whose receiver has been
+    /// Broadcast `payload` to subscribers whose directory scope matches.
+    /// Lazy-prunes subscribers whose receiver has been
     /// dropped (relay thread exited because the socket closed). Full
     /// mailboxes drop the event for that subscriber but keep them
     /// registered — slow consumers shed events rather than growing
@@ -451,6 +456,12 @@ impl State {
 }
 
 fn subscriber_matches(sub: &Subscriber, payload: &EventPayload) -> bool {
+    if let Some(shell_cwd) = &sub.shell_cwd {
+        return payload
+            .cwd
+            .as_ref()
+            .is_some_and(|cwd| shell_cwd.starts_with(cwd));
+    }
     match (&sub.cwd_filter, &payload.cwd) {
         (None, _) => true,
         (Some(filter), Some(cwd)) => filter == cwd,
@@ -604,15 +615,35 @@ fn run_inner(
             }
             StateMsg::Subscribe { subscriber, reply } => {
                 let id = state.add_subscriber(subscriber);
-                // Confirm registration *before* the listener ACKs the
-                // client. If reply fails (peer gone), the subscriber
-                // is harmlessly left in the map until the next
-                // broadcast prunes it as Disconnected.
-                let _ = reply.send(id);
+                // Confirm registration before the listener ACKs the client.
+                // A failed reply must not leave an unreachable subscription.
+                if reply.send(id).is_err() {
+                    state.subscribers.remove(&id);
+                }
+            }
+            StateMsg::Unsubscribe(id) => {
+                state.subscribers.remove(&id);
             }
             StateMsg::Shutdown => break,
         }
     }
+}
+
+fn forward_fs_event(tx: &Sender<StateMsg>, event: notify::Event) {
+    use notify::event::{AccessKind, AccessMode};
+    // Linux reports opens while libgit2 reads the index and refs. Treating
+    // those reads as changes makes every prompt render schedule another one.
+    // Opening for write is not itself a change either; keep the subsequent
+    // modify/close-write events so actual writes still invalidate promptly.
+    if matches!(
+        event.kind,
+        notify::EventKind::Access(
+            AccessKind::Open(_) | AccessKind::Read | AccessKind::Close(AccessMode::Read)
+        )
+    ) {
+        return;
+    }
+    let _ = tx.send(StateMsg::FsEvent(event.paths));
 }
 
 /// Build a `notify` watcher whose events feed back into the state
@@ -623,8 +654,7 @@ fn make_watcher(tx: &Sender<StateMsg>) -> Option<RecommendedWatcher> {
     let tx = tx.clone();
     notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
-            // Send error means state thread has shut down; nothing to do.
-            let _ = tx.send(StateMsg::FsEvent(event.paths));
+            forward_fs_event(&tx, event);
         }
     })
     .ok()
@@ -1239,6 +1269,7 @@ mod tests {
             Subscriber {
                 sender: event_tx,
                 cwd_filter: None,
+                shell_cwd: None,
             },
         )
         .map(|id| (event_rx, id))
@@ -1324,6 +1355,41 @@ mod tests {
 
         tx.send(StateMsg::Shutdown).unwrap();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn watcher_reads_do_not_invalidate_but_writes_still_do() {
+        use notify::event::{AccessKind, AccessMode, DataChange, ModifyKind};
+        use notify::{Event, EventKind};
+        let (tx, rx) = mpsc::channel();
+        let path = PathBuf::from("/repo/.git/HEAD");
+        for kind in [
+            AccessKind::Open(AccessMode::Any),
+            AccessKind::Open(AccessMode::Read),
+            AccessKind::Open(AccessMode::Write),
+            AccessKind::Read,
+            AccessKind::Close(AccessMode::Read),
+        ] {
+            forward_fs_event(
+                &tx,
+                Event::new(EventKind::Access(kind)).add_path(path.clone()),
+            );
+            assert!(
+                matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "read/open event triggered invalidation: {kind:?}"
+            );
+        }
+        for kind in [
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Create(notify::event::CreateKind::Any),
+            EventKind::Remove(notify::event::RemoveKind::Any),
+        ] {
+            forward_fs_event(&tx, Event::new(kind).add_path(path.clone()));
+            assert!(
+                matches!(rx.try_recv(), Ok(StateMsg::FsEvent(paths)) if paths == vec![path.clone()])
+            );
+        }
     }
 
     #[test]
@@ -1502,6 +1568,58 @@ mod tests {
     }
 
     #[test]
+    fn unsubscribe_drops_mailbox_without_waiting_for_matching_events() {
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
+        let (events, id) = subscribe(&tx);
+        tx.send(StateMsg::Unsubscribe(id)).unwrap();
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn shell_subscription_matches_ancestors_without_prefix_collisions() {
+        let (sender, _rx) = mpsc::sync_channel(1);
+        let mut subscriber = Subscriber {
+            sender,
+            cwd_filter: None,
+            shell_cwd: Some(PathBuf::from("/repo/sub dir")),
+        };
+        for (cwd, expected) in [
+            (Some("/repo"), true),
+            (Some("/repo/sub dir"), true),
+            (Some("/rep"), false),
+            (Some("/repo2"), false),
+            (Some("/other"), false),
+            (Some("/repo/sub dir/child"), false),
+            (None, false),
+        ] {
+            let event = EventPayload {
+                topic: "git".into(),
+                cwd: cwd.map(PathBuf::from),
+                id: None,
+            };
+            assert_eq!(
+                subscriber_matches(&subscriber, &event),
+                expected,
+                "cwd={cwd:?}"
+            );
+        }
+        // Existing CLI consumers retain exact --cwd filtering.
+        subscriber.shell_cwd = None;
+        subscriber.cwd_filter = Some(PathBuf::from("/repo/sub dir"));
+        let event = EventPayload {
+            topic: "cmd".into(),
+            cwd: Some(PathBuf::from("/repo")),
+            id: None,
+        };
+        assert!(!subscriber_matches(&subscriber, &event));
+    }
+
+    #[test]
     fn subscriber_cwd_filter_skips_other_workdirs() {
         // spawn_no_watcher to avoid FSEventStream init latency
         // (synthetic FsEvents drive this test).
@@ -1524,6 +1642,7 @@ mod tests {
             Subscriber {
                 sender: event_tx,
                 cwd_filter: Some(workdir_a.clone()),
+                shell_cwd: None,
             },
         )
         .unwrap();
@@ -1561,6 +1680,7 @@ mod tests {
             Subscriber {
                 sender: event_tx,
                 cwd_filter: None,
+                shell_cwd: None,
             },
         )
         .unwrap();

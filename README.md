@@ -76,7 +76,12 @@ default build). Controls:
 | Variable | Default | Effect |
 |---|---|---|
 | `CHEVRON_LIVE` | `1` | Set `0` to disable the live prompt entirely. |
-| `CHEVRON_LIVE_SCOPE` | `cwd` | `cwd` redraws only for events in the current repo; `all` redraws for every repo's events (e.g. cross-pane awareness). |
+| `CHEVRON_LIVE_SCOPE` | `cwd` | `cwd` filters events at the daemon before waking the shell, including from repo subdirectories; `all` receives every repo's events (e.g. cross-pane awareness). |
+
+Subscriptions follow directory changes (including symlinked paths).
+`chevron subscribe --cwd PATH` retains exact-directory matching for CLI consumers;
+`--shell-cwd PATH` selects events from that physical directory or its ancestors.
+Older daemons fall back to shell-side filtering until restarted.
 
 The redraw reuses the async render path, so it is safe across PS2
 continuations and transient-prompt collapse. Distro builds without the
