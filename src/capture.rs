@@ -25,10 +25,9 @@
 //! PTY master, real `stdin`, and a self-pipe used to wake on
 //! SIGWINCH. On master readable: copy to terminal + capture file.
 //! On `stdin` readable: copy to master. On SIGWINCH, query terminal
-//! size and propagate to master via `TIOCSWINSZ`. When master EOFs
-//! (child has exited and the slave side closed), the loop exits,
-//! the parent waits the child, and the parent's own exit code
-//! mirrors the child's.
+//! size and propagate to master via `TIOCSWINSZ`. When the child exits,
+//! the loop drains queued output before releasing the parent's slave
+//! reference. The parent's own exit code mirrors the child's.
 //!
 //! ## Capture file
 //!
@@ -60,7 +59,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::daemon::{client, paths, proto};
 
@@ -177,21 +176,11 @@ fn run_pty(
         None
     };
 
-    // 5. Spawn the child with the slave PTY as its stdin/stdout/stderr,
-    //    then drop EVERY parent-side slave fd before the poll loop.
-    //
-    //    The loop below exits only when the master reports EOF/HUP, and
-    //    the master hangs up only once the LAST open slave fd closes.
-    //    `std::process::Command` keeps its own references to the slave
-    //    fds we hand it (a Command may be spawned more than once), so the
-    //    parent goes on holding the slave open for as long as `cmd` is
-    //    alive — the child can exit yet the master never EOFs and the
-    //    loop blocks forever. Linux enforces this strictly (a 6h CI hang
-    //    on `Test/ubuntu`, chevron-alj); macOS happened to tolerate the
-    //    dangling slave. Scoping `cmd` to this block drops it — and thus
-    //    the parent's three slave fds — at spawn time, leaving the child
-    //    as the sole slave holder so its exit hangs up the master. Do
-    //    NOT flatten this block out; the early drop is load-bearing.
+    // 5. Keep one slave reference until the child's output is drained.
+    // macOS can discard unread PTY output at the last slave close. The IO
+    // loop observes child exit directly rather than waiting for HUP (which
+    // this reference prevents), so keeping it cannot strand the Linux loop.
+    let slave_guard = slave.try_clone()?;
     let mut child = {
         let mut cmd = std::process::Command::new(&cmd_args[0]);
         cmd.args(&cmd_args[1..]);
@@ -237,8 +226,15 @@ fn run_pty(
         .open(output_path)?;
 
     // 7. Run the poll loop.
-    let (bytes_written, truncated) =
-        pty_io_loop(master_fd, winch_r.as_raw_fd(), output_file, max_bytes)?;
+    let (bytes_written, truncated) = pty_io_loop(
+        master_fd,
+        winch_r.as_raw_fd(),
+        libc::STDOUT_FILENO,
+        output_file,
+        max_bytes,
+        || child.try_wait().map(|status| status.is_some()),
+    )?;
+    drop(slave_guard);
 
     // 8. Reap the child.
     let status = child.wait()?;
@@ -272,15 +268,17 @@ fn run_pty(
 ///   - `STDIN` readable → read bytes, write to `master_fd`
 ///   - `winch_fd` readable → drain it and propagate window size from
 ///     real `stdin` to `master_fd`
-///   - master EOF (HUP) → break
+///   - child exited and output drained (or master EOF) → break
 ///
 /// Returns `(bytes_written_to_file, truncated)`.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn pty_io_loop(
     master_fd: RawFd,
     winch_fd: RawFd,
+    terminal_fd: RawFd,
     mut output_file: File,
     max_bytes: u64,
+    mut child_exited: impl FnMut() -> std::io::Result<bool>,
 ) -> std::io::Result<(u64, bool)> {
     let mut total_written: u64 = 0;
     let mut truncated = false;
@@ -306,9 +304,13 @@ fn pty_io_loop(
     ];
 
     loop {
-        // SAFETY: poll on three valid pollfds with a -1 (infinite)
-        // timeout. The buffer is on our stack and lives for the call.
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
+        let exited = child_exited()?;
+        // Poll periodically while running so child exit wakes us even with
+        // a slave reference held. After exit, drain only buffered output;
+        // a grandchild inheriting the terminal must not keep capture alive.
+        let timeout = if exited { 0 } else { 100 };
+        // SAFETY: fds contains three initialized pollfds and lives for the call.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 3, timeout) };
         if rc < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -317,6 +319,10 @@ fn pty_io_loop(
                 continue;
             }
             return Err(err);
+        }
+
+        if exited && fds[0].revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            break;
         }
 
         // Drain the SIGWINCH self-pipe and propagate the new size.
@@ -350,36 +356,43 @@ fn pty_io_loop(
         }
 
         // Drain master → terminal + capture file.
-        if fds[0].revents & libc::POLLIN != 0 {
+        if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             // SAFETY: same shape as the stdin read above.
             let n = unsafe { libc::read(master_fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if n > 0 {
-                let bytes = &buf[..n as usize];
-                // Always to terminal (use direct syscall to avoid any
-                // stdlib buffering between us and the user).
-                let _ = write_all(libc::STDOUT_FILENO, bytes);
-                // Conditionally to capture file (cap at max_bytes).
-                if total_written < max_bytes {
-                    let remaining = max_bytes - total_written;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let to_write = std::cmp::min(bytes.len(), remaining as usize);
-                    output_file.write_all(&bytes[..to_write])?;
-                    total_written += to_write as u64;
-                    if bytes.len() > to_write {
+            match n {
+                1.. => {
+                    let bytes = &buf[..n as usize];
+                    // Always to terminal (use direct syscall to avoid any
+                    // stdlib buffering between us and the user).
+                    let _ = write_all(terminal_fd, bytes);
+                    // Conditionally to capture file (cap at max_bytes).
+                    if total_written < max_bytes {
+                        let remaining = max_bytes - total_written;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let to_write = std::cmp::min(bytes.len(), remaining as usize);
+                        output_file.write_all(&bytes[..to_write])?;
+                        total_written += to_write as u64;
+                        if bytes.len() > to_write {
+                            truncated = true;
+                        }
+                    } else {
                         truncated = true;
                     }
-                } else {
-                    truncated = true;
+                    // HUP can accompany readable data. Keep reading until
+                    // EOF/EIO so an exiting child cannot truncate its output
+                    // at one buffer (or lose it on a HUP-only notification).
                 }
-            } else {
-                // n == 0 or EIO (POLLHUP path on some platforms) →
-                // master is closed because the child exited and the
-                // slave was reaped. Drain and break.
-                break;
+                0 => break,
+                _ => {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EIO) {
+                        break; // Linux PTY EOF.
+                    }
+                    if err.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(err);
+                    }
+                }
             }
-        }
-        if fds[0].revents & libc::POLLHUP != 0 {
-            break;
         }
     }
 
@@ -594,7 +607,7 @@ fn publish_cmd_start(id: &str, session_id: &str, cwd: &Path, cmd: &str) {
         cmd: cmd.to_string(),
         started_at_ms: now_unix_ms(),
     });
-    let _ = client::try_publish_event(&req);
+    let _ = client::try_publish_event_with_timeout(&req, Duration::from_secs(1));
 }
 
 fn publish_cmd_end(
@@ -618,7 +631,7 @@ fn publish_cmd_end(
         output_bytes: Some(output_bytes),
         output_truncated: Some(truncated),
     });
-    let _ = client::try_publish_event(&req);
+    let _ = client::try_publish_event_with_timeout(&req, Duration::from_secs(1));
 }
 
 fn hostname_or_unknown() -> String {
@@ -658,6 +671,71 @@ mod tests {
     #[test]
     fn run_with_help_flag_exits_zero() {
         assert_eq!(run(&["--help".to_string()]), 0);
+    }
+
+    #[test]
+    fn fast_child_output_survives_a_delayed_capture_reader() {
+        // Opening a FIFO for writing blocks until its reader arrives. Since
+        // run_pty opens the capture file after spawn, this deliberately lets
+        // echo exit before the parent starts draining the PTY.
+        let dir = tempfile::TempDir::new().unwrap();
+        let fifo = dir.path().join("capture.fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: fifo_c is a valid NUL-terminated path; mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let reader_path = fifo.clone();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            std::fs::read(reader_path).unwrap()
+        });
+        let result = run_pty(&fifo, &["echo".into(), "delayed-reader".into()], 1024).unwrap();
+        let output = reader.join().unwrap();
+        assert_eq!(result.0, 0);
+        assert_eq!(output, b"delayed-reader\r\n");
+        assert_eq!(result.1, i64::try_from(output.len()).unwrap());
+    }
+
+    #[test]
+    fn capture_drains_buffered_output_after_hangup() {
+        use std::os::unix::net::UnixStream;
+
+        // A socket pair deterministically queues more than one read buffer
+        // before HUP. A live PTY child could exit before or after the read,
+        // hiding the POLLIN + POLLHUP case depending on scheduling.
+        let (master, mut peer) = UnixStream::pair().unwrap();
+        let buffer_size: libc::c_int = 65_536;
+        // SAFETY: peer is a valid socket and buffer_size has the exact
+        // type and size required by SO_SNDBUF.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    peer.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    std::ptr::addr_of!(buffer_size).cast(),
+                    std::mem::size_of_val(&buffer_size).try_into().unwrap(),
+                )
+            },
+            0
+        );
+        let expected = vec![b'x'; 20_000];
+        peer.write_all(&expected).unwrap();
+        drop(peer);
+        let (winch_r, _winch_w) = pipe_cloexec_nonblocking().unwrap();
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let terminal = File::options().write(true).open("/dev/null").unwrap();
+        let (written, truncated) = pty_io_loop(
+            master.as_raw_fd(),
+            winch_r.as_raw_fd(),
+            terminal.as_raw_fd(),
+            output.reopen().unwrap(),
+            30_000,
+            || Ok(false),
+        )
+        .unwrap();
+        assert_eq!(written, 20_000);
+        assert!(!truncated);
+        assert_eq!(std::fs::read(output.path()).unwrap(), expected);
     }
 
     #[test]

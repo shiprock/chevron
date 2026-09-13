@@ -641,6 +641,28 @@ fn event_cmd_end_exits_success_without_daemon() {
         .success();
 }
 
+/// Daemon-backed e2e tests each spawn a real chevrond plus several
+/// chevron subprocesses. Serialize them: at high `--test-threads`
+/// counts (48 on the dev box) five concurrent daemons compound with
+/// the wider suite's process storm into multi-second state-actor
+/// convoys that blow otherwise-generous deadlines — the 10 s row poll
+/// (chevron-8q7) and the 15 s subscribe deadline both fell, in 2 of 3
+/// full-suite runs. One at a time, each finishes in milliseconds.
+static DAEMON_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Kill-on-drop wrapper for helper subprocesses (`chevron subscribe`):
+/// a bare `std::process::Child` is NOT killed when a panicking test
+/// unwinds, and eight orphaned subscribers from earlier failing runs
+/// were found still running, attached to long-dead daemons.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// RAII guard that kills the daemon subprocess (via the chevron-daemon-stop
 /// subcommand) and cleans up the socket dir override on drop. Holds the
 /// `Child` so Drop can `wait()` to reap the process — otherwise we leave
@@ -648,6 +670,10 @@ fn event_cmd_end_exits_success_without_daemon() {
 struct DaemonGuard {
     socket_dir: TempDir,
     child: Option<std::process::Child>,
+    // Declared last: the Drop body stops and reaps the daemon, then
+    // fields drop in declaration order, so the serialization ticket is
+    // released only after this test's daemon is fully gone.
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 
 impl DaemonGuard {
@@ -656,12 +682,18 @@ impl DaemonGuard {
     // false positive locally rather than restructuring the guard.
     #[allow(clippy::zombie_processes)]
     fn start() -> Self {
+        // A test that panics while holding the ticket poisons the
+        // mutex; the serialization it provides is unaffected, so
+        // recover the guard rather than cascading the failure.
+        let serial = DAEMON_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new().unwrap();
         // Background `chevron daemon serve` with the socket dir override.
         // We can't use spawn() + a Drop that calls kill() because the daemon
         // serve never returns from its accept loop — instead we let it run
         // and shoot it down via the daemon stop subcommand on drop.
-        let child = std::process::Command::cargo_bin("chevron")
+        let mut child = std::process::Command::cargo_bin("chevron")
             .unwrap()
             .args(["daemon", "serve"])
             .env("CHEVRON_SOCKET_DIR", dir.path())
@@ -670,27 +702,53 @@ impl DaemonGuard {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        // Wait for the daemon to bind the socket. ~50 ms is enough on
-        // typical machines but we poll with a generous budget to handle
-        // slow CI runners.
+        // A bound socket precedes database initialization. Wait for a real
+        // protocol response so callers cannot publish before the schema
+        // exists or mistake an inline CLI fallback for daemon readiness.
         let sock = dir.path().join("chevrond.sock");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if sock.exists() {
-                // Also wait a tick for the listener thread to be accepting.
-                std::thread::sleep(std::time::Duration::from_millis(20));
+            if sock.exists()
+                && cmd()
+                    .args(["daemon", "version"])
+                    .env("CHEVRON_SOCKET_DIR", dir.path())
+                    .env("CHEVRON_DAEMON_TIMEOUT_MS", "2000")
+                    .current_dir(dir.path())
+                    .output()
+                    .is_ok_and(|out| out.status.success())
+            {
                 return Self {
                     socket_dir: dir,
                     child: Some(child),
+                    _serial: serial,
                 };
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        // The child is not yet owned by a guard on this path: kill it
+        // before panicking, or the never-bound serve process outlives
+        // the whole test run.
+        let _ = child.kill();
+        let _ = child.wait();
         panic!("daemon failed to bind socket within timeout");
     }
 
     fn socket_dir(&self) -> &std::path::Path {
         self.socket_dir.path()
+    }
+
+    /// A chevron Command pre-wired for this daemon: socket-dir override
+    /// plus a generous socket budget. The client's production budgets
+    /// (10/25 ms, src/daemon/client.rs) are prompt-latency-first and
+    /// deliberately LOSSY under load — the observed flake was healthy
+    /// daemons with events dropped client-side at 48-thread test
+    /// concurrency (the ULID still prints; the publish never landed).
+    /// These tests assert on DELIVERY, so they opt into reliability.
+    fn cmd(&self) -> Command {
+        let mut c = cmd();
+        c.env("CHEVRON_SOCKET_DIR", self.socket_dir());
+        c.env("CHEVRON_DAEMON_TIMEOUT_MS", "2000");
+        c
     }
 }
 
@@ -751,7 +809,8 @@ fn event_lifecycle_publishes_to_daemon_and_persists_row() {
     // file-backed DB compose correctly under real process boundaries.
     let daemon = DaemonGuard::start();
 
-    let start = cmd()
+    let start = daemon
+        .cmd()
         .args([
             "event",
             "cmd-start",
@@ -760,7 +819,6 @@ fn event_lifecycle_publishes_to_daemon_and_persists_row() {
             "cargo",
             "test",
         ])
-        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
         .output()
         .unwrap();
     assert!(start.status.success());
@@ -768,9 +826,9 @@ fn event_lifecycle_publishes_to_daemon_and_persists_row() {
     let id = id.trim().to_string();
     assert_eq!(id.len(), 26);
 
-    cmd()
+    daemon
+        .cmd()
         .args(["event", "cmd-end", &id, "0", "250"])
-        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
         .assert()
         .success();
 
@@ -782,9 +840,15 @@ fn event_lifecycle_publishes_to_daemon_and_persists_row() {
     // the earlier CmdStart and CmdEnd have already been committed.
     // More reliable than a fixed-duration sleep under CI load (the
     // original 50ms wait flaked in the pre-push 5x stress run).
-    cmd()
+    // Run it from the test's own (non-repo) tempdir: inheriting the
+    // test runner's cwd drags the dev checkout (gigabyte target/) into
+    // the daemon's status computations and FS watches.
+    // query_row_eventually still covers the case where a non-repo cwd
+    // shortens the flush.
+    daemon
+        .cmd()
         .arg("git")
-        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
+        .current_dir(daemon.socket_dir())
         .assert()
         .success();
 
@@ -1270,9 +1334,9 @@ fn daemon_version_against_live_daemon_reports_matching_versions() {
     // version dimensions (binary, proto, schema) should agree —
     // and no WARNING lines should appear on stderr.
     let daemon = DaemonGuard::start();
-    let out = cmd()
+    let out = daemon
+        .cmd()
         .args(["daemon", "version"])
-        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
         .env_remove("XDG_RUNTIME_DIR")
         .output()
         .unwrap();
@@ -1343,14 +1407,86 @@ fn capture_help_exits_zero() {
 }
 
 #[test]
+fn capture_publishes_lifecycle_when_daemon_handshake_is_slow() {
+    use chevron::daemon::proto::{self, Request, Response};
+    use std::io::{BufReader, Write as _};
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let listener = UnixListener::bind(dir.path().join("chevrond.sock")).unwrap();
+    let server = std::thread::spawn(move || {
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            let (mut conn, _) = listener.accept().unwrap();
+            if conn.set_read_timeout(Some(Duration::from_secs(5))).is_err() {
+                continue;
+            }
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                proto::decode_request(&line),
+                Ok(Request::Hello(_))
+            ));
+            // A loaded runner can delay scheduling the handler beyond the
+            // shell hook's 25 ms budget. Capture must still publish its row.
+            std::thread::sleep(Duration::from_millis(100));
+            if writeln!(
+                conn,
+                "{}",
+                proto::encode_response(&Response::Hello(proto::PROTO_VERSION))
+            )
+            .is_err()
+            {
+                continue;
+            }
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                continue;
+            }
+            events.push(proto::decode_request(&line).unwrap());
+            let _ = writeln!(conn, "{}", proto::encode_response(&Response::Ack));
+        }
+        events
+    });
+    let out = cmd()
+        .args(["capture", "echo", "slow-daemon"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let events = server.join().unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "capture must publish both lifecycle events"
+    );
+    let Request::CmdStart(start) = &events[0] else {
+        panic!("expected CMD_START")
+    };
+    let Request::CmdEnd(end) = &events[1] else {
+        panic!("expected CMD_END")
+    };
+    assert_eq!(start.id, end.id);
+    assert_eq!(start.cmd, "echo slow-daemon");
+    assert_eq!(end.exit_status, 0);
+    assert!(end.output_bytes.is_some_and(|bytes| bytes > 0));
+}
+
+#[test]
 fn capture_runs_command_and_creates_output_file() {
     // End-to-end: spawn daemon, run `chevron capture echo hi`, verify
     // the output file lands in $SOCKET_DIR/outputs and the DB row
     // records output_bytes.
     let daemon = DaemonGuard::start();
-    let out = cmd()
+    // Hermetic cwd: capture publishes its cwd to the daemon, and the
+    // inherited test-runner cwd (the chevron checkout) drags the dev
+    // repo into the daemon's world — see the lifecycle e2e test.
+    let out = daemon
+        .cmd()
         .args(["capture", "echo", "phase-4-echo-test"])
-        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
+        .current_dir(daemon.socket_dir())
         .env_remove("XDG_RUNTIME_DIR")
         .output()
         .unwrap();
@@ -1362,10 +1498,11 @@ fn capture_runs_command_and_creates_output_file() {
     );
 
     // Flush actor before reading the DB (same trick as Phase 1's
-    // lifecycle e2e test).
-    cmd()
+    // lifecycle e2e test, hermetic cwd for the same reason).
+    daemon
+        .cmd()
         .arg("git")
-        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
+        .current_dir(daemon.socket_dir())
         .assert()
         .success();
 
@@ -1548,25 +1685,59 @@ fn subscribe_receives_git_event_from_real_daemon() {
     init_repo(repo_dir.path());
     let repo_path = repo_dir.path().canonicalize().unwrap();
 
-    // STATUS once to make the daemon discover + watch the repo.
-    // We do this through `chevron git` (which calls status_for_cwd).
-    cmd()
-        .arg("git")
-        .current_dir(&repo_path)
-        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
-        .assert()
-        .success();
+    // Register the watch through an acknowledged STATUS exchange. The CLI
+    // can time out during HELLO after 10 ms and successfully compute inline,
+    // leaving the daemon with no watch no matter how often HEAD is touched.
+    // This test exercises event delivery, so setup must confirm the daemon
+    // actually handled STATUS instead of accepting the CLI fallback.
+    {
+        use chevron::daemon::proto::{self, Request, Response};
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
 
-    // Spawn the subscriber as a child; capture its stdout.
-    let mut sub_child = std::process::Command::cargo_bin("chevron")
-        .unwrap()
-        .arg("subscribe")
-        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+        let mut conn = UnixStream::connect(daemon.socket_dir().join("chevrond.sock")).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        conn.set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(conn.try_clone().unwrap());
+        let mut line = String::new();
+        writeln!(
+            conn,
+            "{}",
+            proto::encode_request(&Request::Hello(proto::PROTO_VERSION))
+        )
         .unwrap();
-    let sub_stdout = sub_child.stdout.take().unwrap();
+        reader.read_line(&mut line).unwrap();
+        assert!(
+            matches!(proto::decode_response(&line), Ok(Response::Hello(v)) if v == proto::PROTO_VERSION)
+        );
+        writeln!(
+            conn,
+            "{}",
+            proto::encode_request(&Request::Status(repo_path.clone()))
+        )
+        .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(matches!(
+            proto::decode_response(&line),
+            Ok(Response::Status(Some(_)))
+        ));
+    }
+
+    // Spawn the subscriber as a child; capture its stdout. Kill-on-drop
+    // so a panicking assert below cannot orphan it.
+    let mut sub_child = KillOnDrop(
+        daemon
+            .cmd()
+            .arg("subscribe")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let sub_stdout = sub_child.0.stdout.take().unwrap();
 
     // Spawn the stdout reader first so no event can slip through the
     // window between firing the trigger and starting to read. It
@@ -1611,8 +1782,7 @@ fn subscribe_receives_git_event_from_real_daemon() {
 
     // Clean up the subscriber. Killing it triggers the daemon's
     // disconnected-subscriber pruning on next broadcast.
-    let _ = sub_child.kill();
-    let _ = sub_child.wait();
+    drop(sub_child);
 }
 
 #[test]
@@ -1627,15 +1797,16 @@ fn subscribe_filters_out_ping_heartbeats() {
     // that). Instead we verify the indirect contract: when no real
     // events fire, the subscriber's stdout stays empty.
     let daemon = DaemonGuard::start();
-    let mut sub_child = std::process::Command::cargo_bin("chevron")
-        .unwrap()
-        .arg("subscribe")
-        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let sub_stdout = sub_child.stdout.take().unwrap();
+    let mut sub_child = KillOnDrop(
+        daemon
+            .cmd()
+            .arg("subscribe")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let sub_stdout = sub_child.0.stdout.take().unwrap();
 
     // 100ms is enough to confirm no immediate spurious output (the
     // daemon's default 60s heartbeat is far longer than this). We're
@@ -1661,6 +1832,5 @@ fn subscribe_filters_out_ping_heartbeats() {
         std::str::from_utf8(&buf[..n]).unwrap_or("<binary>")
     );
 
-    let _ = sub_child.kill();
-    let _ = sub_child.wait();
+    drop(sub_child);
 }
