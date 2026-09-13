@@ -629,6 +629,23 @@ fn run_inner(
     }
 }
 
+fn forward_fs_event(tx: &Sender<StateMsg>, event: notify::Event) {
+    use notify::event::{AccessKind, AccessMode};
+    // Linux reports opens while libgit2 reads the index and refs. Treating
+    // those reads as changes makes every prompt render schedule another one.
+    // Opening for write is not itself a change either; keep the subsequent
+    // modify/close-write events so actual writes still invalidate promptly.
+    if matches!(
+        event.kind,
+        notify::EventKind::Access(
+            AccessKind::Open(_) | AccessKind::Read | AccessKind::Close(AccessMode::Read)
+        )
+    ) {
+        return;
+    }
+    let _ = tx.send(StateMsg::FsEvent(event.paths));
+}
+
 /// Build a `notify` watcher whose events feed back into the state
 /// thread's own channel as [`StateMsg::FsEvent`]. Returns `None` if
 /// watcher construction fails (e.g. inotify resource exhaustion); the
@@ -637,8 +654,7 @@ fn make_watcher(tx: &Sender<StateMsg>) -> Option<RecommendedWatcher> {
     let tx = tx.clone();
     notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
-            // Send error means state thread has shut down; nothing to do.
-            let _ = tx.send(StateMsg::FsEvent(event.paths));
+            forward_fs_event(&tx, event);
         }
     })
     .ok()
@@ -1339,6 +1355,41 @@ mod tests {
 
         tx.send(StateMsg::Shutdown).unwrap();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn watcher_reads_do_not_invalidate_but_writes_still_do() {
+        use notify::event::{AccessKind, AccessMode, DataChange, ModifyKind};
+        use notify::{Event, EventKind};
+        let (tx, rx) = mpsc::channel();
+        let path = PathBuf::from("/repo/.git/HEAD");
+        for kind in [
+            AccessKind::Open(AccessMode::Any),
+            AccessKind::Open(AccessMode::Read),
+            AccessKind::Open(AccessMode::Write),
+            AccessKind::Read,
+            AccessKind::Close(AccessMode::Read),
+        ] {
+            forward_fs_event(
+                &tx,
+                Event::new(EventKind::Access(kind)).add_path(path.clone()),
+            );
+            assert!(
+                matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "read/open event triggered invalidation: {kind:?}"
+            );
+        }
+        for kind in [
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Create(notify::event::CreateKind::Any),
+            EventKind::Remove(notify::event::RemoveKind::Any),
+        ] {
+            forward_fs_event(&tx, Event::new(kind).add_path(path.clone()));
+            assert!(
+                matches!(rx.try_recv(), Ok(StateMsg::FsEvent(paths)) if paths == vec![path.clone()])
+            );
+        }
     }
 
     #[test]
