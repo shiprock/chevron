@@ -211,7 +211,7 @@ impl Config {
     }
 }
 
-fn config_path() -> PathBuf {
+pub(crate) fn config_path() -> PathBuf {
     if let Ok(path) = std::env::var("CHEVRON_CONFIG") {
         return PathBuf::from(path);
     }
