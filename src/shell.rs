@@ -703,13 +703,32 @@ _chevron_live_callback() {
     # daemon coalesces per workdir, but bursts from `git rebase` etc.
     # can still produce a handful within ms of each other. One redraw
     # per 100 ms is plenty for human-perceptible liveness.
+    [[ -n "${_chevron_live_timer_fd:-}" ]] && return
     local now_ms=$(( EPOCHREALTIME * 1000 ))
     now_ms=${now_ms%.*}
     local last_ms=${_chevron_live_last_ms:-0}
     if (( now_ms - last_ms < 100 )); then
+        # Keep one trailing refresh for the burst. Never drop its final state.
+        exec {_chevron_live_timer_fd}< <(sleep 0.1; printf 'ready\n')
+        zle -F "$_chevron_live_timer_fd" _chevron_live_flush
         return
     fi
     _chevron_live_last_ms=$now_ms
+    _chevron_live_render
+}
+_chevron_live_flush() {
+    local fd=$1 token
+    [[ "$fd" == "${_chevron_live_timer_fd:-}" ]] || return
+    IFS= read -r token <&$fd
+    zle -F "$fd" 2>/dev/null
+    { exec {fd}<&- } 2>/dev/null
+    unset _chevron_live_timer_fd
+    [[ "${CHEVRON_LIVE:-0}" == 0 ]] && return
+    local now_ms=$(( EPOCHREALTIME * 1000 ))
+    _chevron_live_last_ms=${now_ms%.*}
+    _chevron_live_render
+}
+_chevron_live_render() {
     # Spawn a background render using the existing async pipeline.
     # The completion callback (_chevron_async_callback) sets PROMPT
     # and calls zle reset-prompt, redrawing the prompt in place.
@@ -721,6 +740,12 @@ _chevron_live_callback() {
 # Re-subscribe only when the physical directory or scope changes. Filtering
 # in the daemon prevents unrelated events from waking this shell at all.
 _chevron_stop_live() {
+    # Cancel a queued redraw on cd, disable, or shell exit.
+    if [[ -n "${_chevron_live_timer_fd:-}" ]]; then
+        zle -F "$_chevron_live_timer_fd" 2>/dev/null
+        { exec {_chevron_live_timer_fd}<&- } 2>/dev/null
+        unset _chevron_live_timer_fd
+    fi
     if [[ -n "${_chevron_live_fd:-}" ]]; then
         zle -F "$_chevron_live_fd" 2>/dev/null
         { exec {_chevron_live_fd}<&- } 2>/dev/null
@@ -2432,7 +2457,7 @@ mod tests {
         // pipeline so we don't duplicate prompt-render logic. It
         // should call _chevron_start_async with stashed exit + duration.
         let out = init_zsh();
-        let cb_start = out.find("_chevron_live_callback() {").unwrap();
+        let cb_start = out.find("_chevron_live_render() {").unwrap();
         let cb_end = out[cb_start..].find("\n}\n").map(|i| cb_start + i).unwrap();
         let body = &out[cb_start..cb_end];
         assert!(
