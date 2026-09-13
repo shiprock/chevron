@@ -21,18 +21,26 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::mpsc::{self, Sender};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use git2::Repository;
 
-use super::proto::{self, Request, Response};
-use super::state::StateMsg;
+use super::proto::{self, EventPayload, Request, Response};
+use super::state::{SUBSCRIBER_CHANNEL_CAP, StateMsg, Subscriber};
 use crate::segments::git::RepoStatus;
 
 /// Per-message timeout on each connection. Generous because clients are
 /// usually local and fast — this is just a guard against a hung peer.
 const CONN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Heartbeat cadence for subscriber-relay connections. The daemon
+/// writes a `PING` line every `HEARTBEAT_INTERVAL` of idle time; the
+/// write failure is what surfaces a dead subscriber to the daemon so
+/// it can prune. 60s caps dead-subscriber cleanup latency without
+/// generating significant wire traffic — one line per minute per
+/// active subscriber.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Read-line buffer cap. Larger inputs are treated as malformed (and the
 /// connection is closed). Real STATUS lines are path-bounded; 8 KiB is
@@ -44,7 +52,9 @@ const MAX_LINE_BYTES: usize = 8 * 1024;
 /// and fall back to inline compute.
 ///
 /// Takes `conn` by value so the socket closes on return.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+// Long but linear: one arm per opcode, no nested control flow. Splitting
+// it would hide the simple "match request, send response" shape.
 pub fn handle_connection(conn: UnixStream, state_tx: &Sender<StateMsg>) {
     let _ = conn.set_read_timeout(Some(CONN_TIMEOUT));
     let _ = conn.set_write_timeout(Some(CONN_TIMEOUT));
@@ -102,6 +112,98 @@ pub fn handle_connection(conn: UnixStream, state_tx: &Sender<StateMsg>) {
                 if send_resp(&conn, &resp).is_err() {
                     return;
                 }
+            }
+            Request::CmdStart(event) => {
+                // Fire-and-forget into the state actor's queue. ACK as
+                // soon as the message is dispatched — durability is
+                // guaranteed only up to the actor's last commit
+                // (synchronous=NORMAL + WAL), which is fine for Phase 1.
+                let _ = state_tx.send(StateMsg::CmdStart(event));
+                if send_resp(&conn, &Response::Ack).is_err() {
+                    return;
+                }
+            }
+            Request::CmdEnd(event) => {
+                let _ = state_tx.send(StateMsg::CmdEnd(event));
+                if send_resp(&conn, &Response::Ack).is_err() {
+                    return;
+                }
+            }
+            Request::Version => {
+                let resp = Response::Version(proto::DaemonVersion {
+                    binary: env!("CARGO_PKG_VERSION").to_string(),
+                    proto: proto::PROTO_VERSION,
+                    schema: crate::daemon::state::CURRENT_SCHEMA_VERSION.to_string(),
+                });
+                if send_resp(&conn, &resp).is_err() {
+                    return;
+                }
+            }
+            Request::Subscribe(spec) => {
+                // Synchronously register with the actor so we ACK only
+                // after subscription is durable — no events lost
+                // between ACK and registration.
+                let (event_tx, event_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAP);
+                let (reply_tx, reply_rx) = mpsc::channel();
+                if state_tx
+                    .send(StateMsg::Subscribe {
+                        subscriber: Subscriber {
+                            sender: event_tx,
+                            cwd_filter: spec.cwd,
+                        },
+                        reply: reply_tx,
+                    })
+                    .is_err()
+                {
+                    let _ = send_resp(&conn, &Response::Err("state thread gone".into()));
+                    return;
+                }
+                if reply_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+                    let _ = send_resp(&conn, &Response::Err("subscribe timed out".into()));
+                    return;
+                }
+                if send_resp(&conn, &Response::Ack).is_err() {
+                    return;
+                }
+                // Clear the per-message read timeout — relay loop
+                // doesn't read from the socket, and we don't want any
+                // residual timeout to confuse future code. Write
+                // timeout stays so a wedged peer can't pin us forever
+                // mid-PING.
+                let _ = conn.set_read_timeout(None);
+                relay_loop(&event_rx, &conn, HEARTBEAT_INTERVAL);
+                return;
+            }
+        }
+    }
+}
+
+/// Subscriber-relay loop. Owns the receiver end of a bounded mailbox
+/// fed by the state actor's `broadcast`. Drains it to the socket as
+/// `EVENT` lines; emits `PING` heartbeats on timeout so a dead peer
+/// surfaces via write failure within `heartbeat` time. Returns on
+/// socket write failure or sender-disconnect (actor shutdown).
+pub fn relay_loop(rx: &Receiver<EventPayload>, conn: &UnixStream, heartbeat: Duration) {
+    loop {
+        match rx.recv_timeout(heartbeat) {
+            Ok(event) => {
+                if send_resp(conn, &Response::Event(event)).is_err() {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+                if send_resp(conn, &Response::Ping(ts)).is_err() {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // State actor pruned us (slow peer + Disconnected
+                // detected on a prior broadcast attempt) or daemon is
+                // shutting down. Either way: drain done, close.
+                return;
             }
         }
     }
@@ -231,7 +333,8 @@ mod tests {
     fn spawn_handler() -> (Client, Sender<StateMsg>, std::thread::JoinHandle<()>) {
         let (a, b) = UnixStream::pair().unwrap();
         a.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let (state_tx, _state_join) = state::spawn(state::TTL).unwrap();
+        let db = state::open_memory_db().unwrap();
+        let (state_tx, _state_join) = state::spawn(state::TTL, db).unwrap();
         let tx_for_handler = state_tx.clone();
         let join = std::thread::spawn(move || handle_connection(b, &tx_for_handler));
         (Client::new(a), state_tx, join)

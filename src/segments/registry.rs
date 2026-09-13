@@ -110,12 +110,14 @@ impl Segment for PathSegment {
         let workdir = git2::Repository::discover(&ctx.pwd)
             .ok()
             .and_then(|r| r.workdir().and_then(|p| p.canonicalize().ok()));
+        let repo_relative = path::resolve_repo_relative(&ctx.config);
         let (text, end_bg) = path::render_with_repo(
             &ctx.home,
             &ctx.pwd,
             ctx.max_dir_size,
             from_bg,
             workdir.as_deref(),
+            repo_relative,
         );
         SegmentOutput { text, end_bg }
     }

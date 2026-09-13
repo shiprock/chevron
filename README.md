@@ -61,6 +61,28 @@ eval "$(chevron init bash)"
 chevron init fish | source
 ```
 
+### Live prompt
+
+On zsh, the prompt updates **between keystrokes** when repository state
+changes — a background `git fetch` lands, a build finishes in another pane,
+a teammate's push arrives — without you pressing Enter. A background
+`chevron subscribe` helper streams events from chevrond over its socket and
+redraws the prompt in place; it reconnects on its own if the daemon
+restarts.
+
+This is **on by default** (it needs the `daemon` feature, which is in the
+default build). Controls:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CHEVRON_LIVE` | `1` | Set `0` to disable the live prompt entirely. |
+| `CHEVRON_LIVE_SCOPE` | `cwd` | `cwd` redraws only for events in the current repo; `all` redraws for every repo's events (e.g. cross-pane awareness). |
+
+The redraw reuses the async render path, so it is safe across PS2
+continuations and transient-prompt collapse. Distro builds without the
+`daemon` feature (e.g. nixpkgs) leave `chevron subscribe` a no-op, so the
+prompt simply renders the usual way.
+
 ### Starship custom modules
 
 ```toml

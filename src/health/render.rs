@@ -57,6 +57,7 @@ fn severity_str(sev: Severity) -> &'static str {
         Severity::Warn => "warn",
         Severity::Critical => "critical",
         Severity::Unknown => "unknown",
+        Severity::Info => "info",
     }
 }
 

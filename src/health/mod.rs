@@ -11,7 +11,9 @@ mod render;
 use crate::config::HealthConfig;
 use crate::sysinfo::SystemInfo;
 
-use check::Check;
+// Re-exported so the doctor subcommand can build its own Check lists without
+// duplicating the type. health owns the Check vocabulary; doctor composes on top.
+pub use check::{Check, Severity};
 
 #[must_use]
 pub fn run(args: &[String]) -> i32 {

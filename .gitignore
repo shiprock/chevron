@@ -6,3 +6,7 @@ result
 # Beads recovery snapshots (the live db is already ignored by .beads/.gitignore;
 # this catches the timestamped *.bak files in .beads/.br_recovery/).
 .beads/.br_recovery/
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db

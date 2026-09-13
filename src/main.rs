@@ -5,7 +5,7 @@ use std::path::Path;
 use chevron::banner;
 #[cfg(feature = "weather")]
 use chevron::weather;
-use chevron::{color, health, repo_status, segments, shell};
+use chevron::{color, configure, doctor, health, repo_status, segments, shell};
 
 #[allow(clippy::too_many_lines)]
 fn main() {
@@ -63,17 +63,43 @@ fn main() {
                 .unwrap_or_default();
             println!("{}", segments::tmux_title::render(&home, &pwd));
         }
-        Some("init") => match args.get(2).map(String::as_str) {
-            Some("zsh") => print!("{}", shell::init_zsh()),
-            Some("bash") => print!("{}", shell::init_bash()),
-            Some("fish") => print!("{}", shell::init_fish()),
-            _ => {
-                eprintln!("Usage: chevron init <zsh|bash|fish>");
-                std::process::exit(1);
+        Some("init") => {
+            // `--instant-prompt` short-circuits config loading — the snippet
+            // is pure shell with no config dependence.
+            if args.get(3).map(String::as_str) == Some("--instant-prompt") {
+                if args.get(2).map(String::as_str) == Some("zsh") {
+                    print!("{}", shell::init_zsh_instant_prompt());
+                } else {
+                    eprintln!("Usage: chevron init zsh --instant-prompt (zsh-only feature)");
+                    std::process::exit(1);
+                }
+            } else {
+                // Read config so the init script's `[shell]` defaults are
+                // baked in. Env vars set before sourcing still win.
+                let cfg = chevron::config::Config::load();
+                match args.get(2).map(String::as_str) {
+                    Some("zsh") => print!("{}", shell::init_zsh_with(&cfg.shell)),
+                    Some("bash") => print!("{}", shell::init_bash_with(&cfg.shell)),
+                    Some("fish") => print!("{}", shell::init_fish_with(&cfg.shell)),
+                    _ => {
+                        eprintln!("Usage: chevron init <zsh|bash|fish>");
+                        std::process::exit(1);
+                    }
+                }
             }
-        },
+        }
         Some("status") => repo_status::run(),
         Some("health") => std::process::exit(health::run(&args[2..])),
+        Some("doctor") => std::process::exit(doctor::run(&args[2..])),
+        Some("configure") => std::process::exit(configure::run(&args[2..])),
+        #[cfg(feature = "daemon")]
+        Some("capture") => std::process::exit(chevron::capture::run(&args[2..])),
+        #[cfg(feature = "daemon")]
+        Some("event") => std::process::exit(chevron::event::run(&args[2..])),
+        #[cfg(feature = "daemon")]
+        Some("history") => std::process::exit(chevron::history::run(&args[2..])),
+        #[cfg(feature = "daemon")]
+        Some("subscribe") => std::process::exit(chevron::subscribe::run(&args[2..])),
         #[cfg(feature = "daemon")]
         Some("daemon") => match args.get(2).map(String::as_str) {
             Some("serve") => {
@@ -87,8 +113,9 @@ fn main() {
             }
             Some("stop") => std::process::exit(chevron::daemon::lifecycle::stop()),
             Some("status") => std::process::exit(chevron::daemon::lifecycle::status()),
+            Some("version") => std::process::exit(chevron::daemon::client::print_version()),
             _ => {
-                eprintln!("Usage: chevron daemon <serve|start|stop|status>");
+                eprintln!("Usage: chevron daemon <serve|start|stop|status|version>");
                 std::process::exit(1);
             }
         },
@@ -116,8 +143,18 @@ fn main() {
                 "init",
                 "status",
                 "health",
+                "doctor",
+                "configure",
                 #[cfg(feature = "daemon")]
                 "daemon",
+                #[cfg(feature = "daemon")]
+                "capture",
+                #[cfg(feature = "daemon")]
+                "event",
+                #[cfg(feature = "daemon")]
+                "history",
+                #[cfg(feature = "daemon")]
+                "subscribe",
                 "version",
                 #[cfg(feature = "banner")]
                 "banner",

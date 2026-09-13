@@ -108,7 +108,7 @@ fn branch_info(repo: &Repository) -> (String, bool) {
     } else {
         repo.head()
             .ok()
-            .and_then(|h| h.shorthand().map(str::to_string))
+            .and_then(|h| h.shorthand().ok().map(str::to_string))
             .unwrap_or_else(|| "HEAD".to_string())
     };
     (branch, detached)
@@ -162,7 +162,7 @@ fn status_counts(repo: &Repository) -> (u32, u32, u32, u32) {
             staged += 1;
         }
         if (s.is_wt_modified() || s.is_wt_deleted() || s.is_wt_typechange())
-            && !(check_filter_attrs && has_filter_attr(repo, entry.path()))
+            && !(check_filter_attrs && has_filter_attr(repo, entry.path().ok()))
         {
             modified += 1;
         }
@@ -183,7 +183,7 @@ fn ahead_behind(repo: &Repository) -> (u32, u32) {
         return (0, 0);
     };
 
-    let Some(branch_name) = head.shorthand() else {
+    let Ok(branch_name) = head.shorthand() else {
         return (0, 0);
     };
 

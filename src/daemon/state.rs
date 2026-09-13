@@ -29,12 +29,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use rusqlite::Connection;
 
+use super::proto::{CmdEndEvent, CmdStartEvent, EventPayload};
 use crate::segments::git::RepoStatus;
 
 /// Cache freshness window. Tight enough that working-tree edits not
@@ -61,6 +63,24 @@ impl CacheEntry {
     }
 }
 
+/// Per-subscriber bounded mailbox depth. Slow subscribers (their
+/// relay thread blocked on socket write because the peer's read end
+/// is wedged) shed events past this cap rather than growing daemon
+/// memory unboundedly. 32 is generous for the prompt-refresh use
+/// case — bursts of FS events from `git rebase` etc. coalesce in
+/// the broadcaster's mind anyway, and a single redraw catches up.
+pub const SUBSCRIBER_CHANNEL_CAP: usize = 32;
+
+/// Per-subscriber registration. `sender` is the actor's end of a
+/// bounded channel; the listener-side relay thread owns the receiver
+/// and writes each message to the socket. `cwd_filter` narrows
+/// broadcasts; `None` means "all events". The id is opaque, just for
+/// debugging logs and the actor's bookkeeping.
+pub struct Subscriber {
+    pub sender: SyncSender<EventPayload>,
+    pub cwd_filter: Option<PathBuf>,
+}
+
 pub enum StateMsg {
     /// Look up a fresh entry. `reply` receives `Some(status)` only when the
     /// entry exists and is within `ttl`; `None` for miss or stale.
@@ -81,6 +101,24 @@ pub enum StateMsg {
     /// that workdir's cache entry. Sent by the notify watcher callback;
     /// also useful for hand-driven tests.
     FsEvent(Vec<PathBuf>),
+    /// Persist a command-started event. Fire-and-forget: the listener
+    /// ACKs the client as soon as the message lands on this channel.
+    /// Phase 1 of chevron-1yn; consumed by the SQLite-backed commands
+    /// table.
+    CmdStart(CmdStartEvent),
+    /// Persist a command-finished event by updating the existing row
+    /// keyed by `id`. Silent no-op if no matching row exists (e.g. the
+    /// daemon was restarted between start and end).
+    CmdEnd(CmdEndEvent),
+    /// Register a Phase 3 subscriber. The actor adds it to the
+    /// broadcast list and replies with its assigned id on `reply` so
+    /// the listener can ACK back to the client only after the
+    /// registration is durable (no events lost between ACK and
+    /// register).
+    Subscribe {
+        subscriber: Subscriber,
+        reply: Sender<u64>,
+    },
     /// Stop the actor. Mainly for tests; production exits via signal.
     Shutdown,
 }
@@ -94,15 +132,32 @@ struct State {
     /// `workdir → last query time`. Drives LRU eviction.
     last_query: HashMap<PathBuf, Instant>,
     watcher: Option<RecommendedWatcher>,
+    /// `SQLite` handle for the commands log (chevron-1yn Phase 1).
+    /// Owned by the state thread so writes serialise naturally and we
+    /// don't need a Mutex. Single-writer `SQLite` has no contention;
+    /// queries against this file (Phase 2's `chevron history`) will
+    /// open separate read-only connections under WAL.
+    db: Connection,
+    /// Phase 3 (chevron-1yn.3): live-prompt subscribers. Each entry
+    /// is one connected `chevron subscribe` helper; the actor pushes
+    /// `EventPayload`s into the channel when state changes, and the
+    /// per-connection relay thread on the listener side drains them
+    /// to its socket. Disconnected channels are pruned lazily on the
+    /// next broadcast attempt.
+    subscribers: HashMap<u64, Subscriber>,
+    next_subscriber_id: u64,
 }
 
 impl State {
-    fn new(watcher: Option<RecommendedWatcher>) -> Self {
+    fn new(watcher: Option<RecommendedWatcher>, db: Connection) -> Self {
         Self {
             cache: HashMap::new(),
             watches: HashMap::new(),
             last_query: HashMap::new(),
             watcher,
+            db,
+            subscribers: HashMap::new(),
+            next_subscriber_id: 1,
         }
     }
 
@@ -134,11 +189,28 @@ impl State {
     }
 
     fn invalidate_for_event_paths(&mut self, paths: &[PathBuf]) {
+        // Coalesce: a single git operation often fires many FS events
+        // (HEAD, refs, index, ORIG_HEAD, …). Collect the distinct
+        // workdirs affected and broadcast once per workdir instead of
+        // once per path. The cache invalidation itself is per-path
+        // (and idempotent) but the subscriber notification benefits
+        // from deduping.
+        let mut affected: Vec<PathBuf> = Vec::new();
         for p in paths {
             if let Some(workdir) = resolve_workdir(&self.watches, p) {
                 let workdir = workdir.clone();
                 self.cache.remove(&workdir);
+                if !affected.contains(&workdir) {
+                    affected.push(workdir);
+                }
             }
+        }
+        for workdir in affected {
+            self.broadcast(&EventPayload {
+                topic: "git".to_string(),
+                cwd: Some(workdir),
+                id: None,
+            });
         }
     }
 
@@ -182,6 +254,116 @@ impl State {
         self.cache.remove(&stale_workdir);
         self.last_query.remove(&stale_workdir);
     }
+
+    fn record_cmd_start(&self, e: &CmdStartEvent) {
+        // INSERT OR IGNORE so a duplicate id (shouldn't happen with
+        // client-side ULIDs but worth guarding against) doesn't error
+        // out the actor. Logging an error here would write to stderr
+        // which the daemon redirects to /dev/null — silent on duplicate
+        // is the only reasonable behaviour.
+        let _ = self.db.execute(
+            "INSERT OR IGNORE INTO commands \
+             (id, session_id, hostname, cwd, cmd, started_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                e.id,
+                e.session_id,
+                e.hostname,
+                e.cwd.to_string_lossy(),
+                e.cmd,
+                e.started_at_ms,
+            ],
+        );
+    }
+
+    fn record_cmd_end(&self, e: &CmdEndEvent) {
+        // UPDATE — silent no-op if no matching id (daemon restarted
+        // between start and end, or end arrived for an event we never
+        // saw). Phase 2's history query just won't see this row's
+        // completion fields; it's still in the table.
+        //
+        // output_bytes and output_truncated default to None on the
+        // wire when the command wasn't wrapped by `chevron capture`.
+        // COALESCE preserves prior values (in case CMD_END is replayed
+        // — currently never happens but the protocol allows it).
+        let _ = self.db.execute(
+            "UPDATE commands SET \
+                finished_at = ?2, \
+                duration_ms = ?3, \
+                exit_status = ?4, \
+                output_bytes = COALESCE(?5, output_bytes), \
+                output_truncated = COALESCE(?6, output_truncated) \
+             WHERE id = ?1",
+            rusqlite::params![
+                e.id,
+                e.finished_at_ms,
+                e.duration_ms,
+                e.exit_status,
+                e.output_bytes,
+                e.output_truncated.map(i64::from),
+            ],
+        );
+    }
+
+    /// Look up the cwd of a recorded command. Used when broadcasting
+    /// `cmd` events because `CmdEndEvent` doesn't carry cwd (it's
+    /// small on purpose — completions are matched to starts by id).
+    /// Returns `None` if the row isn't present, which happens if
+    /// Phase 1's `CmdStart` never landed for this id.
+    fn cmd_cwd(&self, id: &str) -> Option<PathBuf> {
+        self.db
+            .query_row("SELECT cwd FROM commands WHERE id = ?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()
+            .map(PathBuf::from)
+    }
+
+    fn add_subscriber(&mut self, subscriber: Subscriber) -> u64 {
+        let id = self.next_subscriber_id;
+        self.next_subscriber_id = self.next_subscriber_id.wrapping_add(1);
+        self.subscribers.insert(id, subscriber);
+        id
+    }
+
+    /// Broadcast `payload` to subscribers whose `cwd_filter` matches
+    /// (or is None). Lazy-prunes subscribers whose receiver has been
+    /// dropped (relay thread exited because the socket closed). Full
+    /// mailboxes drop the event for that subscriber but keep them
+    /// registered — slow consumers shed events rather than growing
+    /// daemon memory.
+    fn broadcast(&mut self, payload: &EventPayload) {
+        let mut dead: Vec<u64> = Vec::new();
+        for (id, sub) in &self.subscribers {
+            if !subscriber_matches(sub, payload) {
+                continue;
+            }
+            // Full mailbox: slow subscriber; drop this event. Their
+            // next successful delivery still triggers a redraw which
+            // pulls the current state from the cache. So `Ok(())`
+            // and `Err(Full)` are intentionally identical-bodied
+            // here — both mean "this subscriber stays registered".
+            #[allow(clippy::match_same_arms)]
+            match sub.sender.try_send(payload.clone()) {
+                Ok(()) => {}
+                Err(TrySendError::Disconnected(_)) => dead.push(*id),
+                Err(TrySendError::Full(_)) => {}
+            }
+        }
+        for id in dead {
+            self.subscribers.remove(&id);
+        }
+    }
+}
+
+fn subscriber_matches(sub: &Subscriber, payload: &EventPayload) -> bool {
+    match (&sub.cwd_filter, &payload.cwd) {
+        (None, _) => true,
+        (Some(filter), Some(cwd)) => filter == cwd,
+        // Subscriber asked for a specific cwd but this event has no
+        // cwd (rare — cmd events for ids we don't have rows for).
+        (Some(_), None) => false,
+    }
 }
 
 /// Walk `path`'s ancestors looking for a gitdir registered in `watches`.
@@ -198,17 +380,75 @@ fn resolve_workdir<'a>(watches: &'a HashMap<PathBuf, PathBuf>, path: &Path) -> O
     None
 }
 
-/// Drive the actor loop. Owns the cache and watcher for the lifetime of
-/// the call.
+/// Directories under `workdir` to watch for working-tree liveness
+/// (chevron-95q). A gitignore-aware walk that skips `.git` and any directory
+/// libgit2 reports ignored (`node_modules/`, `target/`, …) so a worktree
+/// watch doesn't blow `fs.inotify.max_user_watches` on big trees — the hard
+/// part the feature is named for.
+///
+/// Returns `None` (→ watch the gitdir only, fall back to the TTL for
+/// working-tree edits) when the repo can't be opened or the non-ignored
+/// directory count exceeds `limit`. The returned set always includes
+/// `workdir` itself; callers watch each entry NON-recursively and resolve
+/// events back to `workdir` via its root key in the watch map.
+///
+/// This is the gitignore-filtering primitive for the worktree watch; the
+/// wiring into `register_watch`/`evict_lru` (with the watch budget and
+/// unwatch-on-eviction bookkeeping) is tracked on chevron-95q.
+#[must_use]
+pub fn worktree_watch_dirs(workdir: &Path, limit: usize) -> Option<Vec<PathBuf>> {
+    let repo = git2::Repository::open(workdir).ok()?;
+    let dotgit = std::ffi::OsStr::new(".git");
+    let mut dirs = vec![workdir.to_path_buf()];
+    let mut stack = vec![workdir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // `file_type` does not follow symlinks, so a symlinked directory
+            // reads as a non-dir and is skipped — no watch, no walk cycles.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+            if path.file_name() == Some(dotgit) {
+                continue;
+            }
+            // is_path_ignored wants a workdir-relative path. A path that
+            // can't be made relative isn't under the worktree — skip it.
+            let Ok(rel) = path.strip_prefix(workdir) else {
+                continue;
+            };
+            if repo.is_path_ignored(rel).unwrap_or(false) {
+                continue;
+            }
+            dirs.push(path.clone());
+            stack.push(path);
+            if dirs.len() > limit {
+                return None;
+            }
+        }
+    }
+    Some(dirs)
+}
+
+/// Drive the actor loop. Owns the cache, watcher, and `SQLite` handle
+/// for the lifetime of the call.
 #[allow(clippy::needless_pass_by_value)]
-pub fn run(rx: Receiver<StateMsg>, tx: Sender<StateMsg>, ttl: Duration) {
+pub fn run(rx: Receiver<StateMsg>, tx: Sender<StateMsg>, ttl: Duration, db: Connection) {
     let watcher = make_watcher(&tx);
-    run_inner(rx, watcher, ttl);
+    run_inner(rx, watcher, ttl, db);
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_inner(rx: Receiver<StateMsg>, watcher: Option<RecommendedWatcher>, ttl: Duration) {
-    let mut state = State::new(watcher);
+fn run_inner(
+    rx: Receiver<StateMsg>,
+    watcher: Option<RecommendedWatcher>,
+    ttl: Duration,
+    db: Connection,
+) {
+    let mut state = State::new(watcher, db);
 
     while let Ok(msg) = rx.recv() {
         match msg {
@@ -226,6 +466,31 @@ fn run_inner(rx: Receiver<StateMsg>, watcher: Option<RecommendedWatcher>, ttl: D
             }
             StateMsg::FsEvent(paths) => {
                 state.invalidate_for_event_paths(&paths);
+            }
+            StateMsg::CmdStart(e) => state.record_cmd_start(&e),
+            StateMsg::CmdEnd(e) => {
+                // Persist first so the broadcast's cmd_cwd() lookup
+                // sees the row. CmdEnd-without-prior-CmdStart already
+                // no-ops in record_cmd_end; we still emit the event
+                // with the id (cwd will be None) so subscribers can
+                // act on the signal even if persistence races. The
+                // shell-prompt subscriber only cares about the signal
+                // itself anyway.
+                state.record_cmd_end(&e);
+                let cwd = state.cmd_cwd(&e.id);
+                state.broadcast(&EventPayload {
+                    topic: "cmd".to_string(),
+                    cwd,
+                    id: Some(e.id),
+                });
+            }
+            StateMsg::Subscribe { subscriber, reply } => {
+                let id = state.add_subscriber(subscriber);
+                // Confirm registration *before* the listener ACKs the
+                // client. If reply fails (peer gone), the subscriber
+                // is harmlessly left in the map until the next
+                // broadcast prunes it as Disconnected.
+                let _ = reply.send(id);
             }
             StateMsg::Shutdown => break,
         }
@@ -248,32 +513,145 @@ fn make_watcher(tx: &Sender<StateMsg>) -> Option<RecommendedWatcher> {
 }
 
 /// Spawn the state actor on a named thread. Returns the channel sender plus a
-/// join handle.
+/// join handle. The actor takes ownership of `db` for its lifetime.
 ///
 /// # Errors
 ///
 /// Returns the [`io::Error`](std::io::Error) from `thread::Builder::spawn`
 /// only if the OS can't create a thread (resource exhaustion).
-pub fn spawn(ttl: Duration) -> std::io::Result<(Sender<StateMsg>, JoinHandle<()>)> {
+pub fn spawn(ttl: Duration, db: Connection) -> std::io::Result<(Sender<StateMsg>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel();
     let tx_for_run = tx.clone();
     let handle = std::thread::Builder::new()
         .name("chevrond-state".into())
-        .spawn(move || run(rx, tx_for_run, ttl))?;
+        .spawn(move || run(rx, tx_for_run, ttl, db))?;
     Ok((tx, handle))
 }
 
-/// Test-only: spawn the actor without a real `notify` watcher. Logical
-/// watch tracking still happens (so LRU and `FsEvent` invalidation can
-/// be exercised) but no actual `notify` resources are created.
+/// Open the commands database at `dir/commands.db`, apply the schema,
+/// and return a write-mode connection. WAL + `synchronous=NORMAL`
+/// keeps per-event writes well under a millisecond on SSD while still
+/// letting concurrent readers (Phase 2's `chevron history`) see
+/// committed rows.
+///
+/// # Errors
+///
+/// Returns the underlying [`rusqlite::Error`] if the directory isn't
+/// writable, the file is corrupt, or the schema-application fails.
+pub fn open_db(dir: &Path) -> rusqlite::Result<Connection> {
+    let path = dir.join("commands.db");
+    let conn = Connection::open(&path)?;
+    apply_schema(&conn)?;
+    Ok(conn)
+}
+
+/// Test-only counterpart to [`open_db`] that opens an in-memory DB. The
+/// resulting connection is only usable from the thread that holds it,
+/// which matches the state actor's ownership model.
+///
+/// # Errors
+///
+/// Returns the underlying [`rusqlite::Error`] if the in-memory DB
+/// can't be initialised — should be impossible in practice but the
+/// signature matches [`open_db`] for symmetry.
 #[cfg(test)]
-fn spawn_no_watcher(ttl: Duration) -> (Sender<StateMsg>, JoinHandle<()>) {
+pub fn open_memory_db() -> rusqlite::Result<Connection> {
+    let conn = Connection::open_in_memory()?;
+    apply_schema(&conn)?;
+    Ok(conn)
+}
+
+/// Current commands-db schema version. Bumped whenever the on-disk
+/// shape changes incompatibly enough that older history-CLI builds
+/// might misinterpret rows. v1 → v2 added Phase 4 output-capture
+/// columns; the migration is metadata-only (ALTER TABLE ADD COLUMN
+/// with defaults) so existing rows preserve their original meaning.
+pub const CURRENT_SCHEMA_VERSION: &str = "2";
+
+fn apply_schema(conn: &Connection) -> rusqlite::Result<()> {
+    // WAL gives concurrent readers + one writer with no journal-file
+    // contention; synchronous=NORMAL gives durability up to the last
+    // checkpoint, which is fine for command history (a crash losing the
+    // last few seconds of commands is acceptable; corruption is not).
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '1');
+
+        CREATE TABLE IF NOT EXISTS commands (
+            id           TEXT PRIMARY KEY,
+            session_id   TEXT NOT NULL,
+            hostname     TEXT NOT NULL,
+            cwd          TEXT NOT NULL,
+            cmd          TEXT NOT NULL,
+            started_at   INTEGER NOT NULL,
+            finished_at  INTEGER,
+            duration_ms  INTEGER,
+            exit_status  INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_commands_cwd          ON commands(cwd);
+        CREATE INDEX IF NOT EXISTS idx_commands_started_at   ON commands(started_at);
+        CREATE INDEX IF NOT EXISTS idx_commands_exit_status  ON commands(exit_status);",
+    )?;
+    migrate_v1_to_v2(conn)?;
+    Ok(())
+}
+
+/// Add the Phase 4 output-capture columns and bump `schema_version`
+/// to `'2'`. Idempotent — re-running on a v2 DB is a no-op because
+/// we detect the stored version FIRST rather than try/catch the
+/// `ALTER TABLE` statements (older `rusqlite` versions surface
+/// column-already-exists as a `SqliteFailure` that's awkward to
+/// filter cleanly).
+fn migrate_v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
+    let version: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "1".to_string());
+    if version == CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+    // SQLite ALTER TABLE ADD COLUMN is metadata-only (no table
+    // rewrite) so this is fast even on large commands tables.
+    // `output_bytes` is NULL for rows captured pre-Phase-4 or
+    // commands run without `chcap` — meaning "no output captured".
+    // `output_truncated` defaults to 0 (i.e. "not truncated") so
+    // existing rows have well-defined values for the new column.
+    conn.execute_batch(
+        "ALTER TABLE commands ADD COLUMN output_bytes INTEGER;
+         ALTER TABLE commands ADD COLUMN output_truncated INTEGER NOT NULL DEFAULT 0;
+         UPDATE meta SET value = '2' WHERE key = 'schema_version';",
+    )?;
+    Ok(())
+}
+
+/// Spawn the state actor WITHOUT a real `notify` watcher. Logical watch
+/// tracking still happens (so LRU eviction and [`StateMsg::FsEvent`]
+/// invalidation work), but no `notify` resources are created — the caller
+/// drives invalidation by sending `FsEvent` itself. Used by unit tests and
+/// by the daemon-backed e2e harness, where injecting every event keeps the
+/// event → redraw timing deterministic instead of racing real FS events.
+///
+/// # Errors
+///
+/// Returns an error if the state-actor thread fails to spawn.
+pub fn spawn_no_watcher(
+    ttl: Duration,
+    db: Connection,
+) -> std::io::Result<(Sender<StateMsg>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel();
     let handle = std::thread::Builder::new()
-        .name("chevrond-state-test".into())
-        .spawn(move || run_inner(rx, None, ttl))
-        .unwrap();
-    (tx, handle)
+        .name("chevrond-state-unwatched".into())
+        .spawn(move || run_inner(rx, None, ttl, db))?;
+    Ok((tx, handle))
 }
 
 #[cfg(test)]
@@ -335,7 +713,7 @@ mod tests {
 
     #[test]
     fn get_miss_returns_none() {
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
         assert!(query(&tx, PathBuf::from("/nonexistent")).is_none());
         tx.send(StateMsg::Shutdown).unwrap();
         handle.join().unwrap();
@@ -343,7 +721,7 @@ mod tests {
 
     #[test]
     fn insert_then_get_returns_fresh() {
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
         let workdir = PathBuf::from("/repo");
         let git_dir = workdir.join(".git");
         insert(&tx, &workdir, &git_dir, "master");
@@ -356,7 +734,7 @@ mod tests {
     #[test]
     fn stale_entry_returns_none() {
         // TTL = 50 ms, entry timestamped 500 ms ago → expired.
-        let (tx, handle) = spawn(Duration::from_millis(50)).unwrap();
+        let (tx, handle) = spawn(Duration::from_millis(50), open_memory_db().unwrap()).unwrap();
         let workdir = PathBuf::from("/repo");
         tx.send(StateMsg::Insert {
             workdir: workdir.clone(),
@@ -372,7 +750,7 @@ mod tests {
 
     #[test]
     fn insert_overwrites_previous_entry() {
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
         let workdir = PathBuf::from("/repo");
         let git_dir = workdir.join(".git");
         insert(&tx, &workdir, &git_dir, "old");
@@ -385,7 +763,7 @@ mod tests {
 
     #[test]
     fn multiple_workdirs_independent() {
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
         let a = PathBuf::from("/a");
         let b = PathBuf::from("/b");
         insert(&tx, &a, &a.join(".git"), "branch-a");
@@ -400,7 +778,7 @@ mod tests {
     fn shutdown_drains_pending_messages() {
         // Messages queued before Shutdown should still be processed in
         // FIFO order. We rely on this for deterministic test cleanup.
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
         let workdir = PathBuf::from("/repo");
         let git_dir = workdir.join(".git");
         insert(&tx, &workdir, &git_dir, "master");
@@ -421,7 +799,7 @@ mod tests {
         // If the handler thread gives up before the reply lands, the state
         // thread's `reply.send(...)` returns Err — but the actor must keep
         // processing subsequent messages.
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
         let (reply_tx, reply_rx) = mpsc::channel();
         drop(reply_rx);
         tx.send(StateMsg::Get {
@@ -441,15 +819,17 @@ mod tests {
 
     #[test]
     fn fs_event_invalidates_matching_workdir() {
-        // Drive an Insert via a real .git tempdir so the state thread can
-        // actually register a watch; then synthesise an FsEvent for a
-        // child of that gitdir and verify the cache entry is dropped.
+        // We synthesise FsEvents via tx.send() rather than relying on
+        // the real notify watcher, so spawn_no_watcher is sufficient
+        // — and avoids the FSEventStream init latency on macOS that
+        // can push the test past its recv_timeout budget under
+        // parallel test stress.
         let tmp = tempfile::TempDir::new().unwrap();
         let workdir = tmp.path().to_path_buf();
         let git_dir = workdir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
 
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
         insert(&tx, &workdir, &git_dir, "master");
         assert!(query(&tx, workdir.clone()).is_some());
 
@@ -468,13 +848,14 @@ mod tests {
     #[test]
     fn fs_event_for_unrelated_path_is_ignored() {
         // FS event for a path nowhere near a registered gitdir must not
-        // disturb existing cache entries.
+        // disturb existing cache entries. spawn_no_watcher avoids
+        // FSEventStream init latency (see fs_event_invalidates_matching_workdir).
         let tmp = tempfile::TempDir::new().unwrap();
         let workdir = tmp.path().to_path_buf();
         let git_dir = workdir.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
 
-        let (tx, handle) = spawn(test_ttl()).unwrap();
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
         insert(&tx, &workdir, &git_dir, "master");
 
         tx.send(StateMsg::FsEvent(vec![PathBuf::from("/var/log/something")]))
@@ -514,6 +895,431 @@ mod tests {
         assert_eq!(resolve_workdir(&watches, Path::new("/r/src/main.rs")), None);
     }
 
+    // ── Phase 1 (chevron-1yn.1): command lifecycle persistence ───────────
+
+    fn fixture_cmd_start(id: &str) -> CmdStartEvent {
+        CmdStartEvent {
+            id: id.to_string(),
+            session_id: "sess-abc".to_string(),
+            hostname: "matt-mbp".to_string(),
+            cwd: PathBuf::from("/Users/mim/src/chevron"),
+            cmd: "cargo test".to_string(),
+            started_at_ms: 1_000,
+        }
+    }
+
+    fn fixture_cmd_end(id: &str) -> CmdEndEvent {
+        CmdEndEvent {
+            id: id.to_string(),
+            finished_at_ms: 2_500,
+            duration_ms: 1_500,
+            exit_status: 0,
+            output_bytes: None,
+            output_truncated: None,
+        }
+    }
+
+    /// Drain by sending Shutdown and joining the thread, which releases
+    /// the actor's owned connection so a fresh reader can open the file
+    /// without write-lock contention.
+    fn drain(tx: &Sender<StateMsg>, handle: JoinHandle<()>) {
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn cmd_start_inserts_row_with_pending_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = open_db(tmp.path()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), db).unwrap();
+        tx.send(StateMsg::CmdStart(fixture_cmd_start("id-1")))
+            .unwrap();
+        drain(&tx, handle);
+
+        let conn = Connection::open(tmp.path().join("commands.db")).unwrap();
+        let (cmd, started_at, finished_at, exit_status): (String, i64, Option<i64>, Option<i64>) =
+            conn.query_row(
+                "SELECT cmd, started_at, finished_at, exit_status FROM commands WHERE id = ?1",
+                ["id-1"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(cmd, "cargo test");
+        assert_eq!(started_at, 1_000);
+        // Completion columns must be NULL until CmdEnd lands.
+        assert!(finished_at.is_none());
+        assert!(exit_status.is_none());
+    }
+
+    #[test]
+    fn cmd_end_fills_completion_columns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = open_db(tmp.path()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), db).unwrap();
+        tx.send(StateMsg::CmdStart(fixture_cmd_start("id-2")))
+            .unwrap();
+        tx.send(StateMsg::CmdEnd(fixture_cmd_end("id-2"))).unwrap();
+        drain(&tx, handle);
+
+        let conn = Connection::open(tmp.path().join("commands.db")).unwrap();
+        let (finished_at, duration_ms, exit_status): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT finished_at, duration_ms, exit_status FROM commands WHERE id = ?1",
+                ["id-2"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(finished_at, 2_500);
+        assert_eq!(duration_ms, 1_500);
+        assert_eq!(exit_status, 0);
+    }
+
+    #[test]
+    fn cmd_end_without_start_is_silent_noop() {
+        // A CmdEnd referencing an unknown id (daemon restarted between
+        // start and end, or the start was opt-ed-out via leading space)
+        // must not error the actor or insert a partial row.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = open_db(tmp.path()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), db).unwrap();
+        tx.send(StateMsg::CmdEnd(fixture_cmd_end("orphan")))
+            .unwrap();
+        // The actor should still be alive for follow-up traffic.
+        tx.send(StateMsg::CmdStart(fixture_cmd_start("id-3")))
+            .unwrap();
+        drain(&tx, handle);
+
+        let conn = Connection::open(tmp.path().join("commands.db")).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "only the successful CmdStart should have a row");
+        let has_orphan: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM commands WHERE id = ?1",
+                ["orphan"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_orphan, 0);
+    }
+
+    #[test]
+    fn duplicate_cmd_start_ignores_second_insert() {
+        // Client-side ULIDs shouldn't repeat, but if they do (e.g. test
+        // fixture replay), the second insert must be a no-op rather
+        // than blowing up the actor with a UNIQUE constraint error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = open_db(tmp.path()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), db).unwrap();
+        tx.send(StateMsg::CmdStart(fixture_cmd_start("dup")))
+            .unwrap();
+        let mut second = fixture_cmd_start("dup");
+        second.cmd = "second insert wins? (no)".to_string();
+        tx.send(StateMsg::CmdStart(second)).unwrap();
+        drain(&tx, handle);
+
+        let conn = Connection::open(tmp.path().join("commands.db")).unwrap();
+        let cmd: String = conn
+            .query_row("SELECT cmd FROM commands WHERE id = ?1", ["dup"], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        // INSERT OR IGNORE keeps the first one.
+        assert_eq!(cmd, "cargo test");
+    }
+
+    #[test]
+    fn open_db_seeds_schema_version_and_is_idempotent() {
+        // Opening twice on the same dir must succeed (CREATE TABLE IF
+        // NOT EXISTS + INSERT OR IGNORE keep things deterministic) and
+        // the schema_version row must read back as the current version.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _ = open_db(tmp.path()).unwrap();
+        let conn = open_db(tmp.path()).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_adds_output_columns_and_preserves_rows() {
+        // Hand-craft a v1-shaped DB with one row, then call open_db.
+        // After migration: schema_version bumps to '2', the row still
+        // exists, and the new columns are queryable with sensible
+        // defaults (NULL for output_bytes, 0 for output_truncated).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("commands.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta(key, value) VALUES('schema_version', '1');
+                 CREATE TABLE commands (
+                     id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                     hostname TEXT NOT NULL, cwd TEXT NOT NULL, cmd TEXT NOT NULL,
+                     started_at INTEGER NOT NULL, finished_at INTEGER,
+                     duration_ms INTEGER, exit_status INTEGER);
+                 INSERT INTO commands(id, session_id, hostname, cwd, cmd, started_at)
+                     VALUES('legacy-1', 's', 'h', '/', 'echo hi', 100);",
+            )
+            .unwrap();
+        }
+
+        // Open via the production path — triggers the migration.
+        let conn = open_db(tmp.path()).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2");
+
+        let (cmd, output_bytes, output_truncated): (String, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT cmd, output_bytes, output_truncated FROM commands WHERE id = ?1",
+                ["legacy-1"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(cmd, "echo hi");
+        assert!(
+            output_bytes.is_none(),
+            "legacy row should have NULL output_bytes"
+        );
+        assert_eq!(output_truncated, 0);
+    }
+
+    #[test]
+    fn migrate_idempotent_on_v2_db() {
+        // Opening a v2 DB twice should be a no-op the second time.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _ = open_db(tmp.path()).unwrap();
+        // Second open should not fail (the ALTER TABLE would error on
+        // a re-add but we short-circuit on version match).
+        let conn = open_db(tmp.path()).unwrap();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "2");
+    }
+
+    // ── Phase 3 (chevron-1yn.3): subscriber broadcast ───────────────────
+
+    fn subscribe(tx: &Sender<StateMsg>) -> (Receiver<EventPayload>, u64) {
+        let (event_tx, event_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAP);
+        subscribe_with(
+            tx,
+            Subscriber {
+                sender: event_tx,
+                cwd_filter: None,
+            },
+        )
+        .map(|id| (event_rx, id))
+        .unwrap()
+    }
+
+    fn subscribe_with(tx: &Sender<StateMsg>, subscriber: Subscriber) -> Result<u64, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(StateMsg::Subscribe {
+            subscriber,
+            reply: reply_tx,
+        })
+        .map_err(|e| e.to_string())?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn subscribe_returns_distinct_ids() {
+        let (tx, handle) = spawn(test_ttl(), open_memory_db().unwrap()).unwrap();
+        let (_rx1, id1) = subscribe(&tx);
+        let (_rx2, id2) = subscribe(&tx);
+        assert_ne!(id1, id2);
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fs_event_broadcasts_to_subscribers() {
+        // Drive an Insert to register the workdir in the watches
+        // map; spawn_no_watcher's logical-watch tracking is enough
+        // since we synthesise the FsEvent ourselves.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let git_dir = workdir.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
+        insert(&tx, &workdir, &git_dir, "master");
+        let (event_rx, _id) = subscribe(&tx);
+
+        tx.send(StateMsg::FsEvent(vec![git_dir.join("HEAD")]))
+            .unwrap();
+
+        let event = event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("expected a broadcast event");
+        assert_eq!(event.topic, "git");
+        assert_eq!(event.cwd, Some(workdir));
+
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fs_event_coalesces_multiple_paths_per_workdir() {
+        // A real git operation fires N events per logical change
+        // (HEAD, refs, index, …). The broadcaster should emit ONE
+        // event per affected workdir, not N. We synthesise the
+        // events via tx.send() so spawn_no_watcher is sufficient.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let git_dir = workdir.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
+        insert(&tx, &workdir, &git_dir, "master");
+        let (event_rx, _id) = subscribe(&tx);
+
+        tx.send(StateMsg::FsEvent(vec![
+            git_dir.join("HEAD"),
+            git_dir.join("index"),
+            git_dir.join("refs/heads/master"),
+        ]))
+        .unwrap();
+
+        // Exactly one event.
+        let first = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(first.topic, "git");
+        let second = event_rx.recv_timeout(Duration::from_millis(100));
+        assert!(second.is_err(), "expected coalescing but got: {second:?}");
+
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn subscriber_cwd_filter_skips_other_workdirs() {
+        // spawn_no_watcher to avoid FSEventStream init latency
+        // (synthetic FsEvents drive this test).
+        let tmp_a = tempfile::TempDir::new().unwrap();
+        let tmp_b = tempfile::TempDir::new().unwrap();
+        let workdir_a = tmp_a.path().to_path_buf();
+        let workdir_b = tmp_b.path().to_path_buf();
+        let git_a = workdir_a.join(".git");
+        let git_b = workdir_b.join(".git");
+        std::fs::create_dir_all(&git_a).unwrap();
+        std::fs::create_dir_all(&git_b).unwrap();
+
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
+        insert(&tx, &workdir_a, &git_a, "master");
+        insert(&tx, &workdir_b, &git_b, "master");
+
+        let (event_tx, event_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAP);
+        let _id = subscribe_with(
+            &tx,
+            Subscriber {
+                sender: event_tx,
+                cwd_filter: Some(workdir_a.clone()),
+            },
+        )
+        .unwrap();
+
+        // Event for B should be filtered out.
+        tx.send(StateMsg::FsEvent(vec![git_b.join("HEAD")]))
+            .unwrap();
+        let no_event = event_rx.recv_timeout(Duration::from_millis(200));
+        assert!(no_event.is_err(), "got unexpected: {no_event:?}");
+
+        // Event for A should reach the subscriber.
+        tx.send(StateMsg::FsEvent(vec![git_a.join("HEAD")]))
+            .unwrap();
+        let event = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event.cwd, Some(workdir_a));
+
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn disconnected_subscriber_pruned_on_next_broadcast() {
+        // spawn_no_watcher: synthetic FsEvent.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let git_dir = workdir.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
+        insert(&tx, &workdir, &git_dir, "master");
+
+        let (event_tx, event_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAP);
+        let _id = subscribe_with(
+            &tx,
+            Subscriber {
+                sender: event_tx,
+                cwd_filter: None,
+            },
+        )
+        .unwrap();
+        // Drop the receiver — actor's next try_send fails with Disconnected.
+        drop(event_rx);
+
+        // First broadcast surfaces Disconnected and prunes. Second
+        // would no longer reach this subscriber. We can't easily
+        // observe pruning from outside the actor, but we can verify
+        // a fresh subscription works after the dead one churned.
+        tx.send(StateMsg::FsEvent(vec![git_dir.join("HEAD")]))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let (event_rx2, _) = subscribe(&tx);
+        tx.send(StateMsg::FsEvent(vec![git_dir.join("HEAD")]))
+            .unwrap();
+        let event = event_rx2.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event.topic, "git");
+
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn cmd_end_broadcasts_cmd_event_with_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = open_db(tmp.path()).unwrap();
+        let (tx, handle) = spawn(test_ttl(), db).unwrap();
+
+        let (event_rx, _) = subscribe(&tx);
+
+        // Start then end a command; verify a cmd event lands with the
+        // cwd we recorded at start.
+        tx.send(StateMsg::CmdStart(fixture_cmd_start("cmd-evt-1")))
+            .unwrap();
+        tx.send(StateMsg::CmdEnd(fixture_cmd_end("cmd-evt-1")))
+            .unwrap();
+
+        // Drain: the CmdStart triggers no broadcast; the CmdEnd does.
+        let event = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event.topic, "cmd");
+        assert_eq!(event.id.as_deref(), Some("cmd-evt-1"));
+        assert!(event.cwd.is_some());
+
+        tx.send(StateMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
     #[test]
     fn lru_eviction_at_cap() {
         // Use `spawn_no_watcher` to avoid creating 65 real `notify`
@@ -521,7 +1327,7 @@ mod tests {
         // makes the test multi-second. Logical watch tracking still
         // happens via the unconditional `watches` insert, so LRU is
         // exercised. Use throwaway PathBufs (no real dirs needed).
-        let (tx, handle) = spawn_no_watcher(test_ttl());
+        let (tx, handle) = spawn_no_watcher(test_ttl(), open_memory_db().unwrap()).unwrap();
         let workdirs: Vec<PathBuf> = (0..=MAX_WATCHES)
             .map(|i| PathBuf::from(format!("/tmp/lru-test-{i}")))
             .collect();
@@ -537,5 +1343,66 @@ mod tests {
 
         tx.send(StateMsg::Shutdown).unwrap();
         handle.join().unwrap();
+    }
+
+    // ── chevron-95q: gitignore-filtered worktree enumerator ──────────────
+
+    #[test]
+    fn worktree_watch_dirs_skips_dotgit_and_gitignored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        crate::segments::testutil::init_repo(root);
+        std::fs::write(root.join(".gitignore"), "node_modules/\ntarget/\n").unwrap();
+        std::fs::create_dir_all(root.join("src").join("inner")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules").join("pkg")).unwrap();
+        std::fs::create_dir_all(root.join("target").join("debug")).unwrap();
+
+        let dirs = worktree_watch_dirs(root, 1000).unwrap();
+        let names: Vec<String> = dirs
+            .iter()
+            .map(|d| d.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            dirs.contains(&root.to_path_buf()),
+            "must include the worktree root: {names:?}"
+        );
+        assert!(
+            dirs.iter().any(|d| d.ends_with("src")),
+            "must include src: {names:?}"
+        );
+        assert!(
+            dirs.iter().any(|d| d.ends_with("src/inner")),
+            "must descend into src/inner: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("node_modules")),
+            "gitignored node_modules must be skipped: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("target")),
+            "gitignored target must be skipped: {names:?}"
+        );
+        assert!(
+            !dirs.iter().any(|d| d.ends_with(".git")),
+            ".git must be skipped: {names:?}"
+        );
+    }
+
+    #[test]
+    fn worktree_watch_dirs_bails_over_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        crate::segments::testutil::init_repo(root);
+        for i in 0..10 {
+            std::fs::create_dir_all(root.join(format!("d{i}"))).unwrap();
+        }
+        // 10 dirs + root exceeds the limit → bail (gitdir-only fallback).
+        assert!(worktree_watch_dirs(root, 5).is_none());
+    }
+
+    #[test]
+    fn worktree_watch_dirs_none_when_not_a_repo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(worktree_watch_dirs(tmp.path(), 1000).is_none());
     }
 }
