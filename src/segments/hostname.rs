@@ -28,9 +28,7 @@ pub fn render_with(from_bg: Option<u8>) -> (String, Option<u8>) {
         return (String::new(), from_bg);
     }
 
-    let is_ssh = std::env::var("SSH_CONNECTION")
-        .ok()
-        .is_some_and(|v| !v.is_empty());
+    let is_ssh = std::env::var("SSH_CONNECTION").is_ok_and(|v| !v.is_empty());
 
     let mut out = String::with_capacity(128);
 
