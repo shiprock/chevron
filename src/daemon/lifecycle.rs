@@ -48,7 +48,7 @@ fn request_shutdown() {
         // SAFETY: write(2) is async-signal-safe; the fd is a live pipe
         // write end (O_NONBLOCK, so a full pipe can't block a handler).
         unsafe {
-            let _ = libc::write(fd, [b'x'].as_ptr().cast(), 1);
+            let _ = libc::write(fd, b"x".as_ptr().cast(), 1);
         }
     }
 }
