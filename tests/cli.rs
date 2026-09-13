@@ -1616,14 +1616,46 @@ fn subscribe_receives_git_event_from_real_daemon() {
     init_repo(repo_dir.path());
     let repo_path = repo_dir.path().canonicalize().unwrap();
 
-    // STATUS once to make the daemon discover + watch the repo.
-    // We do this through `chevron git` (which calls status_for_cwd).
-    cmd()
-        .arg("git")
-        .current_dir(&repo_path)
-        .env("CHEVRON_SOCKET_DIR", daemon.socket_dir())
-        .assert()
-        .success();
+    // Register the watch through an acknowledged STATUS exchange. The CLI
+    // can time out during HELLO after 10 ms and successfully compute inline,
+    // leaving the daemon with no watch no matter how often HEAD is touched.
+    // This test exercises event delivery, so setup must confirm the daemon
+    // actually handled STATUS instead of accepting the CLI fallback.
+    {
+        use chevron::daemon::proto::{self, Request, Response};
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let mut conn = UnixStream::connect(daemon.socket_dir().join("chevrond.sock")).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        conn.set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(conn.try_clone().unwrap());
+        let mut line = String::new();
+        writeln!(
+            conn,
+            "{}",
+            proto::encode_request(&Request::Hello(proto::PROTO_VERSION))
+        )
+        .unwrap();
+        reader.read_line(&mut line).unwrap();
+        assert!(
+            matches!(proto::decode_response(&line), Ok(Response::Hello(v)) if v == proto::PROTO_VERSION)
+        );
+        writeln!(
+            conn,
+            "{}",
+            proto::encode_request(&Request::Status(repo_path.clone()))
+        )
+        .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(matches!(
+            proto::decode_response(&line),
+            Ok(Response::Status(Some(_)))
+        ));
+    }
 
     // Spawn the subscriber as a child; capture its stdout.
     let mut sub_child = std::process::Command::cargo_bin("chevron")
