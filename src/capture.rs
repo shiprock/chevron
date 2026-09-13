@@ -60,7 +60,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::daemon::{client, paths, proto};
 
@@ -237,8 +237,13 @@ fn run_pty(
         .open(output_path)?;
 
     // 7. Run the poll loop.
-    let (bytes_written, truncated) =
-        pty_io_loop(master_fd, winch_r.as_raw_fd(), output_file, max_bytes)?;
+    let (bytes_written, truncated) = pty_io_loop(
+        master_fd,
+        winch_r.as_raw_fd(),
+        libc::STDOUT_FILENO,
+        output_file,
+        max_bytes,
+    )?;
 
     // 8. Reap the child.
     let status = child.wait()?;
@@ -279,6 +284,7 @@ fn run_pty(
 fn pty_io_loop(
     master_fd: RawFd,
     winch_fd: RawFd,
+    terminal_fd: RawFd,
     mut output_file: File,
     max_bytes: u64,
 ) -> std::io::Result<(u64, bool)> {
@@ -350,36 +356,43 @@ fn pty_io_loop(
         }
 
         // Drain master → terminal + capture file.
-        if fds[0].revents & libc::POLLIN != 0 {
+        if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             // SAFETY: same shape as the stdin read above.
             let n = unsafe { libc::read(master_fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if n > 0 {
-                let bytes = &buf[..n as usize];
-                // Always to terminal (use direct syscall to avoid any
-                // stdlib buffering between us and the user).
-                let _ = write_all(libc::STDOUT_FILENO, bytes);
-                // Conditionally to capture file (cap at max_bytes).
-                if total_written < max_bytes {
-                    let remaining = max_bytes - total_written;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let to_write = std::cmp::min(bytes.len(), remaining as usize);
-                    output_file.write_all(&bytes[..to_write])?;
-                    total_written += to_write as u64;
-                    if bytes.len() > to_write {
+            match n {
+                1.. => {
+                    let bytes = &buf[..n as usize];
+                    // Always to terminal (use direct syscall to avoid any
+                    // stdlib buffering between us and the user).
+                    let _ = write_all(terminal_fd, bytes);
+                    // Conditionally to capture file (cap at max_bytes).
+                    if total_written < max_bytes {
+                        let remaining = max_bytes - total_written;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let to_write = std::cmp::min(bytes.len(), remaining as usize);
+                        output_file.write_all(&bytes[..to_write])?;
+                        total_written += to_write as u64;
+                        if bytes.len() > to_write {
+                            truncated = true;
+                        }
+                    } else {
                         truncated = true;
                     }
-                } else {
-                    truncated = true;
+                    // HUP can accompany readable data. Keep reading until
+                    // EOF/EIO so an exiting child cannot truncate its output
+                    // at one buffer (or lose it on a HUP-only notification).
                 }
-            } else {
-                // n == 0 or EIO (POLLHUP path on some platforms) →
-                // master is closed because the child exited and the
-                // slave was reaped. Drain and break.
-                break;
+                0 => break,
+                _ => {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EIO) {
+                        break; // Linux PTY EOF.
+                    }
+                    if err.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(err);
+                    }
+                }
             }
-        }
-        if fds[0].revents & libc::POLLHUP != 0 {
-            break;
         }
     }
 
@@ -594,7 +607,7 @@ fn publish_cmd_start(id: &str, session_id: &str, cwd: &Path, cmd: &str) {
         cmd: cmd.to_string(),
         started_at_ms: now_unix_ms(),
     });
-    let _ = client::try_publish_event(&req);
+    let _ = client::try_publish_event_with_timeout(&req, Duration::from_secs(1));
 }
 
 fn publish_cmd_end(
@@ -618,7 +631,7 @@ fn publish_cmd_end(
         output_bytes: Some(output_bytes),
         output_truncated: Some(truncated),
     });
-    let _ = client::try_publish_event(&req);
+    let _ = client::try_publish_event_with_timeout(&req, Duration::from_secs(1));
 }
 
 fn hostname_or_unknown() -> String {
@@ -658,6 +671,48 @@ mod tests {
     #[test]
     fn run_with_help_flag_exits_zero() {
         assert_eq!(run(&["--help".to_string()]), 0);
+    }
+
+    #[test]
+    fn capture_drains_buffered_output_after_hangup() {
+        use std::os::unix::net::UnixStream;
+
+        // A socket pair deterministically queues more than one read buffer
+        // before HUP. A live PTY child could exit before or after the read,
+        // hiding the POLLIN + POLLHUP case depending on scheduling.
+        let (master, mut peer) = UnixStream::pair().unwrap();
+        let buffer_size: libc::c_int = 65_536;
+        // SAFETY: peer is a valid socket and buffer_size has the exact
+        // type and size required by SO_SNDBUF.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    peer.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    std::ptr::addr_of!(buffer_size).cast(),
+                    std::mem::size_of_val(&buffer_size).try_into().unwrap(),
+                )
+            },
+            0
+        );
+        let expected = vec![b'x'; 20_000];
+        peer.write_all(&expected).unwrap();
+        drop(peer);
+        let (winch_r, _winch_w) = pipe_cloexec_nonblocking().unwrap();
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let terminal = File::options().write(true).open("/dev/null").unwrap();
+        let (written, truncated) = pty_io_loop(
+            master.as_raw_fd(),
+            winch_r.as_raw_fd(),
+            terminal.as_raw_fd(),
+            output.reopen().unwrap(),
+            30_000,
+        )
+        .unwrap();
+        assert_eq!(written, 20_000);
+        assert!(!truncated);
+        assert_eq!(std::fs::read(output.path()).unwrap(), expected);
     }
 
     #[test]

@@ -1343,6 +1343,74 @@ fn capture_help_exits_zero() {
 }
 
 #[test]
+fn capture_publishes_lifecycle_when_daemon_handshake_is_slow() {
+    use chevron::daemon::proto::{self, Request, Response};
+    use std::io::{BufReader, Write as _};
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let listener = UnixListener::bind(dir.path().join("chevrond.sock")).unwrap();
+    let server = std::thread::spawn(move || {
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            let (mut conn, _) = listener.accept().unwrap();
+            if conn.set_read_timeout(Some(Duration::from_secs(5))).is_err() {
+                continue;
+            }
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                proto::decode_request(&line),
+                Ok(Request::Hello(_))
+            ));
+            // A loaded runner can delay scheduling the handler beyond the
+            // shell hook's 25 ms budget. Capture must still publish its row.
+            std::thread::sleep(Duration::from_millis(100));
+            if writeln!(
+                conn,
+                "{}",
+                proto::encode_response(&Response::Hello(proto::PROTO_VERSION))
+            )
+            .is_err()
+            {
+                continue;
+            }
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                continue;
+            }
+            events.push(proto::decode_request(&line).unwrap());
+            let _ = writeln!(conn, "{}", proto::encode_response(&Response::Ack));
+        }
+        events
+    });
+    let out = cmd()
+        .args(["capture", "echo", "slow-daemon"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let events = server.join().unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "capture must publish both lifecycle events"
+    );
+    let Request::CmdStart(start) = &events[0] else {
+        panic!("expected CMD_START")
+    };
+    let Request::CmdEnd(end) = &events[1] else {
+        panic!("expected CMD_END")
+    };
+    assert_eq!(start.id, end.id);
+    assert_eq!(start.cmd, "echo slow-daemon");
+    assert_eq!(end.exit_status, 0);
+    assert!(end.output_bytes.is_some_and(|bytes| bytes > 0));
+}
+
+#[test]
 fn capture_runs_command_and_creates_output_file() {
     // End-to-end: spawn daemon, run `chevron capture echo hi`, verify
     // the output file lands in $SOCKET_DIR/outputs and the DB row

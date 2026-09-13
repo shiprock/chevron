@@ -168,6 +168,12 @@ pub fn print_version() -> i32 {
 /// [`PUBLISH_TIMEOUT`] budget.
 #[must_use]
 pub fn try_publish_event(req: &proto::Request) -> bool {
+    try_publish_event_with_timeout(req, PUBLISH_TIMEOUT)
+}
+
+/// Publish with a caller-selected per-syscall budget. Explicit capture can
+/// tolerate a delayed daemon without imposing that latency on shell hooks.
+pub(crate) fn try_publish_event_with_timeout(req: &proto::Request, timeout: Duration) -> bool {
     debug_assert!(
         matches!(req, proto::Request::CmdStart(_) | proto::Request::CmdEnd(_)),
         "try_publish_event is for lifecycle events only"
@@ -175,8 +181,8 @@ pub fn try_publish_event(req: &proto::Request) -> bool {
     let Ok(conn) = UnixStream::connect(paths::socket_path()) else {
         return false;
     };
-    if conn.set_read_timeout(Some(PUBLISH_TIMEOUT)).is_err()
-        || conn.set_write_timeout(Some(PUBLISH_TIMEOUT)).is_err()
+    if conn.set_read_timeout(Some(timeout)).is_err()
+        || conn.set_write_timeout(Some(timeout)).is_err()
     {
         return false;
     }

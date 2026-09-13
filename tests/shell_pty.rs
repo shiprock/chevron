@@ -2240,7 +2240,7 @@ fn git_in(dir: &std::path::Path, args: &[&str]) {
 
 #[cfg(feature = "daemon")]
 use chevron::daemon::{
-    listener,
+    lifecycle, listener,
     proto::{CmdEndEvent, CmdStartEvent},
     state::{self, StateMsg},
 };
@@ -2255,6 +2255,8 @@ struct LiveFixture {
     term: Term,
     home: std::path::PathBuf,
     state_tx: std::sync::mpsc::Sender<StateMsg>,
+    state_join: Option<std::thread::JoinHandle<()>>,
+    _daemon_lock: std::fs::File,
     // Owns the socket dir; declared last so it outlives `term` on drop.
     sockdir: tempfile::TempDir,
 }
@@ -2269,7 +2271,12 @@ impl LiveFixture {
     /// inserted before the `chevron init` eval.
     fn spawn_with(extra_env: &str) -> Self {
         let sockdir = tempfile::TempDir::new().unwrap();
-        let state_tx = Self::start_daemon(sockdir.path());
+        // Match the real daemon's ownership lock. A status query exceeding
+        // its 10 ms budget otherwise auto-spawns a real daemon, which
+        // unlinks our socket and steals the reconnecting subscriber.
+        let daemon_lock =
+            lifecycle::try_lock_exclusive(&sockdir.path().join("chevrond.lock")).unwrap();
+        let (state_tx, state_join) = Self::start_daemon(sockdir.path());
 
         let home_slot = Arc::new(Mutex::new(std::path::PathBuf::new()));
         let socket_dir = sockdir.path().to_path_buf();
@@ -2311,6 +2318,8 @@ impl LiveFixture {
             term,
             home,
             state_tx,
+            state_join: Some(state_join),
+            _daemon_lock: daemon_lock,
             sockdir,
         };
         fx.term.wait_for("initial prompt on branch `base`", |s| {
@@ -2325,37 +2334,38 @@ impl LiveFixture {
     /// fire its own `FsEvent`s off the `git checkout`s these tests do — which
     /// raced the assertions on fast Linux inotify (CI) while passing on
     /// slower/coalesced macOS `FSEvents` locally (chevron-ffu.6).
-    fn start_daemon(dir: &std::path::Path) -> std::sync::mpsc::Sender<StateMsg> {
-        let listener_sock = UnixListener::bind(dir.join("chevrond.sock")).unwrap();
+    fn start_daemon(
+        dir: &std::path::Path,
+    ) -> (
+        std::sync::mpsc::Sender<StateMsg>,
+        std::thread::JoinHandle<()>,
+    ) {
+        // Bind before replacing the public path: concurrent status queries
+        // must never see a missing socket and auto-spawn a competing daemon.
+        let next_socket = dir.join("chevrond-next.sock");
+        let listener_sock = UnixListener::bind(&next_socket).unwrap();
         let db = state::open_db(dir).unwrap();
-        let (state_tx, _join) = state::spawn_no_watcher(state::TTL, db).unwrap();
+        let (state_tx, join) = state::spawn_no_watcher(state::TTL, db).unwrap();
         let serve_tx = state_tx.clone();
         std::thread::spawn(move || listener::serve_loop(&listener_sock, &serve_tx));
-        state_tx
+        std::fs::rename(next_socket, dir.join("chevrond.sock")).unwrap();
+        (state_tx, join)
     }
 
     /// Restart the daemon on the same socket. Shutting the old state actor
     /// down drops its subscriber senders, so the helper's relay sees EOF and
     /// chevron-1mh's reconnect kicks in.
     ///
-    /// Ordering is deliberate:
-    /// - Sleep AFTER the shutdown (socket still bound) so the old state
-    ///   actor finishes and closes its commands.db before the replacement
-    ///   opens a fresh one — overlapping connections deadlock the open. The
-    ///   live shell's status query during this window connects to the (now
-    ///   stateless) old listener rather than seeing a missing socket.
-    /// - Remove the socket immediately BEFORE rebinding, leaving no window
-    ///   where the path is absent: the shell has `CHEVRON_NO_DAEMON` unset, so
-    ///   a status query against a missing socket would auto-spawn a real
-    ///   chevrond that grabs the path and AddrInUse-s our rebind.
-    ///
-    /// The old listener thread is left stuck accepting a now-unlinked socket;
-    /// it leaks harmlessly and the test process reaps it at exit.
+    /// Join the old actor before opening its database again, then atomically
+    /// replace the listener path. The old listener remains bound until the
+    /// rename, so concurrent shell queries cannot auto-spawn a real daemon.
+    /// The old accept thread is reaped when the test process exits.
     fn restart_daemon(&mut self) {
-        let _ = self.state_tx.send(StateMsg::Shutdown);
-        std::thread::sleep(Duration::from_millis(50));
-        let _ = std::fs::remove_file(self.sockdir.path().join("chevrond.sock"));
-        self.state_tx = Self::start_daemon(self.sockdir.path());
+        self.state_tx.send(StateMsg::Shutdown).unwrap();
+        self.state_join.take().unwrap().join().unwrap();
+        let (state_tx, join) = Self::start_daemon(self.sockdir.path());
+        self.state_tx = state_tx;
+        self.state_join = Some(join);
     }
 
     /// Fire a git `FsEvent` for `$HOME` (its gitdir watch was registered by the
