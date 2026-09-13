@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 
 use crate::health::{Check, Severity};
 
+mod runtime;
+mod sources;
+
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
     let opts = match parse_args(args) {
@@ -128,6 +131,7 @@ fn collect(fast: bool) -> Vec<Section> {
         ("Environment", environment_section()),
         ("Chevron", chevron_section()),
         ("Shell integration", shell_integration_section()),
+        ("Live prompt and daemon", runtime::section()),
     ];
     if !fast {
         out.push(("Self-test", self_test_section()));
@@ -340,14 +344,9 @@ fn check_instant_prompt(home: &str, current_shell: &str) -> Check {
             "zsh only (not your current shell)",
         );
     }
-    let candidates = [".zshrc", ".zshenv", ".zprofile"];
     let mut zshrc_has_chevron = false;
     let mut marker_found_in: Option<String> = None;
-    for c in &candidates {
-        let path = PathBuf::from(home).join(c);
-        let Ok(contents) = std::fs::read_to_string(&path) else {
-            continue;
-        };
+    for (path, contents) in sources::files(home, ShellTarget::Zsh) {
         if contents.contains("chevron init") {
             zshrc_has_chevron = true;
         }
@@ -388,21 +387,15 @@ fn check_legacy_env_vars(home: &str) -> Check {
         "CHEVRON_HISTORY",
         "CHEVRON_LIVE",
     ];
-    let candidates = [
-        ".zshrc",
-        ".zshenv",
-        ".zprofile",
-        ".bashrc",
-        ".bash_profile",
-        ".profile",
-        ".config/fish/config.fish",
-    ];
-    let mut found: Vec<(String, String)> = Vec::new(); // (file, var)
-    for c in &candidates {
-        let path = PathBuf::from(home).join(c);
-        let Ok(contents) = std::fs::read_to_string(&path) else {
+    let mut found: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let files = [ShellTarget::Zsh, ShellTarget::Bash, ShellTarget::Fish]
+        .into_iter()
+        .flat_map(|target| sources::files(home, target));
+    for (path, contents) in files {
+        if !seen.insert(path.clone()) {
             continue;
-        };
+        }
         let pretty = friendly_path(&path, home);
         for line in contents.lines() {
             let trimmed = line.trim_start();
@@ -474,54 +467,50 @@ impl ShellTarget {
 
 fn check_shell_init(home: &str, current_shell: &str, target: ShellTarget) -> Check {
     let is_current = current_shell == target.name();
-    // Find the first candidate file that exists for this shell.
-    let found = target
-        .candidates()
-        .iter()
-        .map(|c| PathBuf::from(home).join(c))
-        .find(|p| p.exists());
-
-    let Some(path) = found else {
-        let value = format!("no {} init file found", target.name());
-        return if is_current {
-            Check::warn(
-                target.check_id(),
-                target.check_id(),
-                value,
-                format!(
-                    "no init file for your current shell — add `eval \"$(chevron init {})\"`",
-                    target.name()
-                ),
-            )
-        } else {
-            Check::info(target.check_id(), target.check_id(), value)
-        };
-    };
-
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
-    let pretty = friendly_path(&path, home);
-    if contents.contains("chevron init") {
-        Check::ok(
-            target.check_id(),
-            target.check_id(),
-            format!("{pretty} loads chevron"),
+    let files = sources::files(home, target);
+    for (path, contents) in &files {
+        if sources::active_lines(contents).any(|line| line.contains("chevron init")) {
+            let pretty = friendly_path(path, home);
+            let direct = target
+                .candidates()
+                .iter()
+                .any(|p| Path::new(home).join(p) == *path);
+            return if direct {
+                Check::ok(
+                    target.check_id(),
+                    target.check_id(),
+                    format!("{pretty} loads chevron"),
+                )
+            } else {
+                Check::info_hint(
+                    target.check_id(),
+                    target.check_id(),
+                    format!("chevron init found in {pretty} (sourced/module file)"),
+                    "static discovery cannot confirm conditional loading; live settings below reflect the inherited environment",
+                )
+            };
+        }
+    }
+    let value = if files.is_empty() {
+        format!("no {} init file found", target.name())
+    } else {
+        format!(
+            "no chevron init reference found in {} inspected file(s)",
+            files.len()
         )
-    } else if is_current {
+    };
+    if is_current {
         Check::warn(
             target.check_id(),
             target.check_id(),
-            format!("{pretty} does not reference `chevron init`"),
+            value,
             format!(
-                "add `eval \"$(chevron init {})\"` to {pretty}",
+                "if a custom loader initializes chevron, this scan may miss it; otherwise add `eval \"$(chevron init {})\"`",
                 target.name()
             ),
         )
     } else {
-        Check::info(
-            target.check_id(),
-            target.check_id(),
-            format!("{pretty} (not your current shell)"),
-        )
+        Check::info(target.check_id(), target.check_id(), value)
     }
 }
 
@@ -589,11 +578,17 @@ fn self_test_section() -> Vec<Check> {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let path_out = crate::segments::path::render_aware(&home, &pwd, None);
-    let git_out = crate::segments::git::render(Path::new("."));
+    // Diagnostics must not auto-start a daemon and thereby hide a missing
+    // socket just reported by the health probe.
+    let status = git2::Repository::discover(".")
+        .ok()
+        .filter(|repo| !repo.is_bare())
+        .map(|mut repo| crate::segments::git::RepoStatus::compute(&mut repo));
+    let (git_out, _) = crate::segments::git::render_segment(status.as_ref(), Some(237));
     let git_value = if git_out.is_empty() {
         "(not in a git repository)".to_string()
     } else {
-        git_out
+        format!("{git_out}{}", crate::color::RST)
     };
     vec![
         Check::info("path_render", "path render", path_out),
@@ -993,6 +988,46 @@ mod tests {
         let c = check_shell_init(&home, "zsh", ShellTarget::Zsh);
         assert_eq!(c.severity, Severity::Ok);
         assert!(c.value.contains("loads chevron"));
+    }
+
+    #[test]
+    fn shell_init_finds_sourced_module_without_executing_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_string_lossy().into_owned();
+        write_temp(
+            &tmp.path().join(".zshrc"),
+            "source \"$HOME/.zsh/lib/prompt.zsh\"\n",
+        );
+        write_temp(
+            &tmp.path().join(".zsh/lib/prompt.zsh"),
+            "export CHEVRON_LIVE=0\neval \"$(chevron init zsh)\"\ntouch \"$HOME/MUST_NOT_EXECUTE\"\n",
+        );
+        let check = check_shell_init(&home, "zsh", ShellTarget::Zsh);
+        assert_ne!(
+            check.severity,
+            Severity::Warn,
+            "sourced init was missed: {}",
+            check.value
+        );
+        assert!(check.value.contains("prompt.zsh"));
+        assert!(!tmp.path().join("MUST_NOT_EXECUTE").exists());
+        let legacy = check_legacy_env_vars(&home);
+        assert!(legacy.value.contains("CHEVRON_LIVE"));
+    }
+
+    #[test]
+    fn shell_init_searches_all_startup_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_string_lossy().into_owned();
+        write_temp(&tmp.path().join(".zshrc"), "# no prompt here\n");
+        write_temp(
+            &tmp.path().join(".zprofile"),
+            "eval \"$(chevron init zsh)\"\n",
+        );
+        assert_eq!(
+            check_shell_init(&home, "zsh", ShellTarget::Zsh).severity,
+            Severity::Ok
+        );
     }
 
     #[test]

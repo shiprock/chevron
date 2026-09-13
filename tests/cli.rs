@@ -1834,3 +1834,68 @@ fn subscribe_filters_out_ping_heartbeats() {
 
     drop(sub_child);
 }
+
+#[test]
+#[cfg(all(feature = "daemon", feature = "weather"))]
+fn doctor_reports_sourced_live_settings_without_starting_daemon() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().canonicalize().unwrap();
+    init_repo(&home);
+    std::fs::create_dir_all(home.join(".zsh/lib")).unwrap();
+    std::fs::write(
+        home.join(".zshrc"),
+        "source \"$HOME/.zsh/lib/prompt.zsh\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".zsh/lib/prompt.zsh"),
+        "export CHEVRON_LIVE=0\neval \"$(chevron init zsh)\"\ntouch \"$HOME/EXECUTED\"\n",
+    )
+    .unwrap();
+    let output = cmd()
+        .args(["doctor", "--json"])
+        .current_dir(&home)
+        .env("HOME", &home)
+        .env("SHELL", "/bin/zsh")
+        .env("TERM", "xterm-256color")
+        .env("LC_ALL", "en_US.UTF-8")
+        .env("CHEVRON_LIVE", "0")
+        .env("CHEVRON_LIVE_SCOPE", "cwd")
+        .env("CHEVRON_CONFIG", home.join("absent.toml"))
+        .env("CHEVRON_SOCKET_DIR", home.join("daemon"))
+        .env_remove("CHEVRON_NO_DAEMON")
+        .env_remove("STARSHIP_CONFIG")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let checks: Vec<_> = report["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["checks"].as_array().unwrap())
+        .collect();
+    let live = checks.iter().find(|c| c["name"] == "live_prompt").unwrap();
+    assert!(
+        live["value"]
+            .as_str()
+            .unwrap()
+            .contains("disabled (inherited CHEVRON_LIVE)")
+    );
+    let daemon = checks
+        .iter()
+        .find(|c| c["name"] == "daemon_connection")
+        .unwrap();
+    assert!(daemon["value"].as_str().unwrap().contains("not running"));
+    let init = checks.iter().find(|c| c["name"] == "zshrc").unwrap();
+    assert!(init["value"].as_str().unwrap().contains("prompt.zsh"));
+    assert!(!home.join("EXECUTED").exists());
+    assert!(
+        !home.join("daemon").exists(),
+        "self-test must not auto-start a daemon"
+    );
+}

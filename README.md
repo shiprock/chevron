@@ -61,6 +61,32 @@ eval "$(chevron init bash)"
 chevron init fish | source
 ```
 
+### Diagnose your setup
+
+```bash
+chevron doctor --no-color
+chevron doctor --json
+chevron doctor --fast --check live_prompt
+chevron doctor --fast --check daemon_connection
+```
+
+Doctor reports live-update configuration (`live_prompt`), scope (`live_scope`),
+configuration location (`live_config`), and daemon connectivity/version/round-trip
+latency (`daemon_connection`). Inherited environment settings take precedence;
+without them, config/default values describe the next shell initialization.
+An enabled setting does not prove that a shell subscriber is attached.
+
+The daemon probe is read-only and has a 500 ms deadline. Missing/stale sockets,
+unresponsive peers, and binary/protocol/schema drift include recovery hints.
+Doctor never starts or restarts the daemon, including during its render self-test.
+`--fast` skips rendering but still checks the daemon.
+
+Shell discovery reads startup files, literal absolute or home-relative `source`
+paths, and conventional Zsh module directories (`~/.zsh`, `~/.config/zsh`). It
+follows symlinks with file/depth/size limits and never executes shell code.
+A reference in a module is reported as configuration evidence; custom loaders
+and conditional execution cannot be verified statically.
+
 ### Live prompt
 
 On zsh, the prompt updates **between keystrokes** when repository state
