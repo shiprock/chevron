@@ -24,9 +24,7 @@ impl Segment for PythonSegment {
         };
 
         // Only show in Python projects or active venvs
-        let in_venv = std::env::var("VIRTUAL_ENV")
-            .ok()
-            .is_some_and(|v| !v.is_empty());
+        let in_venv = std::env::var("VIRTUAL_ENV").is_ok_and(|v| !v.is_empty());
 
         let in_project = find_ancestor_file(&ctx.pwd, "pyproject.toml", 5).is_some()
             || find_ancestor_file(&ctx.pwd, "setup.py", 5).is_some()
