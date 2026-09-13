@@ -532,8 +532,11 @@ _chevron_start_async() {
     local exit_status=$1 duration_ms=$2 job_count=$3
     # Stamp the refresh with the cycle that spawned it (see the
     # generation bump in precmd).
-    _chevron_async_spawn_gen="$_chevron_async_gen"
+    typeset -gA _chevron_async_generations _chevron_async_requests
+    (( _chevron_async_request_id++ ))
     exec {_chevron_async_fd}< <(CHEVRON_CACHE_FILE="$_chevron_cache_file" chevron prompt 20 "$exit_status" "$duration_ms" "$job_count" 2>/dev/null)
+    _chevron_async_generations[$_chevron_async_fd]=$_chevron_async_gen
+    _chevron_async_requests[$_chevron_async_fd]=$_chevron_async_request_id
     zle -F "$_chevron_async_fd" _chevron_async_callback
 }
 _chevron_async_callback() {
@@ -547,6 +550,9 @@ _chevron_async_callback() {
     # CONTEXT=[] PREBUFFER=[unset] %_=[quote ...] during a PS2 edit.
     local _chevron_cb_parser_ctx="${(%):-%_}"
     local fd=$1
+    local generation=${_chevron_async_generations[$fd]}
+    local request=${_chevron_async_requests[$fd]}
+    unset "_chevron_async_generations[$fd]" "_chevron_async_requests[$fd]"
     local fresh
     fresh=$(cat <&$fd 2>/dev/null)
     zle -F "$fd"
@@ -554,7 +560,7 @@ _chevron_async_callback() {
     # Stale guard: if another precmd ran since this refresh was spawned,
     # the result describes a previous cycle — drop it; the newer cycle
     # owns the prompt now. (The fd is already closed above either way.)
-    [[ "$_chevron_async_spawn_gen" == "$_chevron_async_gen" ]] || return
+    [[ "$generation" == "$_chevron_async_gen" && "$request" == "$_chevron_async_request_id" ]] || return
     # The generation only bumps in precmd, so a refresh landing in the
     # accept window — after the collapse painted, before the next
     # precmd — passes the guard above, and its reset-prompt would draw
@@ -683,7 +689,12 @@ _chevron_live_callback() {
     if [[ "${CHEVRON_LIVE_SCOPE:-cwd}" != all && "$line" == *cwd=* ]]; then
         local _ev_cwd="${line#*cwd=}"; _ev_cwd="${_ev_cwd%% *}"
         # cwd is percent-encoded on the wire; decode only when needed.
-        [[ "$_ev_cwd" == *%* ]] && _ev_cwd=$(printf '%b' "${_ev_cwd//\%/\\x}")
+        if [[ "$_ev_cwd" == *%* ]]; then
+            # Protect literal backslashes before interpreting percent escapes.
+            # Assign directly so trailing newlines in paths are preserved.
+            _ev_cwd=${_ev_cwd//\\/\\\\}
+            printf -v _ev_cwd '%b' "${_ev_cwd//\%/\\x}"
+        fi
         # Redraw only when $PWD is inside the event's workdir. Trailing
         # slashes guard the /repo-vs-/repo2 prefix trap.
         [[ "${PWD:A}/" == "${_ev_cwd%/}/"* ]] || return
@@ -1413,7 +1424,7 @@ mod tests {
         let out = init_zsh();
         let cb = body_of(&out, "_chevron_async_callback() {");
         let gen_guard = cb
-            .find("_chevron_async_spawn_gen")
+            .find(r#"[[ "$generation" == "$_chevron_async_gen""#)
             .expect("generation stale guard");
         let collapse_guard = cb
             .find(r#"-n "$_chevron_transient_collapsed" ]] && return"#)
@@ -1939,12 +1950,12 @@ mod tests {
             "precmd must bump the generation every cycle"
         );
         assert!(
-            out.contains(r#"_chevron_async_spawn_gen="$_chevron_async_gen""#),
+            out.contains("_chevron_async_generations[$_chevron_async_fd]=$_chevron_async_gen"),
             "spawn must stamp the generation it belongs to"
         );
         let cb = body_of(&out, "_chevron_async_callback() {");
         assert!(
-            cb.contains(r#"[[ "$_chevron_async_spawn_gen" == "$_chevron_async_gen" ]] || return"#),
+            cb.contains(r#"[[ "$generation" == "$_chevron_async_gen" && "$request" == "$_chevron_async_request_id" ]] || return"#),
             "callback must drop results from older generations"
         );
     }
