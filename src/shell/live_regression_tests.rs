@@ -10,6 +10,18 @@ fn function(name: &str) -> String {
     script[start..end].to_string()
 }
 
+fn live_functions() -> String {
+    [
+        "_chevron_live_callback",
+        "_chevron_live_flush",
+        "_chevron_live_render",
+    ]
+    .into_iter()
+    .map(function)
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
 fn zsh(script: &str, cwd: &std::path::Path) -> String {
     let output = Command::new("zsh")
         .args(["-f", "-c", script])
@@ -69,7 +81,7 @@ fn live_event_cwd_preserves_literal_backslash() {
         std::fs::create_dir(&cwd).unwrap();
         let script = format!(
             "{}\n{}",
-            function("_chevron_live_callback"),
+            live_functions(),
             r#"
 _chevron_start_async() { print RENDER; }
 EPOCHREALTIME=10
@@ -87,4 +99,70 @@ _chevron_live_callback 3
         );
         assert_eq!(zsh(&script, &cwd), "RENDER\n", "cwd={name:?}");
     }
+}
+
+#[test]
+fn live_burst_eventually_renders_final_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut script = live_functions();
+    script.push_str(
+        r#"
+# Deterministic event-loop harness: record timer registration, then deliver
+# its readiness after the burst. Rendering completes synchronously here.
+zle() { if [[ $1 == -F && -n $3 ]]; then timer_fd=$2; timer_callback=$3; fi; }
+sleep() { :; }
+_chevron_start_async() { rendered=$state; (( renders++ )); }
+CHEVRON_LIVE_SCOPE=all
+CHEVRON_LIVE=1
+state=initial
+renders=0
+EPOCHREALTIME=10
+exec 3< <(print -r -- 'EVENT topic=cmd cwd=/repo')
+_chevron_live_callback 3
+print -r -- "first:$rendered"
+EPOCHREALTIME=10.05
+state=intermediate
+exec 4< <(print -r -- 'EVENT topic=git cwd=/repo')
+_chevron_live_callback 4
+state=final
+exec 5< <(print -r -- 'EVENT topic=cmd cwd=/repo')
+_chevron_live_callback 5
+EPOCHREALTIME=10.15
+if [[ -n $timer_callback ]]; then "$timer_callback" "$timer_fd"; fi
+print -r -- "last:$rendered renders:$renders"
+"#,
+    );
+    assert_eq!(
+        zsh(&script, tmp.path()),
+        "first:initial\nlast:final renders:2\n"
+    );
+}
+
+#[test]
+fn stopping_live_cancels_trailing_refresh() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = format!(
+        "{}\n{}\n{}",
+        live_functions(),
+        function("_chevron_stop_live"),
+        r#"
+zle() { :; }
+sleep() { :; }
+_chevron_start_async() { print UNEXPECTED_RENDER; }
+CHEVRON_LIVE=1
+CHEVRON_LIVE_SCOPE=all
+_chevron_live_last_ms=10000
+EPOCHREALTIME=10.05
+exec 3< <(print -r -- 'EVENT cwd=/repo')
+_chevron_live_callback 3
+old_timer=$_chevron_live_timer_fd
+[[ -n $old_timer ]] || exit 2
+_chevron_stop_live
+[[ -z $_chevron_live_timer_fd ]] || exit 3
+# A callback already queued by ZLE must also become harmless.
+_chevron_live_flush "$old_timer"
+print STOPPED
+"#
+    );
+    assert_eq!(zsh(&script, tmp.path()), "STOPPED\n");
 }
