@@ -26,7 +26,6 @@ fn zsh(script: &str, cwd: &std::path::Path) -> String {
 }
 
 #[test]
-#[ignore = "known bug beads_plx-ntc: run explicitly until fixed"]
 fn older_async_render_cannot_overwrite_new_generation() {
     let tmp = tempfile::tempdir().unwrap();
     let script = format!(
@@ -35,7 +34,7 @@ fn older_async_render_cannot_overwrite_new_generation() {
         function("_chevron_async_callback"),
         r#"
 zle() { :; }
-chevron() { print -r -- "generation-$_chevron_async_gen"; }
+chevron() { print -r -- "generation-$_chevron_async_request_id"; }
 _chevron_make_prompt() { REPLY=$1; }
 _chevron_async_gen=1
 _chevron_start_async 0 0 0
@@ -51,14 +50,21 @@ print -r -- "$PROMPT"
 "#
     );
     assert_eq!(zsh(&script, tmp.path()), "generation-2\ngeneration-2\n");
+    // Live updates can overlap without a new precmd cycle as well.
+    let same_cycle = script.replace("_chevron_async_gen=2", "_chevron_async_gen=1");
+    assert_eq!(zsh(&same_cycle, tmp.path()), "generation-2\ngeneration-2\n");
 }
 
 #[test]
-#[ignore = "known bug beads_plx-8kl: run explicitly until fixed"]
 fn live_event_cwd_preserves_literal_backslash() {
     let tmp = tempfile::tempdir().unwrap();
     // Positive control rules out a broken harness or ordinary percent decoding.
-    for name in ["repo withspace", r"repo\name withspace"] {
+    for name in [
+        "repo withspace",
+        r"repo\name withspace",
+        "repo%name",
+        "repo\n",
+    ] {
         let cwd = tmp.path().join(name);
         std::fs::create_dir(&cwd).unwrap();
         let script = format!(
@@ -70,7 +76,9 @@ EPOCHREALTIME=10
 CHEVRON_LIVE_SCOPE=cwd
 # The protocol leaves literal backslashes intact and encodes spaces.
 wire=${PWD:A}
+wire=${wire//\%/%25}
 wire=${wire// /%20}
+wire=${wire//$'\n'/%0A}
 exec 3< <(print -r -- "EVENT cwd=$wire")
 _chevron_live_callback 3
 # A filtered event returns nonzero; assert observable render, not exit status.
