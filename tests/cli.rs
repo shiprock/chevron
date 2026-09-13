@@ -702,15 +702,21 @@ impl DaemonGuard {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        // Wait for the daemon to bind the socket. ~50 ms is enough on
-        // typical machines but we poll with a generous budget to handle
-        // slow CI runners.
+        // A bound socket precedes database initialization. Wait for a real
+        // protocol response so callers cannot publish before the schema
+        // exists or mistake an inline CLI fallback for daemon readiness.
         let sock = dir.path().join("chevrond.sock");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if sock.exists() {
-                // Also wait a tick for the listener thread to be accepting.
-                std::thread::sleep(std::time::Duration::from_millis(20));
+            if sock.exists()
+                && cmd()
+                    .args(["daemon", "version"])
+                    .env("CHEVRON_SOCKET_DIR", dir.path())
+                    .env("CHEVRON_DAEMON_TIMEOUT_MS", "2000")
+                    .current_dir(dir.path())
+                    .output()
+                    .is_ok_and(|out| out.status.success())
+            {
                 return Self {
                     socket_dir: dir,
                     child: Some(child),
