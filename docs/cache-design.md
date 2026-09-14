@@ -16,7 +16,9 @@ command output, and other durable records are not caches: they need separate
 retention, durability and migration rules and must not be deleted by cache GC.
 Probe caches themselves are owned by the daemon in memory. The filesystem holds a
 runtime root for the socket and lock, a state root for durable records, and nothing
-that a prompt process reads as data.
+that a prompt process reads as data. Broader architectural decisions this review
+raised are recorded in [architecture.md](architecture.md); the daemon protocol and
+its upgrade policy are specified in [protocol.md](protocol.md).
 
 Relevant current code: [shell integration](../src/shell.rs),
 [prompt writer](../src/main.rs), [command cache](../src/segments/custom_command.rs),
@@ -154,9 +156,9 @@ libgit2 walk after a short socket timeout. The foreground therefore uses one
 `SNAPSHOT` request that returns every cached typed probe for the cycle in a single
 round trip, each as a hit, an explicit miss or busy, and never computes; the
 asynchronous refresh uses `LEASE` and `PUT`, defined under daemon-owned probe caches.
-Both arrive under a bumped protocol version negotiated in the existing `HELLO`
-exchange. A new client that reaches an old daemon, or times out on
-the socket, renders the Git segment as unknown in the foreground and triggers the
+Both arrive under protocol version 2, whose negotiation, capability and retirement
+rules are specified in [protocol.md](protocol.md). A new client that reaches an old
+daemon, or times out on the socket, renders the Git segment as unknown in the foreground and triggers the
 existing stop and auto-spawn paths off the critical path. Inline compute is not a
 foreground fallback in any of these cases; only the explicit daemon-disabled mode
 computes in the prompt process, through its own bounded worker.
@@ -370,7 +372,8 @@ and never computes; `LEASE` asks permission to compute one key and returns a tok
 `Busy`; `PUT` completes a lease and is rejected when the token is stale; `SUBSCRIBE`
 keeps its semantics and gains generations; `SHUTDOWN` and `VERSION` replace pidfile
 handling. An unknown request kind is an error, and a client that meets an old daemon
-proceeds as described under shell presentation.
+proceeds as described under shell presentation. Wire format, limits and compatibility
+rules are normative in [protocol.md](protocol.md).
 
 Placement follows the dependency. Daemon workers compute Git status, fetch weather and
 location, and run health probes; none of these depend on the caller's environment.
@@ -529,7 +532,7 @@ Implementation ships in independently gated Beads slices:
 | Slice | Scope and gate |
 |---|---|
 | Immediate kill switch — ships first and alone | Stop precmd cache-file reads and binary writes; emit a no-op instant snippet; safely unlink the known legacy entry on first execution. Prove poisoned bytes are not rendered/executed, deletion is narrow/idempotent, and existing Zsh regressions pass. No storage framework or v2 presentation work in this change. User-visible consequence for release notes: `CHEVRON_ASYNC=1` renders synchronously on every cycle until the composition slice lands; live-event refreshes keep working because they never used the cache file. |
-| Socket trust boundary — ships second, also alone | Peer-credential checks in client and daemon; runtime root created and validated with the shared primitive; POSIX record lock on a lifetime descriptor; `SHUTDOWN` and `VERSION` replace the pidfile, with `F_GETLK` as the hung-daemon fallback; history database, spool and log move to the state root with a one-time verified copy. Gate: negative peer tests through an injected credential source plus a two-user manual check on macOS and Linux; a hostile pidfile and a precreated directory are both proven inert; history survives a simulated logout. |
+| Socket trust boundary — ships second, also alone | Peer-credential checks in client and daemon; the protocol version 2 handshake with negotiation and retirement from [protocol.md](protocol.md); runtime root created and validated with the shared primitive; POSIX record lock on a lifetime descriptor; `SHUTDOWN` and `VERSION` replace the pidfile, with `F_GETLK` as the hung-daemon fallback; history database, spool and log move to the state root with a one-time verified copy. Gate: negative peer tests through an injected credential source plus a two-user manual check on macOS and Linux; a hostile pidfile and a precreated directory are both proven inert; history survives a simulated logout. |
 | Measurement prerequisite | Benchmark probe-free composition end to end as above and select its budget before implementing the v2 split. Record distributions and configurations, not a single best-case timing. |
 | Shell harness prerequisite | Add Bash and Fish PTY fixtures with hermetic startup, screen assertions, input/interrupt/resize support and Linux/macOS CI execution. Bash must exercise promptvars on/off; Fish must exercise startup and Enter/cancel behavior. This gates corresponding shell behavior changes and cross-shell acceptance claims. |
 | Session ownership and sync composition | Depends on measurements, relevant PTY harnesses and the `SNAPSHOT` request; implement the init-minted session identity, current-context foreground composition, slow-probe refresh, bounded framing, generation-aware event handling and over-budget fallback. Preserve lifecycle and literal-rendering regressions. |

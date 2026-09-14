@@ -192,5 +192,8 @@ cargo build --release --no-default-features --features banner
 ## Design
 
 The proposed cache architecture and its review findings are documented in
-[Cache contracts and design review](docs/cache-design.md). Implementation is tracked
-in Beads epic `beads_plx-rzh`.
+[Cache contracts and design review](docs/cache-design.md). The daemon wire protocol,
+its compatibility policy and upgrade mechanisms are in
+[chevrond wire protocol](docs/protocol.md), and the architecture decisions the review
+raised beyond caches are in [Architecture direction](docs/architecture.md).
+Implementation is tracked in Beads epic `beads_plx-rzh`.
