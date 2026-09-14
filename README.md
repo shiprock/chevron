@@ -188,3 +188,9 @@ The weather subcommand is feature-gated and enabled by default. To build without
 ```bash
 cargo build --release --no-default-features --features banner
 ```
+
+## Design
+
+The proposed cache architecture and its review findings are documented in
+[Cache contracts and design review](docs/cache-design.md). Implementation is tracked
+in Beads epic `beads_plx-rzh`.
