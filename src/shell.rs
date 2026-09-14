@@ -860,11 +860,18 @@ _chevron_precmd() {
     # Wrap PS1 in OSC 133 A/B markers when enabled. The `\[…\]` brackets
     # tell bash's prompt-width tracker that the escape bytes are
     # zero-width; without them, line editing miscounts columns.
-    local _chevron_body="${chevron_output%%$'\n'*}"
+    # Expand this variable once at display time. Bash does not recursively
+    # evaluate command substitutions or prompt backslash escapes in its value.
+    _chevron_bash_body="${chevron_output%%$'\n'*}"
+    local _chevron_ps1_body='${_chevron_bash_body}'
+    if ! shopt -q promptvars; then
+        # With expansion disabled, only Bash's prompt backslash decoder runs.
+        _chevron_ps1_body=${_chevron_bash_body//\\/\\\\}
+    fi
     if [[ "${CHEVRON_OSC133:-1}" != "0" ]]; then
-        PS1=$'\\[\e]133;A\a\\]'"$_chevron_body"$' \\[\e]133;B\a\\]'
+        PS1=$'\\[\e]133;A\a\\]'"$_chevron_ps1_body"$' \\[\e]133;B\a\\]'
     else
-        PS1="$_chevron_body "
+        PS1="$_chevron_ps1_body "
     fi
     if [[ -n "$TMUX" && "$chevron_output" == *$'\n'* ]]; then
         local tmux_title="${chevron_output#*$'\n'}"
