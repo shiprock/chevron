@@ -40,6 +40,27 @@ chevron <path|git|tmux-title|prompt|init|status|health|weather|...>
 - **`health`** — System health probe (load, memory, disk, CPU temp, network)
 - **`weather`** — One-line current conditions for tmux `status-right` (see [Weather](#weather))
 
+### Custom command segments
+
+Enable a command segment with a configuration such as:
+
+```toml
+[segments]
+order = ["path", "git", "custom_command", "character"]
+
+[segment.custom_command]
+command = "printf ready"
+cache_secs = 30
+timeout_ms = 100
+```
+
+Commands run in the prompt's working directory. Cached output is scoped to the
+command and directory; use `cache_secs = 0` when changes in environment variables
+must be reflected immediately. The timeout includes output collection. Failed,
+timed-out, or oversized commands (more than 256 KiB of stdout) are omitted.
+Line breaks in segment text are displayed as `\n` or `\r` so they cannot split
+the prompt or its optional tmux title.
+
 ## Integration
 
 ### Shell prompt

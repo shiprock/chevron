@@ -62,7 +62,7 @@ pub fn render(ctx: &mut PromptContext) -> String {
                     text: String::new(),
                     end_bg: from_bg,
                 });
-        out.push_str(&result.text);
+        out.push_str(&single_line(&result.text));
         from_bg = result.end_bg;
     }
 
@@ -71,10 +71,17 @@ pub fn render(ctx: &mut PromptContext) -> String {
     if ctx.in_tmux {
         let title = tmux_title::render_from_status(&ctx.home, &ctx.pwd, ctx.repo_status.as_ref());
         out.push('\n');
-        out.push_str(&title);
+        out.push_str(&single_line(&title));
     }
 
     out
+}
+
+// Newlines belong to the prompt/title protocol, never to segment content.
+fn single_line(text: &str) -> String {
+    text.replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 #[cfg(test)]
@@ -218,5 +225,33 @@ mod tests {
 
         let out = render(&mut ctx);
         assert!(out.ends_with(RST), "should end with reset: {out}");
+    }
+    #[test]
+    fn regression_newline_path_keeps_prompt_single_line_and_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("before\nafter");
+        std::fs::create_dir(&path).unwrap();
+        let config: Config = toml::from_str("[segments]\norder=[\"path\"]").unwrap();
+        let mut ctx = PromptContext {
+            home: tmp.path().to_string_lossy().into_owned(),
+            pwd: path.to_string_lossy().into_owned(),
+            max_dir_size: None,
+            exit_status: 0,
+            duration_ms: 0,
+            job_count: 0,
+            in_tmux: false,
+            repo_status: None,
+            config,
+        };
+        let out = render(&mut ctx);
+        assert!(!out.contains('\n'), "path broke prompt framing: {out:?}");
+        assert!(out.contains("before\\nafter"));
+        assert!(out.ends_with(RST));
+        ctx.in_tmux = true;
+        let out = render(&mut ctx);
+        let lines: Vec<_> = out.split('\n').collect();
+        assert_eq!(lines.len(), 2, "only the title separator may be a newline");
+        assert!(lines[0].ends_with(RST));
+        assert!(lines[1].contains("before\\nafter"));
     }
 }

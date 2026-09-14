@@ -89,7 +89,7 @@
             # Integration tests (tests/cli.rs) spawn subprocesses that hang
             # in the Nix sandbox, so only run unit tests during the build.
             cargoTestExtraArgs = "--lib";
-            nativeCheckInputs = [ pkgs.zsh ];
+            nativeCheckInputs = [ pkgs.zsh pkgs.bash ];
             # Read by build.rs into `chevron version`, doctor and the daemon
             # VERSION reply. The sandbox has no .git, so the flake's own
             # revision is passed in; a dirty tree carries the -dirty suffix.
