@@ -1,6 +1,6 @@
 # Cache contracts and design review
 
-Status: proposed design, reviewed against the implementation on 2026-09-14.
+Status: proposed design, reviewed against `master` at commit 55a2f4f on 2026-09-14.
 This document does not claim the architecture is implemented or race-free.
 Implementation and release status live in Beads epic `beads_plx-rzh`.
 
@@ -18,7 +18,9 @@ retention, durability and migration rules and must not be deleted by cache GC.
 Relevant current code: [shell integration](../src/shell.rs),
 [prompt writer](../src/main.rs), [command cache](../src/segments/custom_command.rs),
 [daemon state](../src/daemon/state.rs), [daemon compute](../src/daemon/listener.rs),
-[weather](../src/weather/mod.rs), and [health](../src/health/cache.rs).
+[daemon client](../src/daemon/client.rs), [daemon protocol](../src/daemon/proto.rs),
+[daemon lifecycle](../src/daemon/lifecycle.rs), [weather](../src/weather/mod.rs),
+and [health](../src/health/cache.rs).
 
 ## Design decisions and rationale
 
@@ -31,12 +33,18 @@ Relevant current code: [shell integration](../src/shell.rs),
 | Share storage primitives, retain domain policies | Freshness, privacy and offline requirements differ |
 | Treat command TTL as explicit permission for bounded staleness | Cwd alone cannot capture environment, files, network, credentials or side effects |
 | Include repository incarnation and generation in daemon tokens | Eviction/recreation must not validate an old completion |
+| Add versioned cache-only and compute daemon requests | The existing status request computes on miss and the client computes inline on timeout; neither can serve a probe-free foreground |
+| Treat actor death as a daemon fault that exits for respawn | Without the inline fallbacks a dead actor would silently remove the Git segment until a manual restart |
 
-The two-open prompt read race, literal prompt expansion, custom-cache symlink
-write-through, and weather display-option mismatch were reproduced. The daemon
-late-insert race and multi-writer publication schedules are code-level findings;
-controlled interleaving tests must establish their behavior before implementation.
-Existing fixes in PRs #15 and #23 are useful foundations, not proof of these contracts.
+Evidence status of the findings, as recorded in this repository: literal prompt
+expansion and cross-directory command-output reuse have red/green regression tests
+in PR #23. The two-open prompt read race, custom-cache symlink write-through and
+weather display-option mismatch are confirmed by inspection of the referenced code
+but have no committed reproduction; the slice that fixes each must first land a
+failing test that demonstrates it. The daemon late-insert race and multi-writer
+publication schedules are code-level findings; controlled interleaving tests must
+establish their behavior before implementation. Existing fixes in PRs #15 and #23
+are useful foundations, not proof of these contracts.
 
 ## Threat model and assumptions
 
@@ -46,6 +54,16 @@ in shared temporary locations. An attacker already executing as the same UID can
 usually modify shell startup/configuration too; cache permissions are not isolation
 from a compromised account. Credentials and project paths can still be sensitive
 and must not leak through filenames, world-readable files or routine diagnostics.
+
+The shared-location exposure is concrete today. The prompt cache directory falls
+back to `/tmp` when `XDG_RUNTIME_DIR` is unset, which is the normal state on macOS
+and on Linux sessions that did not pass through a systemd login, such as containers
+and non-systemd distributions. The instant-prompt spool file and the custom-command
+cache use `TMPDIR`, falling back to `/tmp`; macOS sets a private per-user `TMPDIR` by
+default and most Linux sessions do not. Wherever one of these resolves to a shared
+directory, another local user can precreate the per-UID directory or the PID-named
+file. The kill switch and secure storage slices must be verified on both
+configurations, not only on a single-user development machine.
 
 Do not treat an arbitrary override directory as safe because the user supplied it.
 Conversely, paths such as macOS `/tmp` have legitimate platform-owned aliases: the
@@ -100,6 +118,18 @@ network requests or health probes on a miss. Missing/invalidated probe data is o
 or shown as unknown; it is never borrowed from a previous complete prompt. Updated
 probe data is composed with the captured current-cycle context and accepted token.
 Do not duplicate the Rust renderer in shell code.
+
+This split changes the daemon protocol. The current protocol has one status request,
+whose miss path computes in the handler, and the client falls back to an inline
+libgit2 walk after a short socket timeout. The foreground therefore needs a
+cache-only status request that returns a hit, an explicit miss or busy, and never
+computes; the asynchronous refresh uses a compute request that obtains an
+actor-issued lease. Both arrive under a bumped protocol version negotiated in the
+existing `HELLO` exchange. A new client that reaches an old daemon, or times out on
+the socket, renders the Git segment as unknown in the foreground and triggers the
+existing stop and auto-spawn paths off the critical path. Inline compute is not a
+foreground fallback in any of these cases; only the explicit daemon-disabled mode
+computes in the prompt process, through its own bounded worker.
 
 Before implementing this split, benchmark a release-build probe-free render including
 process launch, config loading, cache-only reads, formatting and shell installation.
@@ -165,10 +195,14 @@ new legacy cache content, use a new snippet marker, and have doctor identify the
 old marker with replacement instructions. Do not deserialize or execute legacy
 rendered cache entries as a migration step. On first execution of the new binary,
 unlink the one known legacy `last-prompt` entry so pasted v1 snippets do not paint a
-permanently frozen prompt. Use a validated, owned parent directory and a directory-
-relative unlink: never open the payload, follow the final symlink, recursively remove
-a directory, or delete arbitrary `CHEVRON_CACHE_FILE` override targets. Missing is
-success; unsafe parents or permission errors are reported by doctor with remediation.
+permanently frozen prompt. Use a validated, owned parent directory and a
+directory-relative unlink: never open the payload, follow the final symlink,
+recursively remove a directory, or delete arbitrary `CHEVRON_CACHE_FILE` override
+targets. Missing is success. Permission errors are reported by doctor with
+remediation. An unsafe parent, one not owned by the user or not mode 0700, is
+deliberately left alone and reported by doctor as a security finding rather than a
+cleanup failure: the pasted v1 snippet keeps reading whatever that directory
+contains until the user replaces the snippet.
 Retry the idempotent cleanup on later executions if it could not complete. This narrow
 migration helper does not depend on the shared storage primitive. Test regular files,
 symlinks (target survives), missing files, unsafe parents and repeated execution.
@@ -300,10 +334,24 @@ spawn unbounded duplicate computations. Limit total workers and queued repositor
 The current listener's inline computation on actor timeout or send failure is removed.
 Handlers never compute without an actor-issued lease. A missed reply deadline returns
 an explicit unavailable/busy response within the caller budget; it cannot start another
-Git walk. Clients must also avoid converting that response into an independent inline
-fallback while daemon work may still be running. A deliberately daemon-disabled mode
-uses its own bounded render worker; actor timeout is not a switch into that mode.
-Bound repository discovery as well as status computation, outside the actor thread.
+Git walk. The daemon client currently performs the costlier inline fallback: after a
+short per-syscall socket timeout it runs a full libgit2 walk inside the prompt process.
+The foreground cache-only request removes that fallback and renders the segment as
+unknown; the asynchronous refresh is the only path that may wait for or trigger
+compute. A deliberately daemon-disabled mode uses its own bounded render worker;
+neither actor timeout nor socket timeout is a switch into that mode. Bound repository
+discovery as well as status computation, outside the actor thread.
+
+Removing the fallbacks makes actor liveness a daemon-level requirement. Today the
+lifecycle spawns the state actor and discards its join handle, so a panicked actor
+leaves a daemon that accepts connections but can never answer. Under this design that
+would silently remove the Git segment until someone restarts the daemon. Actor send
+failure or a dead actor thread is therefore a daemon fault: the serve loop must detect
+it, stop accepting, remove its socket and pidfile, and exit nonzero so the client's
+existing auto-spawn path starts a fresh daemon on the next miss. Restarting the actor
+in place is acceptable only if every outstanding lease, waiter and subscriber is
+failed explicitly first. Add a regression test that kills the actor and proves the
+next client request leads to a respawn rather than an indefinite unavailable stream.
 
 As a prerequisite within this slice, introduce an injected monotonic `Clock` interface
 (`now()`), with production `Instant`-backed and manually advanced test implementations.
@@ -350,12 +398,12 @@ Implementation ships in independently gated Beads slices:
 
 | Slice | Scope and gate |
 |---|---|
-| Immediate kill switch — ships first and alone | Stop precmd cache-file reads and binary writes; emit a no-op instant snippet; safely unlink the known legacy entry on first execution. Prove poisoned bytes are not rendered/executed, deletion is narrow/idempotent, and existing Zsh regressions pass. No storage framework or v2 presentation work in this change. |
+| Immediate kill switch — ships first and alone | Stop precmd cache-file reads and binary writes; emit a no-op instant snippet; safely unlink the known legacy entry on first execution. Prove poisoned bytes are not rendered/executed, deletion is narrow/idempotent, and existing Zsh regressions pass. No storage framework or v2 presentation work in this change. User-visible consequence for release notes: `CHEVRON_ASYNC=1` renders synchronously on every cycle until the composition slice lands; live-event refreshes keep working because they never used the cache file. |
 | Measurement prerequisite | Benchmark probe-free composition end to end as above and select its budget before implementing the v2 split. Record distributions and configurations, not a single best-case timing. |
 | Shell harness prerequisite | Add Bash and Fish PTY fixtures with hermetic startup, screen assertions, input/interrupt/resize support and Linux/macOS CI execution. Bash must exercise promptvars on/off; Fish must exercise startup and Enter/cancel behavior. This gates corresponding shell behavior changes and cross-shell acceptance claims. |
-| Session ownership and sync composition | Depends on measurements and relevant PTY harnesses; implement current-context foreground composition, slow-probe refresh, bounded framing and over-budget fallback. Preserve lifecycle and literal-rendering regressions. |
+| Session ownership and sync composition | Depends on measurements, relevant PTY harnesses and the daemon cache-only request; implement current-context foreground composition, slow-probe refresh, bounded framing and over-budget fallback. Preserve lifecycle and literal-rendering regressions. |
 | Shared storage and domain migration | Separate from the kill switch; implement secure storage, coordination and typed probe policies, with command TTL compatibility tests. |
-| Daemon ownership | First inject clock/timer/executor controls; then implement leases/incarnations, remove inline timeout fallback and prove controlled invalidation/eviction/deadline interleavings and resource limits. |
+| Daemon ownership | First inject clock/timer/executor controls; then add the versioned cache-only and compute requests, implement leases/incarnations, remove the listener and client inline fallbacks, make actor death a daemon exit, and prove controlled invalidation/eviction/deadline interleavings and resource limits. |
 
 The current PTY harness covers Zsh only, as recorded in [CLAUDE.md](../CLAUDE.md).
 The Bash subprocess unit tests in PR #23 are valuable but are not PTY evidence.
@@ -370,8 +418,9 @@ rendering functional; rollback must not restore unsafe legacy reads.
 | Scenario | Required evidence |
 |---|---|
 | Probe-free foreground composition, cold/warm and loaded host | measured latency distributions; normal cycles avoid placeholder flicker; over-budget fallback remains responsive |
-| Legacy cache deletion and omitted command TTL migration | narrow idempotent unlink; pasted snippet sees no frozen payload after cleanup; legacy 30-second TTL preserved and doctor warns |
+| Legacy cache deletion and omitted command TTL migration | narrow idempotent unlink; pasted snippet sees no frozen payload after cleanup; unsafe parent reported as a security finding; legacy 30-second TTL preserved and doctor warns |
 | Actor timeout/send failure while compute is running | explicit unavailable/busy response, no handler or client duplicate compute |
+| Old daemon with new client; actor thread dies | foreground renders unknown without inline compute; daemon exits and is respawned on the next miss; no indefinite unavailable stream |
 | Two shells in different directories/environments/configs | neither can install the other's result or overwrite its presentation state |
 | Re-sourced init or nested interactive shell | no duplicate hooks, inherited publication authority or orphaned workers |
 | Same cwd, new exit status/jobs/config/env | new cycle cannot present previous-cycle facts as current |
