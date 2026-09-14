@@ -47,7 +47,7 @@ pub fn zsh_wrap_escapes(s: &str) -> String {
     let mut parts = s.split('\x1b');
 
     if let Some(first) = parts.next() {
-        out.push_str(first);
+        out.push_str(&first.replace('%', "%%"));
     }
 
     for part in parts {
@@ -55,10 +55,10 @@ pub fn zsh_wrap_escapes(s: &str) -> String {
             out.push_str("%{\x1b");
             out.push_str(&part[..=m_pos]);
             out.push_str("%}");
-            out.push_str(&part[m_pos + 1..]);
+            out.push_str(&part[m_pos + 1..].replace('%', "%%"));
         } else {
             out.push('\x1b');
-            out.push_str(part);
+            out.push_str(&part.replace('%', "%%"));
         }
     }
 
@@ -209,5 +209,20 @@ mod tests {
         let input = format!("{}text", fg(31));
         let wrapped = wrap_for_shell("unknown", &input);
         assert_eq!(wrapped, zsh_wrap_escapes(&input));
+    }
+    #[test]
+    fn regression_zsh_percent_text_is_literal() {
+        let literal = format!("{}project%n %F{{red}} %{{text%}}", fg(31));
+        let wrapped = zsh_wrap_escapes(&literal);
+        let output = std::process::Command::new("zsh")
+            .args(["-f", "-c", "print -P -r -- \"$TEST_PROMPT\""])
+            .env("TEST_PROMPT", wrapped)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{literal}\n")
+        );
     }
 }
