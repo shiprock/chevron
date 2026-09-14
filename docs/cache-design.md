@@ -20,16 +20,17 @@ Relevant current code: [shell integration](../src/shell.rs),
 [daemon state](../src/daemon/state.rs), [daemon compute](../src/daemon/listener.rs),
 [weather](../src/weather/mod.rs), and [health](../src/health/cache.rs).
 
-## Findings that change the earlier proposal
+## Design decisions and rationale
 
-| Earlier idea | Gap found in review | Revised decision |
-|---|---|---|
-| Move the rendered prompt into session memory | The next command can change exit status, jobs, environment or config without changing cwd | Never treat the previous cycle's complete prompt as the new cycle's answer |
-| Persist a validated instant-prompt hint | Before `.zshrc` runs, final config/environment are unavailable; secure disk reads and output capture add substantial complexity | Retire the shared rendered startup cache; make v2 startup feedback a neutral, shell-local placeholder |
-| Use atomic writes everywhere | Unique temporaries prevent partial writes, but an obsolete computation can still publish last | Specify publication ownership and invalidation tokens separately from atomicity |
-| Put every result in one generic cache | Different domains require different freshness, privacy and offline policies | Share storage primitives, not domain policy or a global result map |
-| Add cwd to arbitrary command keys | Commands can depend on environment, external files, time, network, credentials or side effects | Caching is explicit bounded staleness, not a claim of dependency completeness |
-| Add generations to daemon work | Eviction/recreation can reuse a generation; watcher loss and late completions need handling too | Token includes a unique repository incarnation and invalidation generation |
+| Decision | Rationale |
+|---|---|
+| Compose current cheap segments synchronously; refresh slow probes asynchronously | Avoid routine placeholder flicker without reusing the previous cycle's exit status, jobs, environment or config; measure the probe-free path before implementation |
+| Use a neutral placeholder only when composition exceeds its budget | Preserve responsiveness on slow paths without making every prompt pay the visual cost |
+| Retire the shared rendered startup cache; initially emit a no-op snippet | Startup cannot validate final config/environment; close the poisoning path without introducing new startup presentation machinery |
+| Separate publication ownership from atomic writes | A complete write can still contain an obsolete result |
+| Share storage primitives, retain domain policies | Freshness, privacy and offline requirements differ |
+| Treat command TTL as explicit permission for bounded staleness | Cwd alone cannot capture environment, files, network, credentials or side effects |
+| Include repository incarnation and generation in daemon tokens | Eviction/recreation must not validate an old completion |
 
 The two-open prompt read race, literal prompt expansion, custom-cache symlink
 write-through, and weather display-option mismatch were reproduced. The daemon
@@ -92,13 +93,23 @@ write a shared final-prompt cache. Explicit `CHEVRON_CACHE_FILE` writes are remo
 from the generated v2 path. Shell, config and protocol compatibility are negotiated
 rather than guessed from the presence of `%{`.
 
-The default synchronous mode continues to compose fresh prompt output from cheap
-inputs and cached probe data. Async mode immediately shows a neutral pending
-placeholder on a new cycle, then installs the valid result. It does not display
-the previous command's success/failure or another environment as current. This is
-an intentional UX change requiring the performance and PTY gates below. A later
-optimization may compose current cheap segments with cached typed probes; it must
-not duplicate the full Rust renderer in shell code to regain the old fast path.
+The v2 async design composes current cheap segments synchronously in the Rust
+renderer, using a cache-only snapshot of typed probe data, then refreshes only slow
+probes asynchronously. The foreground phase must not start Git walks, commands,
+network requests or health probes on a miss. Missing/invalidated probe data is omitted
+or shown as unknown; it is never borrowed from a previous complete prompt. Updated
+probe data is composed with the captured current-cycle context and accepted token.
+Do not duplicate the Rust renderer in shell code.
+
+Before implementing this split, benchmark a release-build probe-free render including
+process launch, config loading, cache-only reads, formatting and shell installation.
+Record p50/p95/p99 for cold and warm runs, representative configs and cache misses,
+on macOS and Linux, including a loaded machine. Establish the foreground budget from
+these results and interactive evidence. A neutral placeholder is only the over-budget
+or failed-composition fallback, not the normal new-cycle path. A supervised render
+must enforce the budget even if config/cache I/O stalls. If the measurements cannot
+support this design, revisit the split before shipping routine placeholder behavior.
+The synchronous integration retains bounded rendering until the split is ready.
 
 Within the same cycle, the last accepted prompt can remain visible during refresh.
 An event that arrives while work is running records one pending refresh. Subsequent
@@ -137,8 +148,9 @@ async lifecycle support. Encoding and byte limits must survive UTF-8 chunk bound
 ## Startup behavior and compatibility
 
 A startup hint cannot validate the environment that has not been loaded yet.
-The v2 instant snippet therefore uses only a neutral builtin placeholder, no
-persisted branch/status/identity and no provider, daemon or config I/O.
+The first migration makes the emitted instant snippet a no-op, with no persisted
+branch/status/identity and no provider, daemon or config I/O. Any future builtin
+startup feedback needs separate UX evidence; it is not part of the kill switch.
 
 The safe default does not redirect stdin/stdout/stderr into the existing predictable
 spool file. If startup emits output, preserve it and put the real prompt on a new
@@ -151,8 +163,20 @@ a regular file cannot enforce a hard bound on arbitrary redirected shell writes.
 Existing pasted v1 snippets do not update when the binary updates. Stop generating
 new legacy cache content, use a new snippet marker, and have doctor identify the
 old marker with replacement instructions. Do not deserialize or execute legacy
-rendered cache entries as a migration step. Legacy files may remain until safe,
-explicit cleanup; packaging must not assume a binary update repairs pasted snippets.
+rendered cache entries as a migration step. On first execution of the new binary,
+unlink the one known legacy `last-prompt` entry so pasted v1 snippets do not paint a
+permanently frozen prompt. Use a validated, owned parent directory and a directory-
+relative unlink: never open the payload, follow the final symlink, recursively remove
+a directory, or delete arbitrary `CHEVRON_CACHE_FILE` override targets. Missing is
+success; unsafe parents or permission errors are reported by doctor with remediation.
+Retry the idempotent cleanup on later executions if it could not complete. This narrow
+migration helper does not depend on the shared storage primitive. Test regular files,
+symlinks (target survives), missing files, unsafe parents and repeated execution.
+
+A pasted snippet may run before the new binary's first execution; that first startup
+cannot be retroactively protected. Old running binaries may also recreate the file.
+Doctor must explain reinitializing shells/replacing snippets and retiring old binaries;
+packaging must not claim that deletion alone repairs all existing shell processes.
 New init must detect an old binary/protocol and fall back to supported synchronous
 rendering. Old shells/new binaries retain the public CLI format for a documented
 transition period. Never silently re-enable the old shared cache as fallback.
@@ -161,7 +185,7 @@ transition period. Never silently re-enable the old shared cache as fallback.
 
 | Domain | Identity | Freshness and failure | Owner |
 |---|---|---|---|
-| Shell presentation | session, cycle, request, captured context | no cross-cycle reuse of full output; pending placeholder on miss | shell |
+| Shell presentation | session, cycle, request, captured context | fresh synchronous composition; slow probes refresh asynchronously; placeholder only over budget | shell |
 | Git status | canonical worktree plus actual gitdir/common-dir identity; daemon incarnation | current 100 ms TTL baseline plus watcher invalidation; invalidated data is not fresh | daemon actor |
 | Custom command | command definition, canonical cwd, cache schema, explicitly declared nonsecret context | explicit TTL; never serve expired output after command failure | secure disk namespace |
 | Weather observations | provider, provider account identity if semantically relevant, location resolution and units | configured fresh TTL; bounded stale-on-error, proposed maximum 6 hours | secure disk namespace |
@@ -179,11 +203,17 @@ or a miss; secret credential values must not be written into keys or diagnostic 
 
 For arbitrary commands, file dependencies cannot be inferred safely. Retain the
 explicit TTL model, document it as permission to reuse potentially stale output,
-and provide an uncached mode. A legacy implicit 30-second default must be migrated
-visibly, not silently lengthened. Require explicit opt-in for new persistent command
-caching; users needing environment-dependent freshness use declared nonsecret keys,
-session-only caching, or disable it. Commands requiring fresh side effects should
-not be cached. TTL zero neither reads nor writes persistent entries. Failure backoff is separate
+and provide an uncached mode. Preserve the implicit 30-second TTL for existing
+unversioned configs with a command but no TTL. Doctor warns that this legacy default
+is deprecated and recommends writing an explicit TTL (including zero to disable).
+Normal prompts remain silent. Neither shorten nor lengthen the effective TTL silently.
+Require explicit opt-in only under a new, explicitly selected config schema; generated
+configs state their TTL. Test omitted TTL, explicit zero and explicit nonzero values
+across migration. Users needing environment-dependent freshness use declared nonsecret
+keys or disable caching. Session-only command caching is not offered: each render is
+a fresh process and this design introduces no resident command-cache owner.
+Commands requiring fresh side effects should not be cached. TTL zero neither reads
+nor writes persistent entries. Failure backoff is separate
 from cached success: a short bounded retry delay may prevent repeated failed probes,
 but must not make expired command output valid or survive a relevant key change.
 Do not cache stderr, authentication failures as successful data, or incomplete output.
@@ -267,6 +297,21 @@ without performing libgit2 work on the actor thread. A miss leases a token conta
 Other requests join a bounded waiter set or receive an explicit busy result; they cannot
 spawn unbounded duplicate computations. Limit total workers and queued repositories.
 
+The current listener's inline computation on actor timeout or send failure is removed.
+Handlers never compute without an actor-issued lease. A missed reply deadline returns
+an explicit unavailable/busy response within the caller budget; it cannot start another
+Git walk. Clients must also avoid converting that response into an independent inline
+fallback while daemon work may still be running. A deliberately daemon-disabled mode
+uses its own bounded render worker; actor timeout is not a switch into that mode.
+Bound repository discovery as well as status computation, outside the actor thread.
+
+As a prerequisite within this slice, introduce an injected monotonic `Clock` interface
+(`now()`), with production `Instant`-backed and manually advanced test implementations.
+Route get/insert freshness, lease start, LRU and debounce decisions through it. Pair it
+with explicit timer/tick delivery and a controllable compute executor so tests advance
+time and complete jobs in chosen orders without real sleeps. Transport integration
+may retain real timeout tests; actor correctness must not depend on wall-clock timing.
+
 Invalidation increments generation even if the cached entry is absent. Completion
 is accepted only for a matching live token, and freshness starts at compute start.
 Rejected work releases its slot; one dirty/pending flag schedules a bounded retry
@@ -301,15 +346,32 @@ miss reasons, plus pending/rejected work counts when available. Default diagnost
 must not print commands, full paths containing secrets, cached payloads or credentials.
 Normal prompts remain silent on cache failures. Do not log on every hit/event.
 
-Implementation ships in Beads-managed slices, with no merge of the full redesign
-until each slice meets its tests. First secure file access and stop trusting shared
-prompt output; then implement session ownership and v2 startup/protocol migration;
-then consolidate data caches and generation-checked daemon work. Preserve existing
-red/green regressions from the earlier fixes. Disabling a new cache must leave the
-bounded uncached renderer functional; rollback must not restore unsafe legacy reads.
+Implementation ships in independently gated Beads slices:
+
+| Slice | Scope and gate |
+|---|---|
+| Immediate kill switch — ships first and alone | Stop precmd cache-file reads and binary writes; emit a no-op instant snippet; safely unlink the known legacy entry on first execution. Prove poisoned bytes are not rendered/executed, deletion is narrow/idempotent, and existing Zsh regressions pass. No storage framework or v2 presentation work in this change. |
+| Measurement prerequisite | Benchmark probe-free composition end to end as above and select its budget before implementing the v2 split. Record distributions and configurations, not a single best-case timing. |
+| Shell harness prerequisite | Add Bash and Fish PTY fixtures with hermetic startup, screen assertions, input/interrupt/resize support and Linux/macOS CI execution. Bash must exercise promptvars on/off; Fish must exercise startup and Enter/cancel behavior. This gates corresponding shell behavior changes and cross-shell acceptance claims. |
+| Session ownership and sync composition | Depends on measurements and relevant PTY harnesses; implement current-context foreground composition, slow-probe refresh, bounded framing and over-budget fallback. Preserve lifecycle and literal-rendering regressions. |
+| Shared storage and domain migration | Separate from the kill switch; implement secure storage, coordination and typed probe policies, with command TTL compatibility tests. |
+| Daemon ownership | First inject clock/timer/executor controls; then implement leases/incarnations, remove inline timeout fallback and prove controlled invalidation/eviction/deadline interleavings and resource limits. |
+
+The current PTY harness covers Zsh only, as recorded in [CLAUDE.md](../CLAUDE.md).
+The Bash subprocess unit tests in PR #23 are valuable but are not PTY evidence.
+Until the harness slice passes, Bash/Fish end-to-end requirements below are pending,
+not satisfied by the current test suite. CI must install the shells and fail the
+required gate if coverage is skipped. This prerequisite must not delay the narrow
+Zsh legacy-cache kill switch.
+
+Preserve existing red/green regressions. Disabling a new cache must leave bounded
+rendering functional; rollback must not restore unsafe legacy reads.
 
 | Scenario | Required evidence |
 |---|---|
+| Probe-free foreground composition, cold/warm and loaded host | measured latency distributions; normal cycles avoid placeholder flicker; over-budget fallback remains responsive |
+| Legacy cache deletion and omitted command TTL migration | narrow idempotent unlink; pasted snippet sees no frozen payload after cleanup; legacy 30-second TTL preserved and doctor warns |
+| Actor timeout/send failure while compute is running | explicit unavailable/busy response, no handler or client duplicate compute |
 | Two shells in different directories/environments/configs | neither can install the other's result or overwrite its presentation state |
 | Re-sourced init or nested interactive shell | no duplicate hooks, inherited publication authority or orphaned workers |
 | Same cwd, new exit status/jobs/config/env | new cycle cannot present previous-cycle facts as current |
@@ -335,7 +397,8 @@ sleep schedules. Unit tests establish storage/actor invariants; executable shell
 PTY tests establish terminal behavior on Linux/macOS, Bash with promptvars on/off,
 and Zsh with PROMPT_SUBST on/off. Fish needs display and startup coverage too.
 
-Release decisions still needing measurement are the async-placeholder UX, exact
-whole-render deadline, maintenance budgets, and local-filesystem support detection.
+Release decisions still needing measurement are the probe-free composition budget,
+over-budget fallback UX, whole-render deadline, maintenance budgets, and local-filesystem
+support detection. Measurement precedes v2 presentation implementation.
 Security, key identity, nonblocking UI behavior, and rejection of obsolete results
 are requirements; measurements may tune budgets but cannot waive those invariants.
