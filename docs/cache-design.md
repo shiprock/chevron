@@ -14,13 +14,16 @@ The scope includes shell rendering, startup hints, custom-command output, daemon
 Git status, weather/location data, and health probes. Command history, captured
 command output, and other durable records are not caches: they need separate
 retention, durability and migration rules and must not be deleted by cache GC.
+Probe caches themselves are owned by the daemon in memory. The filesystem holds a
+runtime root for the socket and lock, a state root for durable records, and nothing
+that a prompt process reads as data.
 
 Relevant current code: [shell integration](../src/shell.rs),
 [prompt writer](../src/main.rs), [command cache](../src/segments/custom_command.rs),
 [daemon state](../src/daemon/state.rs), [daemon compute](../src/daemon/listener.rs),
 [daemon client](../src/daemon/client.rs), [daemon protocol](../src/daemon/proto.rs),
-[daemon lifecycle](../src/daemon/lifecycle.rs), [weather](../src/weather/mod.rs),
-and [health](../src/health/cache.rs).
+[daemon lifecycle](../src/daemon/lifecycle.rs), [daemon paths](../src/daemon/paths.rs),
+[weather](../src/weather/mod.rs), and [health](../src/health/cache.rs).
 
 ## Design decisions and rationale
 
@@ -30,11 +33,17 @@ and [health](../src/health/cache.rs).
 | Use a neutral placeholder only when composition exceeds its budget | Preserve responsiveness on slow paths without making every prompt pay the visual cost |
 | Retire the shared rendered startup cache; initially emit a no-op snippet | Startup cannot validate final config/environment; close the poisoning path without introducing new startup presentation machinery |
 | Separate publication ownership from atomic writes | A complete write can still contain an obsolete result |
-| Share storage primitives, retain domain policies | Freshness, privacy and offline requirements differ |
+| Own every probe cache in the daemon; keep nothing a prompt reads on shared disk | One coordination model replaces cross-process locks, temp files, GC and symlink rules; domain policies stay separate because freshness, privacy and offline requirements differ |
 | Treat command TTL as explicit permission for bounded staleness | Cwd alone cannot capture environment, files, network, credentials or side effects |
 | Include repository incarnation and generation in daemon tokens | Eviction/recreation must not validate an old completion |
 | Add versioned cache-only and compute daemon requests | The existing status request computes on miss and the client computes inline on timeout; neither can serve a probe-free foreground |
 | Treat actor death as a daemon fault that exits for respawn | Without the inline fallbacks a dead actor would silently remove the Git segment until a manual restart |
+| Verify peer credentials on every socket connection, in both directions | Directory permissions can be defeated by precreation; peer UIDs cannot |
+| Stop and status go over the verified socket; the lock holder is the only PID source | A pidfile in a shared directory is attacker-writable |
+| Broadcast computed changes with a generation, not filesystem events | Many panes must not spawn many workers for a no-op |
+| Bound recompute by measured cost and degrade detail first | A slow repository under churn must not pin a core or lose its segment |
+| Mint the session identity at init without a fork and share it with history | One identity, one fewer startup fork, no inherited authority |
+| Print one stderr line at init for security findings | Nobody runs doctor unprompted |
 
 Evidence status of the findings, as recorded in this repository: literal prompt
 expansion and cross-directory command-output reuse have red/green regression tests
@@ -65,6 +74,18 @@ directory, another local user can precreate the per-UID directory or the PID-nam
 file. The kill switch and secure storage slices must be verified on both
 configurations, not only on a single-user development machine.
 
+The daemon shares that boundary and is currently weaker than the cache. Its socket,
+lock, pidfile and history database resolve to a per-UID directory under `/tmp` when
+`XDG_RUNTIME_DIR` is unset. The daemon creates that directory with a call that follows
+existing paths and only then tightens permissions; the client connects to whatever
+socket is there with no peer check, sends its handshake, and then sends every command
+line and working directory as history events; `chevron daemon stop` signals whatever
+PID the pidfile names. Another local user who precreates that directory therefore
+receives the victim's command history, controls the victim's prompt content and can
+make the victim signal their own processes. This is closed by the peer-credential
+check, the shared root primitive and the lock-derived PID described under daemon
+ownership, and it is not closed by the cache kill switch.
+
 Do not treat an arbitrary override directory as safe because the user supplied it.
 Conversely, paths such as macOS `/tmp` have legitimate platform-owned aliases: the
 implementation must distinguish those from untrusted cache-child symlinks.
@@ -93,6 +114,10 @@ and render coordinator must preserve shell responsiveness independently of worke
 8. Staleness is domain-specific and explicit. A Git snapshot is not an atomic
    filesystem transaction, and a weather observation is not current merely
    because its file was just read.
+9. No process trusts a directory, socket, lock or PID it has not verified belongs to
+   its own UID. Peer credentials are checked before any byte is sent or served.
+10. Subscribers learn about changes in computed state, never about raw filesystem
+    events, and every notification carries the generation it describes.
 
 Correctness is relative to captured inputs and observed invalidations. Chevron
 cannot detect every filesystem change instantaneously or infer arbitrary command
@@ -101,8 +126,12 @@ dependencies. The design must expose these limits rather than imply stronger gua
 ## Shell presentation and transport
 
 The shell owns `session`, `cycle`, `latest_request`, and the last accepted response.
-The session identity is regenerated for each interactive shell initialization;
-PID alone is insufficient, and a subshell must not inherit publication authority.
+The binary generates the init script once per interactive shell start and embeds a
+fresh random session identity in it as a literal, so no fork is needed to mint one.
+PID alone is insufficient. A forked subshell inherits the variable but not the
+authority: publication requires `ZSH_SUBSHELL` or `BASH_SUBSHELL` to be zero, and
+fish uses its equivalent. The same identity replaces the separate history session
+request, removing that startup fork as well.
 
 At each `precmd`, capture exit status, duration and job count before other hooks
 alter them. Advance the cycle and launch/render using that immutable context.
@@ -121,11 +150,12 @@ Do not duplicate the Rust renderer in shell code.
 
 This split changes the daemon protocol. The current protocol has one status request,
 whose miss path computes in the handler, and the client falls back to an inline
-libgit2 walk after a short socket timeout. The foreground therefore needs a
-cache-only status request that returns a hit, an explicit miss or busy, and never
-computes; the asynchronous refresh uses a compute request that obtains an
-actor-issued lease. Both arrive under a bumped protocol version negotiated in the
-existing `HELLO` exchange. A new client that reaches an old daemon, or times out on
+libgit2 walk after a short socket timeout. The foreground therefore uses one
+`SNAPSHOT` request that returns every cached typed probe for the cycle in a single
+round trip, each as a hit, an explicit miss or busy, and never computes; the
+asynchronous refresh uses `LEASE` and `PUT`, defined under daemon-owned probe caches.
+Both arrive under a bumped protocol version negotiated in the existing `HELLO`
+exchange. A new client that reaches an old daemon, or times out on
 the socket, renders the Git segment as unknown in the foreground and triggers the
 existing stop and auto-spawn paths off the critical path. Inline compute is not a
 foreground fallback in any of these cases; only the explicit daemon-disabled mode
@@ -152,7 +182,8 @@ On `cd`, a new prompt cycle, live-disable or exit, invalidate pending work and
 cancel timers as appropriate. Reconnect requests a fresh snapshot; an event is a
 resynchronization hint, not a complete journal. Overflow cannot be represented as
 "nothing changed." Continuous traffic is rate-limited without starving the final
-refresh when the stream becomes quiet.
+refresh when the stream becomes quiet. A notification whose generation matches the
+last installed frame is dropped without spawning a worker.
 
 Accept a response only if session/cycle/request still match. Preserve the existing
 accept-line, transient-collapse and PS2 guards: record a valid response if useful,
@@ -204,7 +235,7 @@ deliberately left alone and reported by doctor as a security finding rather than
 cleanup failure: the pasted v1 snippet keeps reading whatever that directory
 contains until the user replaces the snippet.
 Retry the idempotent cleanup on later executions if it could not complete. This narrow
-migration helper does not depend on the shared storage primitive. Test regular files,
+migration helper does not depend on the shared root primitive. Test regular files,
 symlinks (target survives), missing files, unsafe parents and repeated execution.
 
 A pasted snippet may run before the new binary's first execution; that first startup
@@ -221,10 +252,10 @@ transition period. Never silently re-enable the old shared cache as fallback.
 |---|---|---|---|
 | Shell presentation | session, cycle, request, captured context | fresh synchronous composition; slow probes refresh asynchronously; placeholder only over budget | shell |
 | Git status | canonical worktree plus actual gitdir/common-dir identity; daemon incarnation | current 100 ms TTL baseline plus watcher invalidation; invalidated data is not fresh | daemon actor |
-| Custom command | command definition, canonical cwd, cache schema, explicitly declared nonsecret context | explicit TTL; never serve expired output after command failure | secure disk namespace |
-| Weather observations | provider, provider account identity if semantically relevant, location resolution and units | configured fresh TTL; bounded stale-on-error, proposed maximum 6 hours | secure disk namespace |
-| Location lookup | lookup source and declared context | bounded TTL for IP geolocation; explicit coordinates need no lookup | secure disk namespace |
-| Health probe | host and actual target identity, probe/parser revision | existing probe TTL; expired results become unknown rather than falsely healthy | secure disk namespace |
+| Custom command | command definition, scope path (cwd by default, worktree, global or session), cache schema, digest of declared context values with `PATH` included by default | explicit TTL; never serve expired output after command failure | daemon actor stores; the shell's worker computes |
+| Weather observations | provider, provider account identity if semantically relevant, location resolution and units | configured fresh TTL; bounded stale-on-error, proposed maximum 6 hours | daemon actor |
+| Location lookup | lookup source and declared context | bounded TTL for IP geolocation; explicit coordinates need no lookup | daemon actor |
+| Health probe | host and actual target identity, probe/parser revision | existing probe TTL; expired results become unknown rather than falsely healthy | daemon actor |
 
 Cache weather observations, not the rendered line. Render city/icon/font choices
 on every invocation. Store resolved location labels separately from provider data;
@@ -243,14 +274,23 @@ is deprecated and recommends writing an explicit TTL (including zero to disable)
 Normal prompts remain silent. Neither shorten nor lengthen the effective TTL silently.
 Require explicit opt-in only under a new, explicitly selected config schema; generated
 configs state their TTL. Test omitted TTL, explicit zero and explicit nonzero values
-across migration. Users needing environment-dependent freshness use declared nonsecret
-keys or disable caching. Session-only command caching is not offered: each render is
-a fresh process and this design introduces no resident command-cache owner.
-Commands requiring fresh side effects should not be cached. TTL zero neither reads
-nor writes persistent entries. Failure backoff is separate
-from cached success: a short bounded retry delay may prevent repeated failed probes,
-but must not make expired command output valid or survive a relevant key change.
-Do not cache stderr, authentication failures as successful data, or incomplete output.
+across migration.
+
+The key has a scope and a declared context. Scope is `cwd` by default for
+compatibility, `worktree` for commands whose output is the same anywhere in a
+repository, `global` for commands independent of location, and `session` for
+commands whose environment cannot be declared, which the daemon can offer because it
+is a resident owner keyed by the session identity. The declared context is a list of
+nonsecret environment variable names whose values are digested into the key; `PATH`
+is included by default so different toolchain environments never share output.
+Undeclared environment dependence is the user's responsibility and is documented as
+such. The shell's asynchronous worker runs the command in its own environment after a
+`LEASE`, under its deadline, output cap and process-group cleanup, then stores the
+result with `PUT`; the foreground only reads. Commands requiring fresh side effects
+should not be cached. TTL zero neither reads nor writes entries. Failure backoff is
+separate from cached success: a short bounded retry delay may prevent repeated failed
+runs, but must not make expired output valid or survive a relevant key change. Do not
+cache stderr, authentication failures as successful data, or incomplete output.
 
 Health checks must identify the inspected disk/device or tool context, not just a
 fixed label such as `disk_health`. If identity cannot be established, bypass caching.
@@ -259,69 +299,111 @@ onto an empty key. Symlinked shell PWD may be displayed logically while cache id
 uses the physical worktree. Linked worktrees share some Git metadata but not status:
 changes to common refs can invalidate several worktrees without merging their keys.
 
-## Shared disk-cache primitive
+## Filesystem roots and on-disk state
 
-Use a small Rust implementation with opaque namespace/key types. Callers supply
-policy; the storage layer does not know weather or prompt semantics. The API should
-return outcomes such as `Fresh`, `Stale`, `Miss`, `Unsafe` and `Busy`, not collapse
-all causes into an empty string. Invalid data is never a stale fallback.
+Chevron uses two filesystem roots and no probe-cache root. The runtime root holds
+the daemon socket and lock. The state root holds durable records: the command-history
+database, the event spool and the daemon log. Prompt processes never read a file from
+either root as data; they talk to the daemon over the socket.
 
-Runtime and persistent roots are distinct. Prefer a valid user runtime directory
-for ephemeral locks; use a verified user cache root for persistent probe results.
-Do not fall back to the repository working directory when HOME/XDG paths are absent
-or relative. If a safe root cannot be obtained, bypass disk caching.
+Resolution order for the runtime root: an explicit `CHEVRON_SOCKET_DIR` override,
+then `$XDG_RUNTIME_DIR/chevron`, then on macOS the per-user temporary directory the
+system provides through `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which the platform creates
+and owns, then elsewhere a per-UID directory under `/tmp` that must be created
+exclusively or validated. The state root resolves from `CHEVRON_STATE_DIR`, then
+`$XDG_STATE_HOME/chevron`, then `$HOME/.local/state/chevron`, then on macOS the
+per-user directory from `confstr(_CS_DARWIN_USER_DIR)`. Neither root ever falls back
+to the working directory or to a relative path; this includes the daemon log, which
+currently falls back to `./chevrond.log`. Socket paths must stay under the platform
+limit of roughly one hundred bytes, so leaf names stay short. If a root cannot be
+obtained or validated, the component that needs it fails closed and doctor names the
+path.
 
-Create the Chevron leaf directory exclusively with mode 0700, or open and validate
-an existing directory's owner and permissions. Files use 0600. Use directory-relative
-opens and validate the opened descriptors; a `canonicalize`/metadata check followed
-by an ordinary reopen is still racy. Reject final-component symlinks, nonregular files,
-and unexpected ownership. Handle trusted platform aliases such as macOS `/tmp`
-without treating attacker-controlled child paths as trusted. Do not chmod somebody
-else's path to "repair" it. Test overrides obey the same rules as normal roots.
+The command-history database and the event spool currently live in the runtime
+directory. Systemd removes `/run/user/<uid>` at the last logout and macOS purges
+`/tmp`, so history is lost on exactly the systems where the fallback applies. Both
+move to the state root; the daemon copies an existing database from the old location
+once, verifies it, and leaves the original for the user to remove.
 
-A read opens once with no-follow/nonblocking semantics, checks type/owner/size,
-reads at most the configured limit, then validates schema, key and timestamps from
-that same snapshot. This excludes FIFO/device hangs as well as split metadata/body
-reads. Keys cannot contain path traversal; filenames derive from a stable versioned
-digest of canonical key bytes. Do not store raw commands, secrets or full environments
-in filenames/envelopes. Low-entropy secret values must not be treated as safe merely
-because they were hashed; use an opaque context or disable persistence.
+Validation is one primitive shared by both roots. Create the leaf directory with an
+exclusive `mkdir` at mode 0700. If it already exists, open it with `O_DIRECTORY` and
+`O_NOFOLLOW`, `fstat` the descriptor, and require owner equal to the effective UID,
+no group or other permission bits, and a real directory. Every file inside is opened
+relative to that descriptor with no-follow semantics. A `canonicalize` or metadata
+check followed by an ordinary path open is still racy and is not acceptable. Trusted
+platform aliases such as macOS `/tmp` are resolved as path prefixes, never as
+child symlinks. Never chmod a path owned by someone else to repair it. Explicit
+overrides obey the same rules. A process whose effective UID differs from the
+directory owner, such as `sudo` with a preserved HOME or runtime directory, bypasses
+writes and never creates entries there.
 
-Each file contains one entry: schema and producer/parser revision, key digest,
-fetch-start time, expiry/stale limits and a bounded typed payload. One file per key
-avoids weather's whole-map read/modify/write lost updates. Treat future wall-clock
-timestamps as invalid. Use monotonic time for in-process deadlines and freshness;
-on disk accept bounded wall-clock freshness, including documented clock-jump limits.
-A slow fetch must not receive a brand-new lifetime when it completes.
+Automatic maintenance never removes a file it does not own. Foreign-owned entries
+inside a validated owned directory are listed by doctor, which offers an explicit
+directory-relative unlink; that operation is safe because unlink does not follow the
+final component and the directory is ours. The same explicit path removes the legacy
+on-disk caches once nothing reads them: the hashed command files in the temporary
+directory, the weather map and the health directory. They are never read again after
+their replacement ships, and never deleted implicitly.
 
-A writer uses an exclusive unpredictable temporary file in the destination directory,
-checks write completion, closes, and atomically renames. Failure preserves the old
-entry. Fsync is not needed for disposable cache durability. Never reuse a common
-`.tmp` filename, and never open a pre-existing temp as writable. Temporary-file
-cleanup only removes verified cache-owned entries; it must not follow links.
+Durable writes in the state root use an exclusive unpredictable temporary file in the
+destination directory, complete writes, close, then rename. Failure preserves the old
+entry. The event spool on `unstable` already follows this pattern. History durability
+is SQLite's responsibility; spool entries are a best-effort net and are not fsynced,
+and nothing else on disk needs fsync.
 
-Publication needs coordination beyond rename. Use nonblocking cross-process locks
-for refresh ownership. A contender uses an allowed fresh/stale value or receives `Busy`, distinct from
-`Miss`. Callers must not respond to `Busy` by launching the same uncached fetch;
-they omit the segment or use permitted stale data. Lock identity
-must remain stable while holders exist: do not delete active lock inodes or steal a
-lock merely because its recorded PID/mtime looks old. A fixed, bounded set of lock
-stripes is an acceptable first implementation; unrelated-key collisions are handled
-as `Busy`. Locks are released by descriptor close/process exit.
+## Daemon-owned probe caches
 
-Any explicit cache-clear operation must coordinate with writers. With the refresh
-lock held, clear the entry; if busy, report busy/retry rather than promise that a
-still-running old fetch cannot repopulate it. Do not remove the lock inode. GC only
-attempts nonblocking cleanup and cannot remove an active writer's temp. Maintenance
-work is budgeted and kept off the synchronous prompt critical path.
+The daemon actor is the single owner of every probe cache: Git status, custom-command
+output, weather observations, location lookups and health probes. Entries live in
+memory as typed values in per-namespace maps keyed by opaque canonical keys, with
+per-namespace entry caps and payload limits, least-recently-used eviction and a total
+memory budget. Nothing a prompt reads is stored on shared disk, so cross-process
+locks, temporary-file protocols, garbage collection, symlink rules and
+network-filesystem detection disappear from the design. The socket, verified as
+described under daemon ownership, is the only trust boundary. Outcomes remain
+explicit: `Fresh`, `Stale`, `Miss`, `Busy` and `Unsafe`, never an empty string that
+hides the cause.
 
-Initial proposed limits, to validate before release: 256 KiB custom-command output,
-64 KiB weather/health entry, 128 KiB internal prompt response, and 16 MiB/256 entries
-per disk namespace. Cap serialized metadata as well as payload. These are design
-budgets, not measurements of current behavior. Evict expired entries first; if limits
-cannot be maintained within the maintenance budget, skip new writes. Local filesystems
-are the supported concurrency target; uncertain network-filesystem lock/rename semantics
-cause disk caching to be disabled, not an assertion of equivalent guarantees.
+Requests, all under a bumped protocol version negotiated in the existing `HELLO`
+exchange: `SNAPSHOT` returns every cached typed probe a cycle needs in one round trip
+and never computes; `LEASE` asks permission to compute one key and returns a token or
+`Busy`; `PUT` completes a lease and is rejected when the token is stale; `SUBSCRIBE`
+keeps its semantics and gains generations; `SHUTDOWN` and `VERSION` replace pidfile
+handling. An unknown request kind is an error, and a client that meets an old daemon
+proceeds as described under shell presentation.
+
+Placement follows the dependency. Daemon workers compute Git status, fetch weather and
+location, and run health probes; none of these depend on the caller's environment.
+Custom commands depend on the shell's environment, so the shell's asynchronous worker
+runs them itself, in its own environment and working directory, after obtaining a
+lease, and stores the result with `PUT`. The lease prevents duplicate runs across
+shells; the declared context in the key keeps shells with different environments apart.
+
+Freshness starts at compute start, measured on the daemon's injected monotonic clock.
+Wall-clock time is used only for provider-declared validity such as an observation
+timestamp, and a future wall-clock value is invalid. A slow fetch never receives a new
+lifetime at completion. Cache-clear is a request that invalidates a namespace or key
+and increments its generation; it needs no coordination with writers because there is
+one owner.
+
+The daemon persists no probe cache in v2. A restart or idle exit starts cold: the first
+prompt shows the Git segment as unknown until the asynchronous refresh lands, weather
+fetches once, and health probes run once. If measurement shows that cold starts matter,
+a later slice may write a typed snapshot of weather and health entries to the state
+root at exit and reload it with validation; that is a single-writer file and needs
+none of the retired multi-writer machinery.
+
+Without the daemon, whether disabled with `CHEVRON_NO_DAEMON=1` or unavailable, there
+is no probe caching: Git status computes inline under its bound, commands run on every
+prompt under their timeout, and weather prints an empty line, because a status bar
+calling it every second must not reach the network every second. Doctor and the
+init-time notice explain the state. The `weather` cargo feature therefore depends on
+the `daemon` feature, so the documented distribution builds keep their cache.
+
+Initial in-memory limits, to validate before release: 256 KiB per command output,
+64 KiB per weather or health entry, 128 KiB per internal prompt frame, 1024 command
+entries, 64 weather entries, 32 health entries, the existing watched-repository cap,
+and a 32 MiB total budget. These are design budgets, not measurements.
 
 ## Daemon invalidation and work ownership
 
@@ -330,6 +412,22 @@ without performing libgit2 work on the actor thread. A miss leases a token conta
 `daemon_incarnation`, `repo_incarnation`, and `generation` to one bounded worker.
 Other requests join a bounded waiter set or receive an explicit busy result; they cannot
 spawn unbounded duplicate computations. Limit total workers and queued repositories.
+
+Every connection is authenticated by peer credentials before any byte is sent or
+served: the client checks the daemon's UID with `getpeereid` on macOS and `SO_PEERCRED`
+on Linux, and the daemon checks each accepted peer the same way. A mismatch closes the
+connection, yields `Unsafe`, and is never retried with inline compute. This is the
+backstop that holds even if a directory check is bypassed. The daemon creates its
+runtime directory with the shared root primitive and refuses to start in a directory
+it cannot validate; the client refuses to connect through one.
+
+The daemon holds its lock as a POSIX record lock on one descriptor kept open for its
+lifetime and never reopens the lock file, so an unrelated close cannot release it.
+`chevron daemon stop` and `status` are `SHUTDOWN` and `VERSION` requests over the
+verified socket. Only when the socket is unresponsive does `stop` fall back to a
+signal, and then the PID comes from `F_GETLK` on the lock inside the validated
+directory, which the kernel reports and only our UID can hold. The pidfile is removed;
+no code path reads a PID from a file.
 
 The current listener's inline computation on actor timeout or send failure is removed.
 Handlers never compute without an actor-issued lease. A missed reply deadline returns
@@ -347,7 +445,7 @@ lifecycle spawns the state actor and discards its join handle, so a panicked act
 leaves a daemon that accepts connections but can never answer. Under this design that
 would silently remove the Git segment until someone restarts the daemon. Actor send
 failure or a dead actor thread is therefore a daemon fault: the serve loop must detect
-it, stop accepting, remove its socket and pidfile, and exit nonzero so the client's
+it, stop accepting, remove its socket, release its lock, and exit nonzero so the client's
 existing auto-spawn path starts a fresh daemon on the next miss. Restarting the actor
 in place is acceptable only if every outstanding lease, waiter and subscriber is
 failed explicitly first. Add a regression test that kills the actor and proves the
@@ -366,6 +464,24 @@ Rejected work releases its slot; one dirty/pending flag schedules a bounded retr
 when subscribers or requests still need the result. Never wait for an obsolete
 computation as though it were a fresh hit. Idle subscribers need a completion/resync
 notification; TTL expiry on future reads alone is not an eventual-refresh guarantee.
+
+Subscribers receive change notifications, not filesystem events. When a repository
+with subscribers is invalidated, the actor schedules a recompute under the backoff
+below, compares the summarized result with the last one broadcast, and notifies only
+when it differs. The notification carries the repository incarnation and generation;
+a shell that already displays that generation drops it without spawning a worker, so
+file churn that leaves the summary unchanged costs zero prompt refreshes and a real
+change costs one broadcast and one coalesced refresh per pane. A per-subscriber jitter
+of up to 50 ms is an optional spreading measure, to be measured.
+
+Recompute cost is bounded per repository. The actor records the last compute duration
+and enforces a minimum interval of the larger of the TTL and three times that
+duration, coalescing further invalidations into one pending recompute. When a compute
+exceeds its per-repository budget, the next compute runs in a reduced-detail mode that
+skips the untracked-file scan and the result is marked as reduced, so detail degrades
+before the segment disappears. Doctor lists repositories that hit the budget and points
+at Git's filesystem monitor and untracked cache as remedies. The factor and budget are
+initial values for measurement.
 
 Eviction must retire the repository incarnation, cancel/reject its in-flight work,
 and remove its cache, watcher, LRU, debounce, waiter and pending-broadcast metadata.
@@ -394,16 +510,36 @@ miss reasons, plus pending/rejected work counts when available. Default diagnost
 must not print commands, full paths containing secrets, cached payloads or credentials.
 Normal prompts remain silent on cache failures. Do not log on every hit/event.
 
+Security findings are the exception to silence. `chevron init` performs a stateless
+safety check that costs well under a millisecond: it validates the runtime root and,
+if a daemon is listening, its peer UID. On a failure it prints one line to stderr
+naming the finding and pointing at doctor, once per shell start; `CHEVRON_NOTICE=0`
+silences the line and doctor keeps the detail. Per-prompt behavior stays silent: an
+unsafe result renders the affected segment as unknown.
+
+Measurement reuses what the repository has. The hyperfine script in `scripts/bench.sh`
+already times whole subcommands including process launch; extend it to export JSON and
+report distributions for the probe-free render, and keep the criterion benches for
+in-process costs. Property tests with the existing `proptest` dependency cover the
+frame decoder, the protocol decoder and key canonicalization, so malformed input is
+explored rather than sampled.
+
 Implementation ships in independently gated Beads slices:
 
 | Slice | Scope and gate |
 |---|---|
 | Immediate kill switch — ships first and alone | Stop precmd cache-file reads and binary writes; emit a no-op instant snippet; safely unlink the known legacy entry on first execution. Prove poisoned bytes are not rendered/executed, deletion is narrow/idempotent, and existing Zsh regressions pass. No storage framework or v2 presentation work in this change. User-visible consequence for release notes: `CHEVRON_ASYNC=1` renders synchronously on every cycle until the composition slice lands; live-event refreshes keep working because they never used the cache file. |
+| Socket trust boundary — ships second, also alone | Peer-credential checks in client and daemon; runtime root created and validated with the shared primitive; POSIX record lock on a lifetime descriptor; `SHUTDOWN` and `VERSION` replace the pidfile, with `F_GETLK` as the hung-daemon fallback; history database, spool and log move to the state root with a one-time verified copy. Gate: negative peer tests through an injected credential source plus a two-user manual check on macOS and Linux; a hostile pidfile and a precreated directory are both proven inert; history survives a simulated logout. |
 | Measurement prerequisite | Benchmark probe-free composition end to end as above and select its budget before implementing the v2 split. Record distributions and configurations, not a single best-case timing. |
 | Shell harness prerequisite | Add Bash and Fish PTY fixtures with hermetic startup, screen assertions, input/interrupt/resize support and Linux/macOS CI execution. Bash must exercise promptvars on/off; Fish must exercise startup and Enter/cancel behavior. This gates corresponding shell behavior changes and cross-shell acceptance claims. |
-| Session ownership and sync composition | Depends on measurements, relevant PTY harnesses and the daemon cache-only request; implement current-context foreground composition, slow-probe refresh, bounded framing and over-budget fallback. Preserve lifecycle and literal-rendering regressions. |
-| Shared storage and domain migration | Separate from the kill switch; implement secure storage, coordination and typed probe policies, with command TTL compatibility tests. |
-| Daemon ownership | First inject clock/timer/executor controls; then add the versioned cache-only and compute requests, implement leases/incarnations, remove the listener and client inline fallbacks, make actor death a daemon exit, and prove controlled invalidation/eviction/deadline interleavings and resource limits. |
+| Session ownership and sync composition | Depends on measurements, relevant PTY harnesses and the `SNAPSHOT` request; implement the init-minted session identity, current-context foreground composition, slow-probe refresh, bounded framing, generation-aware event handling and over-budget fallback. Preserve lifecycle and literal-rendering regressions. |
+| Daemon-owned probe caches and legacy retirement | Add `SNAPSHOT`, `LEASE` and `PUT`; move weather, location, health and command caches into daemon namespaces with their policies, caps and no-daemon behavior; make `weather` depend on `daemon`; stop reading the legacy disk caches and add doctor cleanup; command TTL and scope compatibility tests. |
+| Daemon ownership | First inject clock/timer/executor controls; then implement leases/incarnations, change-diff broadcasts with generations and jitter, cost backoff and reduced-detail mode, remove the listener and client inline fallbacks, make actor death a daemon exit, and prove controlled invalidation/eviction/deadline interleavings and resource limits. |
+
+Between the kill switch and legacy retirement, the command, weather and health disk
+caches keep their current behavior. The command cache's shared temporary directory is
+the remaining known exposure in that window, so retirement should not trail the socket
+slice by long.
 
 The current PTY harness covers Zsh only, as recorded in [CLAUDE.md](../CLAUDE.md).
 The Bash subprocess unit tests in PR #23 are valuable but are not PTY evidence.
@@ -421,6 +557,14 @@ rendering functional; rollback must not restore unsafe legacy reads.
 | Legacy cache deletion and omitted command TTL migration | narrow idempotent unlink; pasted snippet sees no frozen payload after cleanup; unsafe parent reported as a security finding; legacy 30-second TTL preserved and doctor warns |
 | Actor timeout/send failure while compute is running | explicit unavailable/busy response, no handler or client duplicate compute |
 | Old daemon with new client; actor thread dies | foreground renders unknown without inline compute; daemon exits and is respawned on the next miss; no indefinite unavailable stream |
+| Precreated runtime directory, foreign socket, or peer UID mismatch | daemon refuses to start there; client sends nothing and renders unknown; init prints one notice; doctor names the path |
+| Hostile or stale pidfile; hung daemon | stop never signals a PID it did not derive from the held lock inside a validated directory |
+| Many panes in one repository; churn that leaves the summary unchanged | one recompute, no broadcast when unchanged, one broadcast and one coalesced refresh per pane when changed |
+| Slow repository under sustained churn | recompute interval scales with measured cost; detail degrades before the segment disappears; CPU stays bounded |
+| `sudo` with preserved HOME or runtime directory | effective UID mismatch bypasses writes; foreign-owned entries are removed only by explicit doctor cleanup |
+| Logout on systemd; `/tmp` purge on macOS | history database and spool survive in the state root |
+| Daemon absent or disabled | bounded inline Git status, commands each prompt, weather empty with one notice; no per-second network calls from tmux |
+| Custom command with `session`, `worktree` or `global` scope and declared context | no sharing across differing declared values; expected sharing within scope |
 | Two shells in different directories/environments/configs | neither can install the other's result or overwrite its presentation state |
 | Re-sourced init or nested interactive shell | no duplicate hooks, inherited publication authority or orphaned workers |
 | Same cwd, new exit status/jobs/config/env | new cycle cannot present previous-cycle facts as current |
@@ -429,7 +573,7 @@ rendering functional; rollback must not restore unsafe legacy reads.
 | Split response, truncated frame, missing EOF, oversized/invalid UTF-8 | bounded parser/deadline; no blocked editor or partial display |
 | `%`, `$()`, backticks, newlines, ESC, OSC, tmux `#{...}` in data | literal display appropriate to each output language, no execution/control injection |
 | Startup output, input, password prompt, error, Ctrl-C | no lost output, stolen stdin, wrong erasure or broken terminal descriptors |
-| Reader overlaps rename | old or new complete entry; never header A/body B |
+| Reader overlaps rename in the state root | old or new complete entry; never header A/body B |
 | Two writers or writer crashes at every publication step | old or new valid entry; no shared-temp corruption or unbounded orphan growth |
 | Symlink/FIFO/device, wrong owner/mode, relative/missing roots | rejected without traversal, overwrite, blocking or fallback into cwd |
 | Expiry, future clock, schema/config/provider/account change | miss or explicitly permitted bounded stale value |
@@ -437,8 +581,8 @@ rendering functional; rollback must not restore unsafe legacy reads.
 | Command cwd/env changes, failed command, large output, held-open pipe | correct key/policy, deadline and output cap, child cleanup |
 | Invalidate during compute; evict/recreate; shared Git refs | obsolete token cannot republish, and all affected worktrees eventually refresh |
 | Watcher loss, queue overflow, daemon restart | resync without an unrelated user command or lost-final-event dependency |
-| Busy lock, failed probe, stuck filesystem worker | no duplicate-fetch fallback, retry storm or UI wait for uninterruptible reaping |
-| Capacity, inode exhaustion, read-only filesystem, disk full | old usable state preserved, bounded bypass, silent normal rendering |
+| Busy lease, failed probe, stuck filesystem worker | no duplicate-fetch fallback, retry storm or UI wait for uninterruptible reaping |
+| Memory caps reached; state root full, read-only or exhausted | eviction within bounds; durable writes fail closed and doctor reports; silent normal rendering |
 | Mixed old/new CLI, daemon and pasted snippets | explicit compatibility fallback, no heuristic execution of old cache bytes |
 
 Concurrency tests use barriers/fake clocks and controlled completion order, not lucky
@@ -447,7 +591,8 @@ PTY tests establish terminal behavior on Linux/macOS, Bash with promptvars on/of
 and Zsh with PROMPT_SUBST on/off. Fish needs display and startup coverage too.
 
 Release decisions still needing measurement are the probe-free composition budget,
-over-budget fallback UX, whole-render deadline, maintenance budgets, and local-filesystem
-support detection. Measurement precedes v2 presentation implementation.
+over-budget fallback UX, whole-render deadline, in-memory caps, the recompute backoff
+factor and budget, broadcast jitter, and whether a typed exit snapshot of weather and
+health entries is needed. Measurement precedes v2 presentation implementation.
 Security, key identity, nonblocking UI behavior, and rejection of obsolete results
 are requirements; measurements may tune budgets but cannot waive those invariants.
