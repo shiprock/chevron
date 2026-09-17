@@ -226,7 +226,7 @@ connection.
 
 ## Alignment with the architecture direction
 
-A resident client per shell, as proposed in [architecture.md](architecture.md), pays
+A resident client per shell, as decided in [architecture.md](architecture.md), pays
 the handshake once per shell lifetime, holds one control connection and one relay
 connection, and lets the daemon tie leases and subscriptions to the session so a dead
 client cleans up on disconnect. A split into a thin `chevron` client and a fat

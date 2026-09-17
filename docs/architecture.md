@@ -1,7 +1,8 @@
 # Architecture direction
 
-Status: proposed on 2026-09-14, arising from the cache design review in
-[cache-design.md](cache-design.md). These are decisions that reach beyond caches.
+Status: proposed on 2026-09-14 from the cache design review in
+[cache-design.md](cache-design.md); items 1, 2, 3, 5 and the branch model in 8 were
+decided by the owner on 2026-09-17. These are decisions that reach beyond caches.
 Each carries a status and the evidence that gates it. Nothing here is implemented.
 
 ## 1. The daemon is the runtime
@@ -18,7 +19,9 @@ degraded mode.
 
 ## 2. Process model: a resident client per shell
 
-Status: proposed; gated on the measurement slice.
+Status: decided 2026-09-17. The measurement slice confirms the spawn cost before the
+composition slice builds it; fork consolidation is the recorded fallback only if
+measurement shows spawns are cheap.
 
 With default settings inside tmux, the zsh integration spawns these external
 processes per command today:
@@ -39,9 +42,19 @@ in the cache design, so it must be decided before the composition slice. The
 measurement slice adds raw launch time of `stty -g` and `chevron version` as the
 floor the alternatives are compared against.
 
+The client's environment is captured when it starts, so the shell sends the cycle's
+working directory and the current values of the declared context variables with each
+request, and the client overlays them when it runs a custom command. That makes the
+command's environment exactly the declared one, which is also what the cache key
+digests. The client dies with its shell by reading end-of-file on its pipe; a shell
+that finds the pipe closed restarts it a bounded number of times per session and
+falls back to bounded synchronous rendering beyond that. Moving the terminal query
+and raw-mode dance into the client is its own slice, gated on the PTY harness, because
+those invariants are the most fragile in the repository.
+
 ## 3. Binary split
 
-Status: proposed; follows from 1 and 2.
+Status: decided 2026-09-17, following from 1 and 2.
 
 The prompt path today links git2, an image codec, an interactive prompt library, TLS
 and SQLite, all paged in on every render. A thin `chevron` client and a fat `chevrond`
@@ -63,7 +76,7 @@ the kernel's test suite and grows to Bash and Fish as the cache design requires.
 
 ## 5. Product scope
 
-Status: open; the owner's decision.
+Status: decided 2026-09-17: local-first.
 
 The issue tracker points at a session brain with atuin-style history and a sync
 spike with end-to-end encryption. The cache design's threat model is local. Sync
@@ -72,6 +85,12 @@ which needs its own threat model covering keys, transport and server trust. The 
 coherent shapes are a prompt with a local daemon that exports history, or a session
 brain that syncs. Deciding before the daemon accumulates more data is cheaper than
 deciding after.
+
+Decision: chevron is a prompt with a local daemon. History stays in the local state
+root and is never sent off the host by chevron. Any future sync is a separate
+component with its own threat model, keys and transport, designed and reviewed on its
+own; nothing in this redesign assumes or prepares for it beyond the versioned
+protocol and schema.
 
 ## 6. Settings model
 
@@ -94,18 +113,20 @@ cross-version job in CI.
 
 ## 8. Testing and release process
 
-Status: proposed.
+Status: testing proposed; the branch model was decided 2026-09-17: single trunk.
 
 Two-UID security tests run in a Linux container in CI and cannot run on the macOS
 runner; the design says so and runs them where possible. The daemon end-to-end suite
-loses its ignore marker as part of the daemon slice. The kill switch and socket
-slices are security fixes and land on both `master` and `unstable` together with a
-tag; the current divergence between those branches is a standing risk for a tool
-meant to last, and a single trunk with release tags would remove it.
+loses its ignore marker as part of the daemon slice. The branch model is a single
+trunk: reconcile `unstable` into `master` once, point the dotfiles flake at `master`
+or a release tag, retire `unstable`, and update the branch section of CLAUDE.md when
+that lands. Releases are tags. The kill switch and socket slices then land once, on
+the trunk, each with a tag.
 
 ## Sequencing
 
-The kill switch and socket trust slices depend on none of the above and proceed now.
-Items 1 through 3 are decided, with measurements, before the composition and daemon
-slices, because they change the transport and the binary layout. Item 5 is the only
-goal-level question.
+The branch reconciliation comes first, so that every later slice lands once. The kill
+switch and socket trust slices follow immediately; they depend on nothing else. The
+measurement slice then confirms the resident-client decision, and the composition and
+daemon slices build the client, the binary split and the daemon changes on that basis.
+Product scope is settled as local-first, so no slice carries sync work.

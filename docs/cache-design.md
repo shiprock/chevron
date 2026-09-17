@@ -46,6 +46,7 @@ Relevant current code: [shell integration](../src/shell.rs),
 | Bound recompute by measured cost and degrade detail first | A slow repository under churn must not pin a core or lose its segment |
 | Mint the session identity at init without a fork and share it with history | One identity, one fewer startup fork, no inherited authority |
 | Print one stderr line at init for security findings | Nobody runs doctor unprompted |
+| Run one resident client per shell instead of per-prompt processes (decided 2026-09-17) | Removes every spawn from the prompt cycle and absorbs the shell-side logic this design would otherwise add; the measurement slice confirms the spawn cost first |
 
 Evidence status of the findings, as recorded in this repository: literal prompt
 expansion and cross-directory command-output reuse have red/green regression tests
@@ -135,10 +136,22 @@ authority: publication requires `ZSH_SUBSHELL` or `BASH_SUBSHELL` to be zero, an
 fish uses its equivalent. The same identity replaces the separate history session
 request, removing that startup fork as well.
 
+The transport is a resident client per shell, decided on 2026-09-17 and recorded in
+[architecture.md](architecture.md). Init starts one client process for the shell; it
+holds the control and relay connections to the daemon, performs the `HELLO` once, and
+exchanges frames with the shell over a persistent pipe. Where this section says
+worker, read the client's handling of one cycle request: superseding is a message
+carrying the new cycle token, not a process to reap, and the client abandons the old
+cycle's work. The bounded nonblocking reader, the frame format and the acceptance
+rules below apply unchanged to the pipe. If the client is not ready within the
+foreground budget, the cycle uses the over-budget fallback and installs the frame when
+it arrives. A closed pipe is restarted a bounded number of times per session, after
+which the shell falls back to bounded synchronous rendering.
+
 At each `precmd`, capture exit status, duration and job count before other hooks
 alter them. Advance the cycle and launch/render using that immutable context.
-The worker loads current config once and collects its inputs once; it does not
-write a shared final-prompt cache. Explicit `CHEVRON_CACHE_FILE` writes are removed
+The client loads config once and reloads it when the file changes; it collects each
+cycle's inputs once and does not write a shared final-prompt cache. Explicit `CHEVRON_CACHE_FILE` writes are removed
 from the generated v2 path. Shell, config and protocol compatibility are negotiated
 rather than guessed from the presence of `%{`.
 
@@ -175,10 +188,11 @@ The synchronous integration retains bounded rendering until the split is ready.
 
 Within the same cycle, the last accepted prompt can remain visible during refresh.
 An event that arrives while work is running records one pending refresh. Subsequent
-events coalesce; the final event cannot disappear. Allow at most one active worker
-and one pending refresh per shell. Superseding a worker cancels/reaps it or waits
-within a deadline before launching its replacement. Cancellation never sends a
-signal to PID zero or a recycled process group.
+events coalesce; the final event cannot disappear. Allow at most one in-flight cycle
+request and one pending refresh per shell. Superseding sends the client the new cycle
+token; the client cancels the old cycle's outstanding probes and command runs, and any
+child process it must terminate is addressed by its own process group, never PID zero
+or a recycled group.
 
 On `cd`, a new prompt cycle, live-disable or exit, invalidate pending work and
 cancel timers as appropriate. Reconnect requests a fresh snapshot; an event is a
@@ -254,7 +268,7 @@ transition period. Never silently re-enable the old shared cache as fallback.
 |---|---|---|---|
 | Shell presentation | session, cycle, request, captured context | fresh synchronous composition; slow probes refresh asynchronously; placeholder only over budget | shell |
 | Git status | canonical worktree plus actual gitdir/common-dir identity; daemon incarnation | current 100 ms TTL baseline plus watcher invalidation; invalidated data is not fresh | daemon actor |
-| Custom command | command definition, scope path (cwd by default, worktree, global or session), cache schema, digest of declared context values with `PATH` included by default | explicit TTL; never serve expired output after command failure | daemon actor stores; the shell's worker computes |
+| Custom command | command definition, scope path (cwd by default, worktree, global or session), cache schema, digest of declared context values with `PATH` included by default | explicit TTL; never serve expired output after command failure | daemon actor stores; the shell's resident client computes |
 | Weather observations | provider, provider account identity if semantically relevant, location resolution and units | configured fresh TTL; bounded stale-on-error, proposed maximum 6 hours | daemon actor |
 | Location lookup | lookup source and declared context | bounded TTL for IP geolocation; explicit coordinates need no lookup | daemon actor |
 | Health probe | host and actual target identity, probe/parser revision | existing probe TTL; expired results become unknown rather than falsely healthy | daemon actor |
@@ -286,9 +300,11 @@ is a resident owner keyed by the session identity. The declared context is a lis
 nonsecret environment variable names whose values are digested into the key; `PATH`
 is included by default so different toolchain environments never share output.
 Undeclared environment dependence is the user's responsibility and is documented as
-such. The shell's asynchronous worker runs the command in its own environment after a
-`LEASE`, under its deadline, output cap and process-group cleanup, then stores the
-result with `PUT`; the foreground only reads. Commands requiring fresh side effects
+such. The shell sends the cycle's working directory and the current values of the
+declared context variables with each request; the resident client overlays them on
+its base environment and runs the command after a `LEASE`, under its deadline, output
+cap and process-group cleanup, then stores the result with `PUT`; the foreground only
+reads. Commands requiring fresh side effects
 should not be cached. TTL zero neither reads nor writes entries. Failure backoff is
 separate from cached success: a short bounded retry delay may prevent repeated failed
 runs, but must not make expired output valid or survive a relevant key change. Do not
@@ -377,9 +393,9 @@ rules are normative in [protocol.md](protocol.md).
 
 Placement follows the dependency. Daemon workers compute Git status, fetch weather and
 location, and run health probes; none of these depend on the caller's environment.
-Custom commands depend on the shell's environment, so the shell's asynchronous worker
-runs them itself, in its own environment and working directory, after obtaining a
-lease, and stores the result with `PUT`. The lease prevents duplicate runs across
+Custom commands depend on the shell's environment, so the shell's resident client
+runs them with the cycle's working directory and the declared context values the shell
+sent, after obtaining a lease, and stores the result with `PUT`. The lease prevents duplicate runs across
 shells; the declared context in the key keeps shells with different environments apart.
 
 Freshness starts at compute start, measured on the daemon's injected monotonic clock.
@@ -533,9 +549,9 @@ Implementation ships in independently gated Beads slices:
 |---|---|
 | Immediate kill switch — ships first and alone | Stop precmd cache-file reads and binary writes; emit a no-op instant snippet; safely unlink the known legacy entry on first execution. Prove poisoned bytes are not rendered/executed, deletion is narrow/idempotent, and existing Zsh regressions pass. No storage framework or v2 presentation work in this change. User-visible consequence for release notes: `CHEVRON_ASYNC=1` renders synchronously on every cycle until the composition slice lands; live-event refreshes keep working because they never used the cache file. |
 | Socket trust boundary — ships second, also alone | Peer-credential checks in client and daemon; the protocol version 2 handshake with negotiation and retirement from [protocol.md](protocol.md); runtime root created and validated with the shared primitive; POSIX record lock on a lifetime descriptor; `SHUTDOWN` and `VERSION` replace the pidfile, with `F_GETLK` as the hung-daemon fallback; history database, spool and log move to the state root with a one-time verified copy. Gate: negative peer tests through an injected credential source plus a two-user manual check on macOS and Linux; a hostile pidfile and a precreated directory are both proven inert; history survives a simulated logout. |
-| Measurement prerequisite | Benchmark probe-free composition end to end as above and select its budget before implementing the v2 split. Record distributions and configurations, not a single best-case timing. |
+| Measurement prerequisite | Benchmark probe-free composition end to end as above and select its budget before implementing the v2 split. Record distributions and configurations, not a single best-case timing. Also time raw process launch of `stty -g` and `chevron version` against a daemon round trip to confirm the resident-client decision; if spawns prove cheap, fork consolidation is the recorded fallback. |
 | Shell harness prerequisite | Add Bash and Fish PTY fixtures with hermetic startup, screen assertions, input/interrupt/resize support and Linux/macOS CI execution. Bash must exercise promptvars on/off; Fish must exercise startup and Enter/cancel behavior. This gates corresponding shell behavior changes and cross-shell acceptance claims. |
-| Session ownership and sync composition | Depends on measurements, relevant PTY harnesses and the `SNAPSHOT` request; implement the init-minted session identity, current-context foreground composition, slow-probe refresh, bounded framing, generation-aware event handling and over-budget fallback. Preserve lifecycle and literal-rendering regressions. |
+| Session ownership and sync composition | Depends on measurements, relevant PTY harnesses and the `SNAPSHOT` request; implement the resident client with its pipe transport, lifecycle and bounded restart, the init-minted session identity, current-context foreground composition, slow-probe refresh, bounded framing, generation-aware event handling and over-budget fallback. Moving the terminal query dance into the client is a separate slice gated on the PTY harness. Preserve lifecycle and literal-rendering regressions. |
 | Daemon-owned probe caches and legacy retirement | Add `SNAPSHOT`, `LEASE` and `PUT`; move weather, location, health and command caches into daemon namespaces with their policies, caps and no-daemon behavior; make `weather` depend on `daemon`; stop reading the legacy disk caches and add doctor cleanup; command TTL and scope compatibility tests. |
 | Daemon ownership | First inject clock/timer/executor controls; then implement leases/incarnations, change-diff broadcasts with generations and jitter, cost backoff and reduced-detail mode, remove the listener and client inline fallbacks, make actor death a daemon exit, and prove controlled invalidation/eviction/deadline interleavings and resource limits. |
 
@@ -569,7 +585,8 @@ rendering functional; rollback must not restore unsafe legacy reads.
 | Daemon absent or disabled | bounded inline Git status, commands each prompt, weather empty with one notice; no per-second network calls from tmux |
 | Custom command with `session`, `worktree` or `global` scope and declared context | no sharing across differing declared values; expected sharing within scope |
 | Two shells in different directories/environments/configs | neither can install the other's result or overwrite its presentation state |
-| Re-sourced init or nested interactive shell | no duplicate hooks, inherited publication authority or orphaned workers |
+| Re-sourced init or nested interactive shell | no duplicate hooks, inherited publication authority or orphaned client processes |
+| Resident client crashes or its pipe closes; shell exits | bounded restart, then synchronous fallback; the client exits on end-of-file and leaves no orphan |
 | Same cwd, new exit status/jobs/config/env | new cycle cannot present previous-cycle facts as current |
 | Old completion after new cycle, cd, resize, disable or exit | response and title rejected; workers/fds/timers bounded and cleaned |
 | Burst while render is in flight; then silence | coalesced work eventually displays the final valid state |
