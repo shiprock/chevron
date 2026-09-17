@@ -322,14 +322,14 @@ fn shell_integration_section() -> Vec<Check> {
         check_tmux(&home),
         check_legacy_env_vars(&home),
         check_instant_prompt(&home, &shell_name),
+        check_legacy_prompt_cache(),
     ]
 }
 
-/// Detect whether the user has pasted the instant-prompt snippet into
-/// their `.zshrc`. The snippet itself is gated on `-o interactive && -t 1`
-/// and on chevron's main init not yet being loaded, so a stray presence is
-/// harmless. We just surface its presence/absence so users discover the
-/// feature exists.
+/// Detect instant-prompt blocks pasted into zsh startup files. The retired
+/// v1 block read a shared cache file and painted its bytes before `.zshrc`
+/// ran; it must be removed. The current block is a comment-only no-op and is
+/// merely reported.
 fn check_instant_prompt(home: &str, current_shell: &str) -> Check {
     // zsh-only feature. For non-zsh users this row is informational
     // ("doesn't apply") to avoid implying they're missing something.
@@ -342,7 +342,8 @@ fn check_instant_prompt(home: &str, current_shell: &str) -> Check {
     }
     let candidates = [".zshrc", ".zshenv", ".zprofile"];
     let mut zshrc_has_chevron = false;
-    let mut marker_found_in: Option<String> = None;
+    let mut legacy_in: Option<String> = None;
+    let mut current_in: Option<String> = None;
     for c in &candidates {
         let path = PathBuf::from(home).join(c);
         let Ok(contents) = std::fs::read_to_string(&path) else {
@@ -351,26 +352,73 @@ fn check_instant_prompt(home: &str, current_shell: &str) -> Check {
         if contents.contains("chevron init") {
             zshrc_has_chevron = true;
         }
+        if contents.contains(crate::shell::LEGACY_INSTANT_PROMPT_MARKER) {
+            legacy_in = Some(friendly_path(&path, home));
+        }
         if contents.contains(crate::shell::INSTANT_PROMPT_MARKER) {
-            marker_found_in = Some(friendly_path(&path, home));
+            current_in = Some(friendly_path(&path, home));
         }
     }
-    match (marker_found_in, zshrc_has_chevron) {
+    if let Some(path) = legacy_in {
+        return Check::warn(
+            "instant_prompt",
+            "instant prompt",
+            format!("retired v1 block in {path}"),
+            "remove the block marked chevron-instant-prompt-v1: it painted bytes from a shared \
+             cache file that chevron no longer writes, and on multi-user hosts another user \
+             could choose those bytes",
+        );
+    }
+    match (current_in, zshrc_has_chevron) {
         (Some(path), _) => Check::ok(
             "instant_prompt",
             "instant prompt",
-            format!("snippet present in {path}"),
+            format!("no-op block in {path} (safe to delete)"),
         ),
-        (None, true) => Check::info_hint(
+        (None, true) => Check::info(
             "instant_prompt",
             "instant prompt",
-            "available, not enabled",
-            "paste the output of `chevron init zsh --instant-prompt` at the TOP of ~/.zshrc",
+            "not used (the startup cache is retired)",
         ),
         (None, false) => Check::info(
             "instant_prompt",
             "instant prompt",
             "not configured (chevron init not in ~/.zshrc)",
+        ),
+    }
+}
+
+/// Run the idempotent v1 prompt-cache cleanup and report what it found. A
+/// parent directory the cleanup refuses to touch is a security finding: on
+/// that host another user may control what a still-pasted v1 block paints,
+/// and only the user can remove that block.
+fn check_legacy_prompt_cache() -> Check {
+    use crate::legacy_cache::{self, Cleanup};
+    let dir = legacy_cache::dir();
+    match legacy_cache::retire() {
+        Cleanup::Absent => Check::ok(
+            "legacy_prompt_cache",
+            "legacy prompt cache",
+            format!("none under {}", dir.display()),
+        ),
+        Cleanup::Removed => Check::ok(
+            "legacy_prompt_cache",
+            "legacy prompt cache",
+            format!("removed retired entry from {}", dir.display()),
+        ),
+        Cleanup::UnsafeParent(reason) => Check::critical(
+            "legacy_prompt_cache",
+            "legacy prompt cache",
+            reason,
+            "security finding: chevron will not touch this directory. Remove any block marked \
+             chevron-instant-prompt-v1 from ~/.zshrc, delete the directory yourself if it is \
+             yours, and on multi-user hosts set XDG_RUNTIME_DIR to a private directory",
+        ),
+        Cleanup::Failed(reason) => Check::warn(
+            "legacy_prompt_cache",
+            "legacy prompt cache",
+            reason,
+            "remove the entry manually; nothing reads it any more",
         ),
     }
 }
@@ -956,6 +1004,51 @@ mod tests {
         assert!(c.hint.is_some(), "glyph check should hint about fonts");
     }
 
+    // ── instant prompt markers ───────────────────────────────────────────
+
+    #[test]
+    fn instant_prompt_reports_retired_v1_block_as_warning() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join(".zshrc"),
+            format!(
+                "# Marker: {}\neval \"$(chevron init zsh)\"\n",
+                crate::shell::LEGACY_INSTANT_PROMPT_MARKER
+            ),
+        )
+        .unwrap();
+        let c = check_instant_prompt(home.path().to_str().unwrap(), "zsh");
+        assert_eq!(c.severity, Severity::Warn);
+        assert!(c.value.contains("v1"), "{}", c.value);
+    }
+
+    #[test]
+    fn instant_prompt_reports_current_block_as_ok() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join(".zshrc"),
+            format!(
+                "{}\neval \"$(chevron init zsh)\"\n",
+                crate::shell::init_zsh_instant_prompt()
+            ),
+        )
+        .unwrap();
+        let c = check_instant_prompt(home.path().to_str().unwrap(), "zsh");
+        assert_eq!(c.severity, Severity::Ok);
+    }
+
+    #[test]
+    fn instant_prompt_without_block_is_informational() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(home.path().join(".zshrc"), "eval \"$(chevron init zsh)\"\n").unwrap();
+        let c = check_instant_prompt(home.path().to_str().unwrap(), "zsh");
+        assert_eq!(c.severity, Severity::Info);
+        assert!(
+            c.hint.is_none(),
+            "must not recommend pasting a retired feature"
+        );
+    }
+
     // ── friendly_path ────────────────────────────────────────────────────
 
     #[test]
@@ -1113,30 +1206,6 @@ mod tests {
         let c = check_instant_prompt(&home, "bash");
         assert_eq!(c.severity, Severity::Info);
         assert!(c.value.contains("zsh only"));
-    }
-
-    #[test]
-    fn instant_prompt_info_when_snippet_absent_and_chevron_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().to_string_lossy().into_owned();
-        write_temp(&tmp.path().join(".zshrc"), "eval \"$(chevron init zsh)\"\n");
-        let c = check_instant_prompt(&home, "zsh");
-        assert_eq!(c.severity, Severity::Info);
-        assert!(c.value.contains("available"));
-        assert!(c.hint.is_some(), "should hint at the --instant-prompt cmd");
-    }
-
-    #[test]
-    fn instant_prompt_ok_when_marker_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().to_string_lossy().into_owned();
-        write_temp(
-            &tmp.path().join(".zshrc"),
-            "# Marker: chevron-instant-prompt-v1\nstuff\neval \"$(chevron init zsh)\"\n",
-        );
-        let c = check_instant_prompt(&home, "zsh");
-        assert_eq!(c.severity, Severity::Ok);
-        assert!(c.value.contains("snippet present"));
     }
 
     #[test]
