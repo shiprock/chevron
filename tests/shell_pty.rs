@@ -487,6 +487,30 @@ impl Term {
         }
     }
 
+    /// Block until a process whose command line matches `cmd` runs as a
+    /// direct child of the spawned zsh, i.e. the foreground command has
+    /// been exec'd and owns the terminal. Signals meant for the child
+    /// (^Z) sent before that point are swallowed by zsh itself.
+    fn wait_for_child(&self, cmd: &str) {
+        let zsh_pid = self.child.process_id().expect("zsh pid").to_string();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let found = std::process::Command::new("pgrep")
+                .args(["-P", &zsh_pid, "-f", cmd])
+                .output()
+                .is_ok_and(|o| o.status.success() && !o.stdout.is_empty());
+            if found {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for child {cmd:?}\n{}",
+                self.dump()
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+
     /// Like `wait_for`, but the predicate runs over the raw byte stream
     /// — for syncing on emissions that never change the rendered grid
     /// (OSC markers, DSR queries).
@@ -1376,9 +1400,10 @@ fn suspend_resume_cycle_keeps_rows_intact() {
     });
     // The collapse paints before preexec hands the terminal to the
     // child; ^Z must hit the CHILD's process group. Too early and zsh
-    // (which ignores TSTP) eats it; too late is harmless within the 5 s
-    // sleep window.
-    std::thread::sleep(Duration::from_millis(200));
+    // (which ignores TSTP) eats it, the sleep runs to completion, and the
+    // suspend below never happens. A fixed delay lost that race about one
+    // run in five on a loaded machine, so wait for the exec'd child instead.
+    t.wait_for_child("sleep 5");
     t.send("\x1a"); // Ctrl-Z
     t.wait_for("suspend message and prompt", |s| {
         lines(s).iter().any(|l| l.contains("suspended")) && prompt_ready(s)
