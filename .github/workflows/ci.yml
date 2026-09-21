@@ -27,6 +27,14 @@ jobs:
   audit:
     name: Cargo Audit
     runs-on: ubuntu-latest
+    # The action publishes its result as a check run, which needs
+    # `checks: write`. With the repository's read-only default token that
+    # publish fails; on pull requests the action logs the failure and still
+    # passes, but on pushes to master it fails the job even with zero
+    # vulnerabilities, which kept master's audit red from 2026-09-13 on.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v7
       - uses: rustsec/audit-check@v2.0.0
