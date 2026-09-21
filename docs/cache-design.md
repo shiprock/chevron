@@ -1,6 +1,7 @@
 # Cache contracts and design review
 
 Status: proposed design, reviewed against `master` at commit 55a2f4f on 2026-09-14.
+The kill-switch slice shipped in #26 on 2026-09-21; every other slice remains open.
 This document does not claim the architecture is implemented or race-free.
 Implementation and release status live in Beads epic `beads_plx-rzh`.
 
@@ -547,7 +548,7 @@ Implementation ships in independently gated Beads slices:
 
 | Slice | Scope and gate |
 |---|---|
-| Immediate kill switch — ships first and alone | Stop precmd cache-file reads and binary writes; emit a no-op instant snippet; safely unlink the known legacy entry on first execution. Prove poisoned bytes are not rendered/executed, deletion is narrow/idempotent, and existing Zsh regressions pass. No storage framework or v2 presentation work in this change. User-visible consequence for release notes: `CHEVRON_ASYNC=1` renders synchronously on every cycle until the composition slice lands; live-event refreshes keep working because they never used the cache file. |
+| Immediate kill switch — ships first and alone (implemented in #26, merged 2026-09-21) | Stop precmd cache-file reads and binary writes; emit a no-op instant snippet; safely unlink the known legacy entry on first execution. Prove poisoned bytes are not rendered/executed, deletion is narrow/idempotent, and existing Zsh regressions pass. No storage framework or v2 presentation work in this change. User-visible consequence for release notes: `CHEVRON_ASYNC=1` renders synchronously on every cycle until the composition slice lands; live-event refreshes keep working because they never used the cache file. |
 | Socket trust boundary — ships second, also alone | Peer-credential checks in client and daemon; the protocol version 2 handshake with negotiation and retirement from [protocol.md](protocol.md); runtime root created and validated with the shared primitive; POSIX record lock on a lifetime descriptor; `SHUTDOWN` and `VERSION` replace the pidfile, with `F_GETLK` as the hung-daemon fallback; history database, spool and log move to the state root with a one-time verified copy. Gate: negative peer tests through an injected credential source plus a two-user manual check on macOS and Linux; a hostile pidfile and a precreated directory are both proven inert; history survives a simulated logout. |
 | Measurement prerequisite | Benchmark probe-free composition end to end as above and select its budget before implementing the v2 split. Record distributions and configurations, not a single best-case timing. Also time raw process launch of `stty -g` and `chevron version` against a daemon round trip to confirm the resident-client decision; if spawns prove cheap, fork consolidation is the recorded fallback. |
 | Shell harness prerequisite | Add Bash and Fish PTY fixtures with hermetic startup, screen assertions, input/interrupt/resize support and Linux/macOS CI execution. Bash must exercise promptvars on/off; Fish must exercise startup and Enter/cancel behavior. This gates corresponding shell behavior changes and cross-shell acceptance claims. |
