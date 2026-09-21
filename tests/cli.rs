@@ -241,75 +241,134 @@ fn prompt_in_tmux_produces_two_lines() {
 }
 
 #[test]
-fn prompt_writes_cache_file_when_env_set() {
+fn prompt_ignores_the_retired_cache_file_env_var() {
+    // The v1 fast path wrote the rendered prompt wherever CHEVRON_CACHE_FILE
+    // pointed. The variable is inert now: rendering succeeds and no file or
+    // directory appears.
     let tmp = TempDir::new().unwrap();
     init_repo(tmp.path());
-    let cwd = tmp.path().canonicalize().unwrap();
     let cache = tmp.path().join("cache").join("last-prompt");
-
-    let output = cmd()
+    cmd()
         .args(["prompt", "20", "0", "0", "0"])
-        .current_dir(&cwd)
-        .env("HOME", "/nonexistent")
+        .current_dir(tmp.path())
         .env("CHEVRON_CACHE_FILE", &cache)
         .env_remove("IN_NIX_SHELL")
-        .env_remove("AWS_PROFILE")
-        .env_remove("VIRTUAL_ENV")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+    assert!(!cache.exists(), "prompt must not write a cache file");
+    assert!(
+        !tmp.path().join("cache").exists(),
+        "prompt must not create the cache directory"
+    );
+}
+
+// ── legacy prompt cache retirement ───────────────────────────────────────────
+
+fn legacy_dir_in(runtime: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata(runtime).unwrap().uid();
+    runtime.join(format!("chevron-{uid}"))
+}
+
+fn seed_legacy_dir(runtime: &std::path::Path, mode: u32) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = legacy_dir_in(runtime);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    std::fs::write(dir.join("last-prompt"), "/x\n%{poison%}\n").unwrap();
+    std::fs::write(dir.join("last-prompt.tmp"), "partial").unwrap();
+    dir
+}
+
+fn init_zsh_with_runtime(runtime: &std::path::Path) -> Command {
+    let mut c = cmd();
+    c.args(["init", "zsh"])
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env_remove("CHEVRON_NOTICE");
+    c
+}
+
+#[test]
+fn init_zsh_removes_legacy_prompt_cache_entries() {
+    let runtime = TempDir::new().unwrap();
+    let dir = seed_legacy_dir(runtime.path(), 0o700);
+    init_zsh_with_runtime(runtime.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("add-zsh-hook"))
+        .stderr(predicate::str::contains("chevron: ").not());
+    assert!(!dir.join("last-prompt").exists());
+    assert!(!dir.join("last-prompt.tmp").exists());
+    assert!(dir.is_dir(), "the directory itself is left alone");
+    // Idempotent: a second start finds nothing and stays quiet.
+    init_zsh_with_runtime(runtime.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("chevron: ").not());
+}
+
+#[test]
+fn init_zsh_unlinks_a_symlinked_legacy_entry_and_keeps_its_target() {
+    use std::os::unix::fs::PermissionsExt;
+    let runtime = TempDir::new().unwrap();
+    let dir = legacy_dir_in(runtime.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let victim = runtime.path().join("victim");
+    std::fs::write(&victim, "keep me").unwrap();
+    std::os::unix::fs::symlink(&victim, dir.join("last-prompt")).unwrap();
+    init_zsh_with_runtime(runtime.path()).assert().success();
+    assert!(
+        std::fs::symlink_metadata(dir.join("last-prompt")).is_err(),
+        "the link itself is removed"
+    );
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+}
+
+#[test]
+fn init_zsh_refuses_an_unsafe_legacy_dir_and_prints_one_notice() {
+    let runtime = TempDir::new().unwrap();
+    let dir = seed_legacy_dir(runtime.path(), 0o755);
+    init_zsh_with_runtime(runtime.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("add-zsh-hook"))
+        .stderr(
+            predicate::str::contains("chevron: ")
+                .and(predicate::str::contains("accessible to other users"))
+                .and(predicate::str::contains("chevron doctor")),
+        );
+    assert!(
+        dir.join("last-prompt").exists(),
+        "nothing inside an unsafe directory is touched"
+    );
+    // CHEVRON_NOTICE=0 silences the line; the refusal stands.
+    init_zsh_with_runtime(runtime.path())
+        .env("CHEVRON_NOTICE", "0")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("chevron: ").not());
+    assert!(dir.join("last-prompt").exists());
+}
+
+#[test]
+fn init_zsh_instant_prompt_is_comment_only() {
+    let out = cmd()
+        .args(["init", "zsh", "--instant-prompt"])
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
-    let printed = String::from_utf8_lossy(&output).to_string();
-
-    assert!(cache.exists(), "cache file should be created");
-    let cached = std::fs::read_to_string(&cache).unwrap();
-    let (cached_cwd, cached_body) = cached.split_once('\n').unwrap();
-    assert_eq!(
-        cached_cwd,
-        cwd.to_string_lossy(),
-        "first line of cache must be the cwd at render time"
-    );
-    assert_eq!(
-        cached_body, printed,
-        "cache body must byte-match the prompt that was printed"
-    );
-}
-
-#[test]
-fn prompt_cache_write_is_atomic_via_tmp_rename() {
-    // Verify the .tmp staging file doesn't linger after a successful write.
-    let tmp = TempDir::new().unwrap();
-    init_repo(tmp.path());
-    let cache = tmp.path().join("cache.dat");
-
-    cmd()
-        .args(["prompt", "20", "0", "0", "0"])
-        .current_dir(tmp.path())
-        .env("CHEVRON_CACHE_FILE", &cache)
-        .env_remove("IN_NIX_SHELL")
-        .assert()
-        .success();
-
-    assert!(cache.exists());
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("chevron-instant-prompt-v2"), "{text}");
     assert!(
-        !tmp.path().join("cache.tmp").exists(),
-        ".tmp staging file should have been renamed"
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .all(|l| l.starts_with('#')),
+        "instant-prompt output must be comment-only:\n{text}"
     );
-}
-
-#[test]
-fn prompt_works_without_cache_env_var() {
-    // Sanity: with CHEVRON_CACHE_FILE unset, prompt rendering is unaffected.
-    let tmp = TempDir::new().unwrap();
-    init_repo(tmp.path());
-    cmd()
-        .args(["prompt", "20", "0", "0", "0"])
-        .current_dir(tmp.path())
-        .env_remove("CHEVRON_CACHE_FILE")
-        .env_remove("IN_NIX_SHELL")
-        .assert()
-        .success();
 }
 
 // ── tmux-title ───────────────────────────────────────────────────────────────

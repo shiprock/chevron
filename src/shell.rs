@@ -18,71 +18,34 @@ pub fn init_zsh_with(cfg: &ShellConfig) -> String {
     format!("{}{}", shell_preamble_posix(cfg), BODY_ZSH)
 }
 
-/// Returns the top-of-`.zshrc` snippet that paints the previously cached
-/// prompt before the rest of `.zshrc` finishes loading (chevron-nf8). The
-/// user pastes this verbatim at the very top of their `~/.zshrc`. Activates
-/// only when chevron's main init has not yet loaded, when stdin/stdout are
-/// a tty, and when the cache file looks zsh-shaped.
+/// Returns the top-of-`.zshrc` instant-prompt block. Since the v1 prompt
+/// cache was retired this is a comment-only no-op, kept so existing installs
+/// have a stable, detectable marker; `chevron doctor` tells users who still
+/// carry the v1 block to remove it.
 #[must_use]
 pub fn init_zsh_instant_prompt() -> &'static str {
     INSTANT_PROMPT_ZSH
 }
 
-/// Sentinel comment line — used by `chevron doctor` to detect whether the
-/// user has pasted the instant-prompt snippet into their .zshrc.
-pub const INSTANT_PROMPT_MARKER: &str = "chevron-instant-prompt-v1";
+/// Sentinel comment line of the current (no-op) instant-prompt block, used
+/// by `chevron doctor` to detect it in zsh startup files.
+pub const INSTANT_PROMPT_MARKER: &str = "chevron-instant-prompt-v2";
 
-const INSTANT_PROMPT_ZSH: &str = r#"# chevron instant prompt — paste this BLOCK at the TOP of ~/.zshrc.
-# Marker: chevron-instant-prompt-v1
-# Paints the previously-rendered prompt from cache in <50ms while .zshrc
-# loads. Any output .zshrc produces is buffered and replayed when the real
-# prompt takes over. To disable, comment out this block.
-if [[ -o interactive && -t 1 ]] \
-    && [[ -z "$_chevron_instant_active" ]] \
-    && ! typeset -f _chevron_make_prompt >/dev/null 2>&1; then
-    _chevron_cache_file="${XDG_RUNTIME_DIR:-/tmp}/chevron-${UID:-$(id -u)}/last-prompt"
-    if [[ -r "$_chevron_cache_file" ]]; then
-        # Pure zsh — no fork. `$(<file)` is the builtin equivalent of cat.
-        local _chevron_cfull="$(<"$_chevron_cache_file")"
-        local _chevron_cprompt="${_chevron_cfull#*$'\n'}"   # drop pwd line
-        _chevron_cprompt="${_chevron_cprompt%%$'\n'*}"       # drop tmux title
-        # Shell-shape heuristic: only paint if the cache looks like a
-        # zsh-bracketed prompt body. Skip bash-style `\[` brackets which
-        # would print as literal characters under `print -P`.
-        if [[ -n "$_chevron_cprompt" \
-            && "$_chevron_cprompt" == *'%{'* \
-            && "$_chevron_cprompt" != *'\['* ]]; then
-            _chevron_instant_buf="${TMPDIR:-/tmp}/chevron-instant-$$"
-            if : > "$_chevron_instant_buf" 2>/dev/null; then
-                _chevron_instant_active=1
-                # Paint the cached prompt. `-P` interprets %{...%} as
-                # zero-width markers so cursor tracking stays correct.
-                print -nP -- "$_chevron_cprompt"
-                # Save original fds, then capture all stdout/stderr from
-                # .zshrc into the buffer. Takeover (or zshexit) restores.
-                exec {_chevron_instant_orig_stdout}>&1 \
-                     {_chevron_instant_orig_stderr}>&2
-                exec >>"$_chevron_instant_buf" 2>&1
-                # Defensive: if .zshrc errors before precmd takes over,
-                # this hook restores fds and flushes the buffer so the
-                # user isn't stuck with a broken terminal.
-                _chevron_instant_zshexit() {
-                    [[ -z "$_chevron_instant_active" ]] && return
-                    # No 2>/dev/null here: exec persists every redirection
-                    # on it, so it would re-point stderr at /dev/null.
-                    exec >&"$_chevron_instant_orig_stdout" \
-                         2>&"$_chevron_instant_orig_stderr"
-                    [[ -s "$_chevron_instant_buf" ]] \
-                        && cat -- "$_chevron_instant_buf" >&2 2>/dev/null
-                    rm -f -- "$_chevron_instant_buf" 2>/dev/null
-                }
-                zshexit_functions+=(_chevron_instant_zshexit)
-            fi
-        fi
-        unset _chevron_cfull _chevron_cprompt
-    fi
-fi
-"#;
+/// Marker of the retired v1 block. That block read a rendered prompt from a
+/// cache file under `${XDG_RUNTIME_DIR:-/tmp}` and painted it with `print -P`
+/// before `.zshrc` ran; on hosts without a private runtime directory another
+/// local user could precreate that directory and choose the bytes. Doctor
+/// reports the marker so users remove the block.
+pub const LEGACY_INSTANT_PROMPT_MARKER: &str = "chevron-instant-prompt-v1";
+
+const INSTANT_PROMPT_ZSH: &str = r"# chevron instant prompt — intentionally empty.
+# Marker: chevron-instant-prompt-v2
+# Earlier versions painted a previously rendered prompt from a shared cache
+# file before .zshrc ran. That cache is retired: nothing is read, painted or
+# redirected here, and this block can be deleted. If your .zshrc still has
+# the earlier block (its marker ends in v1), remove it; `chevron doctor`
+# checks for it.
+";
 
 #[allow(clippy::too_many_lines)]
 const BODY_ZSH: &str = r#"_chevron_preexec() {
@@ -271,11 +234,12 @@ _chevron_precmd() {
     # sweep/rewrite machinery below spend their own time — the duration
     # tag measures the command only.
     local _chevron_cmd_end=$EPOCHREALTIME
-    # Instant-prompt takeover (chevron-nf8). If the top-of-rc snippet
-    # painted a cached prompt and redirected stdout/stderr to a buffer,
-    # restore the real fds, close the spurious OSC 133 prompt region we
-    # opened, clear the cached prompt line, then replay any output that
-    # .zshrc produced. No-op when the snippet wasn't activated.
+    # Instant-prompt takeover (chevron-nf8) for a still-pasted v1 block.
+    # That block is retired, but a user's .zshrc may still carry it: if
+    # it painted a cached prompt and redirected stdout/stderr to a
+    # buffer, restore the real fds, close the spurious OSC 133 prompt
+    # region it opened, clear the painted line, then replay any output
+    # that .zshrc produced. No-op when the block wasn't activated.
     if [[ -n "$_chevron_instant_active" ]]; then
         # No error suppression on the restore: redirections apply left to
         # right and exec persists ALL of them, so a trailing 2>/dev/null
@@ -289,8 +253,7 @@ _chevron_precmd() {
         [[ -s "$_chevron_instant_buf" ]] && cat -- "$_chevron_instant_buf"
         rm -f -- "$_chevron_instant_buf" 2>/dev/null
         unset _chevron_instant_active _chevron_instant_buf \
-              _chevron_instant_orig_stdout _chevron_instant_orig_stderr \
-              _chevron_cache_file
+              _chevron_instant_orig_stdout _chevron_instant_orig_stderr
     fi
     # OSC 133 D: the just-completed command finished with $exit_status.
     # Emitted first so it closes out the previous command region before
@@ -471,36 +434,19 @@ _chevron_precmd() {
     fi
     local job_count=${(%):-%j}
     local chevron_output=""
-    # Generation stamp for the async fast path: bumped every cycle so a
-    # background refresh that finishes after a NEWER prompt is already
-    # up discards itself instead of repainting stale content (previous
-    # directory, previous exit status) over the live prompt.
+    # Generation stamp for background refreshes (live events): bumped
+    # every cycle so a refresh that finishes after a NEWER prompt is
+    # already up discards itself instead of repainting stale content
+    # (previous directory, previous exit status) over the live prompt.
     (( _chevron_async_gen++ ))
-    # Async fast path (CHEVRON_ASYNC=1): try the cached prompt from the
-    # previous render; on hit, set PROMPT immediately and spawn a
-    # background refresh whose result will trigger a redraw via the
-    # zle -F callback. On miss (cwd changed, first prompt of shell), fall
-    # through to the synchronous path below.
-    if [[ "${CHEVRON_ASYNC:-0}" != "0" && -r "$_chevron_cache_file" ]]; then
-        local _chevron_cached_pwd
-        IFS= read -r _chevron_cached_pwd < "$_chevron_cache_file"
-        if [[ "$_chevron_cached_pwd" == "$PWD" ]]; then
-            chevron_output=$(sed -n '2,$p' "$_chevron_cache_file" 2>/dev/null)
-            if [[ -n "$chevron_output" ]]; then
-                _chevron_start_async "$exit_status" "$duration_ms" "$job_count"
-            fi
-        fi
-    fi
-    if [[ -z "$chevron_output" ]]; then
-        # Synchronous render. Sets CHEVRON_CACHE_FILE only when async is
-        # enabled — no point in paying the I/O for users who'll never
-        # read the cache.
-        if [[ "${CHEVRON_ASYNC:-0}" != "0" ]]; then
-            chevron_output="$(CHEVRON_CACHE_FILE="$_chevron_cache_file" chevron prompt 20 $exit_status $duration_ms $job_count)"
-        else
-            chevron_output="$(chevron prompt 20 $exit_status $duration_ms $job_count)"
-        fi
-    fi
+    # Every cycle renders from current context. The former CHEVRON_ASYNC
+    # fast path installed the previous cycle's prompt from a shared cache
+    # file, so a new exit status or environment showed one cycle late,
+    # and on hosts without a private runtime directory another local
+    # user could plant the bytes. It is retired; CHEVRON_ASYNC no longer
+    # changes this path. Live events still refresh through the background
+    # render path below.
+    chevron_output="$(chevron prompt 20 $exit_status $duration_ms $job_count)"
     _chevron_make_prompt "${chevron_output%%$'\n'*}"
     PROMPT="$REPLY"
     # Transient stub for accept-line. Rendered neutrally (no green/red)
@@ -522,8 +468,8 @@ _chevron_precmd() {
     _chevron_last_exit=$exit_status
     _chevron_last_duration=$duration_ms
 }
-# Async fast-path machinery (chevron-7fs.5). Off by default; enable with
-# CHEVRON_ASYNC=1. The background process renders a fresh prompt and
+# Background refresh machinery (chevron-7fs.5), driven by live events
+# (_chevron_live_callback). The background process renders a fresh prompt and
 # writes it to its stdout (a pipe opened via process substitution). When
 # the pipe becomes readable (i.e., chevron has finished + closed stdout),
 # zsh fires _chevron_async_callback, which reads the fresh output, sets
@@ -533,7 +479,7 @@ _chevron_start_async() {
     # Stamp the refresh with the cycle that spawned it (see the
     # generation bump in precmd).
     _chevron_async_spawn_gen="$_chevron_async_gen"
-    exec {_chevron_async_fd}< <(CHEVRON_CACHE_FILE="$_chevron_cache_file" chevron prompt 20 "$exit_status" "$duration_ms" "$job_count" 2>/dev/null)
+    exec {_chevron_async_fd}< <(chevron prompt 20 "$exit_status" "$duration_ms" "$job_count" 2>/dev/null)
     zle -F "$_chevron_async_fd" _chevron_async_callback
 }
 _chevron_async_callback() {
@@ -626,10 +572,6 @@ _chevron_make_prompt() {
         REPLY="$1 "
     fi
 }
-# Cache file for the async fast path. Owner-only directory so the cached
-# prompt content (which may include path/branch info) isn't world-readable.
-_chevron_cache_file="${XDG_RUNTIME_DIR:-/tmp}/chevron-${UID:-$(id -u)}/last-prompt"
-[[ -d "${_chevron_cache_file:h}" ]] || mkdir -p -m 700 "${_chevron_cache_file:h}" 2>/dev/null
 # zselect backs the pending-input probe in _chevron_query_row. Best
 # effort: if the module is missing, the probe is skipped and the query
 # behaves as before.
@@ -1183,57 +1125,35 @@ mod tests {
     }
 
     #[test]
-    fn instant_prompt_snippet_reads_cache_file_without_forking() {
+    fn instant_prompt_snippet_is_comment_only() {
+        // The v1 block read `${XDG_RUNTIME_DIR:-/tmp}/chevron-$UID/last-prompt`
+        // and painted its bytes with `print -P`. The replacement must contain
+        // nothing zsh executes.
         let snippet = super::init_zsh_instant_prompt();
-        // $(<file) is the zsh-builtin file-read — no fork.
-        assert!(
-            snippet.contains("$(<\"$_chevron_cache_file\")"),
-            "snippet must use $(<file) builtin, not sed/cat (perf)"
+        for line in snippet.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(
+                line.starts_with('#'),
+                "executable line in the no-op snippet: {line:?}"
+            );
+        }
+        for forbidden in ["last-prompt", "$(<", "print -", "exec ", "XDG_RUNTIME_DIR"] {
+            assert!(
+                !snippet.contains(forbidden),
+                "no-op snippet must not contain {forbidden:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn instant_prompt_snippet_does_not_carry_the_legacy_marker() {
+        // Doctor scans startup files for the v1 marker; the v2 block must
+        // not trigger that scan by quoting it.
+        let snippet = super::init_zsh_instant_prompt();
+        assert!(!snippet.contains(super::LEGACY_INSTANT_PROMPT_MARKER));
+        assert_ne!(
+            super::INSTANT_PROMPT_MARKER,
+            super::LEGACY_INSTANT_PROMPT_MARKER
         );
-        assert!(
-            !snippet.contains("sed -n"),
-            "snippet must not fork sed (perf)"
-        );
-    }
-
-    #[test]
-    fn instant_prompt_snippet_gates_on_interactive_tty() {
-        let snippet = super::init_zsh_instant_prompt();
-        assert!(snippet.contains("-o interactive"));
-        assert!(snippet.contains("-t 1"));
-    }
-
-    #[test]
-    fn instant_prompt_snippet_skips_when_chevron_already_loaded() {
-        // The `! typeset -f _chevron_make_prompt` guard prevents re-firing
-        // when the user `source ~/.zshrc`s after the shell is up.
-        let snippet = super::init_zsh_instant_prompt();
-        assert!(snippet.contains("typeset -f _chevron_make_prompt"));
-    }
-
-    #[test]
-    fn instant_prompt_snippet_only_paints_zsh_shaped_cache() {
-        // Multi-shell guard: only paint when zsh-style %{ brackets are
-        // present and bash-style square-bracket markers are absent.
-        let snippet = super::init_zsh_instant_prompt();
-        assert!(snippet.contains("*'%{'*"));
-        assert!(snippet.contains("*'\\['*"));
-    }
-
-    #[test]
-    fn instant_prompt_snippet_registers_zshexit_cleanup() {
-        // Critical: if .zshrc errors before precmd fires, this hook must
-        // restore the fds so the user's terminal isn't broken.
-        let snippet = super::init_zsh_instant_prompt();
-        assert!(snippet.contains("zshexit_functions+=(_chevron_instant_zshexit)"));
-        assert!(snippet.contains("_chevron_instant_zshexit()"));
-    }
-
-    #[test]
-    fn instant_prompt_snippet_uses_print_p_for_paint() {
-        // `-P` is essential so %{…%} markers are recognised as zero-width.
-        let snippet = super::init_zsh_instant_prompt();
-        assert!(snippet.contains("print -nP -- \"$_chevron_cprompt\""));
     }
 
     #[test]
@@ -1872,28 +1792,47 @@ mod tests {
     }
 
     #[test]
-    fn zsh_async_fast_path_reads_cache_when_enabled() {
+    fn zsh_precmd_never_reads_a_prompt_cache() {
+        // The retired v1 fast path read the previous cycle's rendered prompt
+        // from a shared file and installed it as PROMPT before refreshing.
+        // Every cycle now renders from current context, and no cache
+        // identifier may survive anywhere in the generated script.
         let out = init_zsh();
+        for forbidden in [
+            "_chevron_cache_file",
+            "CHEVRON_CACHE_FILE",
+            "last-prompt",
+            "sed -n",
+        ] {
+            assert!(
+                !out.contains(forbidden),
+                "init script must not contain {forbidden:?}"
+            );
+        }
+        let precmd = body_of(&out, "_chevron_precmd() {");
         assert!(
-            out.contains("${CHEVRON_ASYNC:-0}"),
-            "async fast path should be gated by CHEVRON_ASYNC env var (off by default)"
+            precmd.contains(
+                "chevron_output=\"$(chevron prompt 20 $exit_status $duration_ms $job_count)\""
+            ),
+            "precmd must render synchronously every cycle"
         );
+        // A call passes quoted arguments; a comment merely naming the
+        // function (the live-callback note at the end of precmd) is fine.
         assert!(
-            out.contains("$_chevron_cache_file"),
-            "async path should read from the cache file"
-        );
-        assert!(
-            out.contains("_chevron_cached_pwd") && out.contains("$PWD"),
-            "should validate cached PWD before using cached output"
+            !precmd.contains("_chevron_start_async \""),
+            "precmd must not spawn a background refresh from a cached prompt"
         );
     }
 
     #[test]
-    fn zsh_async_passes_cache_env_var_to_chevron() {
+    fn zsh_live_refresh_spawns_a_plain_render() {
         let out = init_zsh();
+        let start = body_of(&out, "_chevron_start_async() {");
         assert!(
-            out.contains(r#"CHEVRON_CACHE_FILE="$_chevron_cache_file""#),
-            "async render must set CHEVRON_CACHE_FILE so chevron writes the cache"
+            start.contains(
+                "<(chevron prompt 20 \"$exit_status\" \"$duration_ms\" \"$job_count\" 2>/dev/null)"
+            ),
+            "background refresh must invoke a plain render with no cache environment"
         );
     }
 
@@ -1946,39 +1885,6 @@ mod tests {
         assert!(
             cb.contains(r#"[[ "$_chevron_async_spawn_gen" == "$_chevron_async_gen" ]] || return"#),
             "callback must drop results from older generations"
-        );
-    }
-
-    #[test]
-    fn zsh_cache_file_in_user_owned_dir() {
-        let out = init_zsh();
-        assert!(
-            out.contains("XDG_RUNTIME_DIR"),
-            "cache dir should respect XDG_RUNTIME_DIR"
-        );
-        assert!(
-            out.contains("mkdir -p -m 700"),
-            "cache dir should be created with owner-only mode"
-        );
-    }
-
-    #[test]
-    fn zsh_sync_path_unaffected_when_async_off() {
-        // When CHEVRON_ASYNC is 0 (the default), the sync render call
-        // should NOT carry CHEVRON_CACHE_FILE — no point paying the I/O
-        // for a cache that'll never be read.
-        let out = init_zsh();
-        // The sync arm exists for both async and non-async modes; the
-        // CHEVRON_ASYNC check above the sync render must distinguish.
-        let sync_idx = out
-            .find("chevron prompt 20 $exit_status $duration_ms $job_count)\"")
-            .expect("sync render call should exist");
-        let preceding = &out[..sync_idx];
-        // The CHEVRON_CACHE_FILE-wrapped sync call should come BEFORE the
-        // plain one, conditional on CHEVRON_ASYNC.
-        assert!(
-            preceding.contains(r#"if [[ "${CHEVRON_ASYNC:-0}" != "0" ]]; then"#),
-            "sync render should branch on CHEVRON_ASYNC to decide whether to set CHEVRON_CACHE_FILE"
         );
     }
 

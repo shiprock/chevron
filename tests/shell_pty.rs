@@ -286,6 +286,7 @@ impl Term {
     /// starts. Tests use it to overwrite `.zshrc` (keep
     /// `path=({path_dirs} $path)` so the test-built chevron wins over
     /// /etc/zshenv) or to pre-seed cache files under the hermetic home.
+    #[allow(clippy::too_many_lines)]
     fn spawn_customized(
         dsr: Dsr,
         rows: u16,
@@ -361,9 +362,9 @@ impl Term {
         // `chevron subscribe`. LiveFixture re-exports CHEVRON_LIVE=1 in its
         // .zshrc, which the init preamble honors.
         cmd.env("CHEVRON_LIVE", "0");
-        // The async prompt cache lives under XDG_RUNTIME_DIR; point it
-        // at the test home so parallel tests (and the developer's real
-        // shells) never share cache state.
+        // The retired v1 prompt cache lived under XDG_RUNTIME_DIR and
+        // init still removes leftovers there; point it at the test home
+        // so tests never touch the developer's runtime directory.
         cmd.env("XDG_RUNTIME_DIR", &home_path);
         // The test shell must not talk to an enclosing tmux server
         // (rename-window would hit the developer's session) nor inherit
@@ -376,6 +377,7 @@ impl Term {
             "CHEVRON_OSC133",
             "CHEVRON_ASYNC",
             "CHEVRON_CACHE_FILE",
+            "CHEVRON_NOTICE",
             "CHEVRON_TRANSIENT_DURATION_MS",
             "CHEVRON_HISTORY",
         ] {
@@ -1567,11 +1569,12 @@ fn duration_tag_renders_for_slow_commands() {
     assert!(dim, "duration tag must be dim-styled\n{}", t.dump());
 }
 
-// ── async fast path (CHEVRON_ASYNC=1) ────────────────────────────────────────
+// ── CHEVRON_ASYNC=1 (the cached fast path is retired; the flag must be inert) ──
 
-/// Async basics: the first prompt is a sync cache miss; later cycles
-/// serve the cached prompt instantly and repaint from the background
-/// refresh. Collapse and rewrite must behave exactly as in sync mode.
+/// `CHEVRON_ASYNC=1` no longer changes precmd: the cached fast path that
+/// installed the previous cycle's prompt is retired, so every cycle
+/// renders from current context. Collapse and rewrite must behave
+/// exactly as in sync mode under the flag.
 #[test]
 fn async_mode_cycles_collapse_and_recolor() {
     if !zsh_available() {
@@ -1603,12 +1606,11 @@ fn async_mode_cycles_collapse_and_recolor() {
     );
 }
 
-/// THE async race: cycle N serves the cache and spawns a refresh; the
-/// user has already typed `cd /`, so cycle N+1 paints a new-directory
-/// prompt — and THEN cycle N's refresh lands, `zle reset-prompt`ing the
-/// OLD directory's render over it. The 150 ms render delay makes the
-/// ordering deterministic. The callback must discard results from
-/// superseded cycles.
+/// Formerly THE async race: cycle N served the cache and spawned a
+/// refresh that could land after cycle N+1 painted a new directory. The
+/// cached path is retired, so no refresh exists to land late; with every
+/// render delayed 150 ms the final prompt must still show the new
+/// directory and never the old one.
 #[test]
 fn async_stale_refresh_must_not_overwrite_newer_prompt() {
     if !zsh_available() {
@@ -1636,9 +1638,9 @@ fn async_stale_refresh_must_not_overwrite_newer_prompt() {
     );
 }
 
-/// Rapid typed-ahead commands under async: cached instant prompts,
-/// background refreshes, and transient collapses interleave; counts and
-/// the final prompt must stay exact.
+/// Rapid typed-ahead commands with `CHEVRON_ASYNC=1`: transient
+/// collapses and synchronous renders interleave; counts and the final
+/// prompt must stay exact.
 #[test]
 fn async_rapid_typeahead_stays_consistent() {
     if !zsh_available() {
@@ -1666,14 +1668,11 @@ fn async_rapid_typeahead_stays_consistent() {
     );
 }
 
-/// chevron-6tc: a background refresh landing in the accept window —
-/// after accept-line paints the collapsed stub but before the next
-/// precmd bumps the generation — is NOT stale by the generation guard
-/// (the bump hasn't happened yet), so its `zle reset-prompt` repaints
-/// over the collapse and the cycle shows a duplicated line. Sweep the
-/// Enter timing across the refresh's ~150 ms arrival so some cycle
-/// lands inside the window; every cycle must still collapse to exactly
-/// one chevron row.
+/// chevron-6tc guarded a background refresh landing in the accept
+/// window and duplicating the collapsed line. Precmd no longer spawns
+/// refreshes, but the accept-window guard still protects live-event
+/// refreshes, so keep sweeping the Enter timing under a 150 ms render
+/// delay: every cycle must still collapse to exactly one chevron row.
 #[test]
 fn async_refresh_at_accept_never_duplicates() {
     if !zsh_available() {
@@ -1987,13 +1986,76 @@ fn ctrl_c_during_dsr_sweep_leaves_tty_sane() {
     t.wait_for("full prompt to return", prompt_ready);
 }
 
-/// End-to-end instant prompt (chevron-nf8): the paste-in snippet paints
-/// the cached prompt before .zshrc finishes, buffers all .zshrc output,
-/// and the first precmd takes over — restoring fds, clearing the cached
-/// line, and replaying the buffer. The snippet had no PTY coverage at
-/// all, despite owning one of the stderr-nuking exec bugs.
+fn current_uid() -> String {
+    String::from_utf8(
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string()
+}
+
+/// Seed the file the retired v1 block and v1 precmd read: pwd line, a
+/// zsh-shaped prompt body, tmux title line.
+fn seed_v1_cache(home: &std::path::Path, uid: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let cache_dir = home.join(format!("chevron-{uid}"));
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    // The v1 shell code created this directory with `mkdir -p -m 700`; the
+    // cleanup refuses anything looser, so the seed must match.
+    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let file = cache_dir.join("last-prompt");
+    std::fs::write(&file, format!("{}\n{body} \ntitle\n", home.display())).unwrap();
+    file
+}
+
+/// The retired v1 instant-prompt block, verbatim, as users pasted it. It
+/// is kept here only to prove what happens to installs that still carry it.
+const V1_INSTANT_BLOCK: &str = r#"# chevron instant prompt — paste this BLOCK at the TOP of ~/.zshrc.
+# Marker: chevron-instant-prompt-v1
+if [[ -o interactive && -t 1 ]] \
+    && [[ -z "$_chevron_instant_active" ]] \
+    && ! typeset -f _chevron_make_prompt >/dev/null 2>&1; then
+    _chevron_cache_file="${XDG_RUNTIME_DIR:-/tmp}/chevron-${UID:-$(id -u)}/last-prompt"
+    if [[ -r "$_chevron_cache_file" ]]; then
+        local _chevron_cfull="$(<"$_chevron_cache_file")"
+        local _chevron_cprompt="${_chevron_cfull#*$'\n'}"
+        _chevron_cprompt="${_chevron_cprompt%%$'\n'*}"
+        if [[ -n "$_chevron_cprompt" \
+            && "$_chevron_cprompt" == *'%{'* \
+            && "$_chevron_cprompt" != *'\['* ]]; then
+            _chevron_instant_buf="${TMPDIR:-/tmp}/chevron-instant-$$"
+            if : > "$_chevron_instant_buf" 2>/dev/null; then
+                _chevron_instant_active=1
+                print -nP -- "$_chevron_cprompt"
+                exec {_chevron_instant_orig_stdout}>&1 \
+                     {_chevron_instant_orig_stderr}>&2
+                exec >>"$_chevron_instant_buf" 2>&1
+                _chevron_instant_zshexit() {
+                    [[ -z "$_chevron_instant_active" ]] && return
+                    exec >&"$_chevron_instant_orig_stdout" \
+                         2>&"$_chevron_instant_orig_stderr"
+                    [[ -s "$_chevron_instant_buf" ]] \
+                        && cat -- "$_chevron_instant_buf" >&2 2>/dev/null
+                    rm -f -- "$_chevron_instant_buf" 2>/dev/null
+                }
+                zshexit_functions+=(_chevron_instant_zshexit)
+            fi
+        fi
+        unset _chevron_cfull _chevron_cprompt
+    fi
+fi
+"#;
+
+/// The current instant-prompt block is a comment-only no-op: nothing is
+/// painted from a leftover cache, .zshrc output is never redirected, and
+/// init retires the leftover file.
 #[test]
-fn instant_prompt_paints_takes_over_and_restores_fds() {
+fn instant_prompt_block_is_inert_and_retires_the_leftover_cache() {
     if !zsh_available() {
         return;
     }
@@ -2003,38 +2065,17 @@ fn instant_prompt_paints_takes_over_and_restores_fds() {
         .unwrap();
     assert!(snippet.status.success(), "init zsh --instant-prompt failed");
     let snippet = String::from_utf8(snippet.stdout).unwrap();
-    let uid = String::from_utf8(
-        std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_string();
-
+    let uid = current_uid();
+    let cache_file = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cache_slot = std::sync::Arc::clone(&cache_file);
     let t = Term::spawn_customized(
         Dsr::Immediate,
         ROWS,
         COLS,
         Render::Sync,
         move |home, path_dirs| {
-            // Pre-seed the cache the snippet reads: pwd line, zsh-shaped
-            // prompt body (must contain `%{`), tmux title line.
-            let cache_dir = home.join(format!("chevron-{uid}"));
-            std::fs::create_dir_all(&cache_dir).unwrap();
-            std::fs::write(
-                cache_dir.join("last-prompt"),
-                format!(
-                    "{}\n%{{\x1b[32m%}}CACHED-INSTANT%{{\x1b[0m%}} \ntitle\n",
-                    home.display()
-                ),
-            )
-            .unwrap();
-            // The documented install: snippet at the very top, then the
-            // normal init. The echo runs while fds are buffered and must
-            // be replayed at takeover.
+            let file = seed_v1_cache(home, &uid, "%{\x1b[32m%}CACHED-INSTANT%{\x1b[0m%}");
+            *cache_slot.lock().unwrap() = Some(file);
             std::fs::write(
                 home.join(".zshrc"),
                 format!(
@@ -2046,27 +2087,168 @@ fn instant_prompt_paints_takes_over_and_restores_fds() {
     );
     t.wait_settled(Duration::from_millis(200));
 
-    // The cached prompt was painted. The takeover clears that line, so
-    // assert on the raw stream, not the final grid.
     assert!(
         {
             let raw = t.raw.lock().unwrap();
-            find_subslice(&raw, b"CACHED-INSTANT").is_some()
+            find_subslice(&raw, b"CACHED-INSTANT").is_none()
         },
-        "cached prompt must be painted while .zshrc loads\n{}",
+        "the no-op block must not paint a leftover cache\n{}",
         t.dump()
     );
-    // Output produced while fds were redirected must be replayed.
+    assert!(
+        t.with_screen(lines).iter().any(|l| l == "zshrc-noise"),
+        ".zshrc output must reach the terminal directly\n{}",
+        t.dump()
+    );
+    t.send_line("ls /chevron-instant-probe");
+    t.wait_for("stderr to reach the terminal", |s| {
+        lines(s).iter().any(|l| l.starts_with("ls:"))
+    });
+    let file = cache_file.lock().unwrap().clone().unwrap();
+    assert!(
+        !file.exists(),
+        "init must retire the leftover v1 cache file {}",
+        file.display()
+    );
+}
+
+/// An install that still carries the v1 block: its first startup runs
+/// before init can retire the cache, so it paints once and the precmd
+/// takeover must still restore fds and replay output. Init then removes
+/// the file, and the next startup of the same shell has nothing to paint.
+#[test]
+fn legacy_v1_block_paints_once_then_the_cache_is_retired() {
+    if !zsh_available() {
+        return;
+    }
+    let uid = current_uid();
+    let cache_file = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cache_slot = std::sync::Arc::clone(&cache_file);
+    let t = Term::spawn_customized(
+        Dsr::Immediate,
+        ROWS,
+        COLS,
+        Render::Sync,
+        move |home, path_dirs| {
+            let file = seed_v1_cache(home, &uid, "%{\x1b[32m%}CACHED-INSTANT%{\x1b[0m%}");
+            *cache_slot.lock().unwrap() = Some(file);
+            std::fs::write(
+                home.join(".zshrc"),
+                format!(
+                    "{V1_INSTANT_BLOCK}\necho zshrc-noise\npath=({path_dirs} $path)\neval \"$(chevron init zsh)\"\n"
+                ),
+            )
+            .unwrap();
+        },
+    );
+    t.wait_settled(Duration::from_millis(200));
+
+    assert_eq!(
+        {
+            let raw = t.raw.lock().unwrap();
+            count_subslices(&raw, b"CACHED-INSTANT")
+        },
+        1,
+        "the first startup cannot be protected: the pasted block paints once\n{}",
+        t.dump()
+    );
     assert!(
         t.with_screen(lines).iter().any(|l| l == "zshrc-noise"),
         ".zshrc output must be replayed at takeover\n{}",
         t.dump()
     );
-    // fds fully restored: stderr reaches the terminal afterwards.
     t.send_line("ls /chevron-instant-probe");
     t.wait_for("stderr to reach the terminal after takeover", |s| {
         lines(s).iter().any(|l| l.starts_with("ls:"))
     });
+    let file = cache_file.lock().unwrap().clone().unwrap();
+    assert!(
+        !file.exists(),
+        "init must retire the v1 cache file {}",
+        file.display()
+    );
+
+    // Second startup of the same install: the block finds no file.
+    t.send_line("exec zsh -i");
+    t.send_line("echo second-shell-ready");
+    t.wait_for("second shell", |s| {
+        lines(s).iter().any(|l| l == "second-shell-ready")
+    });
+    t.wait_settled(Duration::from_millis(200));
+    assert_eq!(
+        {
+            let raw = t.raw.lock().unwrap();
+            count_subslices(&raw, b"CACHED-INSTANT")
+        },
+        1,
+        "the second startup must paint nothing from the retired cache\n{}",
+        t.dump()
+    );
+}
+
+/// What an attacker who precreated the v1 directory could plant: a
+/// zsh-shaped body carrying a command substitution, with the pwd line
+/// matching so the retired fast path would have installed it as PROMPT.
+/// Under `CHEVRON_ASYNC=1` and `PROMPT_SUBST` nothing may render or run.
+#[test]
+fn poisoned_v1_cache_is_never_rendered_or_executed() {
+    if !zsh_available() {
+        return;
+    }
+    let uid = current_uid();
+    let uid_for_seed = uid.clone();
+    let home_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let home_capture = std::sync::Arc::clone(&home_slot);
+    let t = Term::spawn_customized(
+        Dsr::Immediate,
+        ROWS,
+        COLS,
+        Render::Async,
+        move |home, path_dirs| {
+            *home_capture.lock().unwrap() = Some(home.to_path_buf());
+            let body = format!(
+                "%{{\x1b[31m%}}POISONED$(touch {}/pwned)%{{\x1b[0m%}}",
+                home.display()
+            );
+            seed_v1_cache(home, &uid_for_seed, &body);
+            std::fs::write(
+                home.join(".zshrc"),
+                format!(
+                    "setopt PROMPT_SUBST\npath=({path_dirs} $path)\neval \"$(chevron init zsh)\"\n"
+                ),
+            )
+            .unwrap();
+        },
+    );
+    t.run("true");
+    t.wait_settled(Duration::from_millis(300));
+
+    let home = home_slot.lock().unwrap().clone().unwrap();
+    assert!(
+        {
+            let raw = t.raw.lock().unwrap();
+            find_subslice(&raw, b"POISONED").is_none()
+        },
+        "poisoned cache bytes must never reach the terminal\n{}",
+        t.dump()
+    );
+    assert!(
+        !home.join("pwned").exists(),
+        "a command substitution in the cache must never execute"
+    );
+    assert!(
+        !home
+            .join(format!("chevron-{uid}"))
+            .join("last-prompt")
+            .exists(),
+        "init must retire the poisoned file"
+    );
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true"],
+        "the prompt must render and collapse normally\n{}",
+        t.dump()
+    );
 }
 
 /// A line executed through a widget other than the overridden

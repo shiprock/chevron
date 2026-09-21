@@ -31,6 +31,7 @@ pub mod event;
 pub mod health;
 #[cfg(feature = "daemon")]
 pub mod history;
+pub mod legacy_cache;
 pub mod repo_status;
 pub mod segments;
 pub mod shell;
