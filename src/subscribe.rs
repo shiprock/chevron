@@ -246,6 +246,22 @@ fn connect_and_relay(spec: proto::SubscribeSpec) -> Outcome {
     }
 }
 
+/// Canonicalize a `--cwd` filter value. The daemon matches filters by exact
+/// path equality against the canonical paths it broadcasts (`git` events
+/// carry the repo's canonicalized workdir root), so a relative or
+/// symlinked argument — `/tmp` vs `/private/tmp` on macOS — would
+/// otherwise subscribe successfully and then match nothing, silently.
+/// A nonexistent path is an argument error, not an empty filter.
+fn canonicalize_filter(cwd: Option<PathBuf>) -> Result<Option<PathBuf>, String> {
+    match cwd {
+        None => Ok(None),
+        Some(p) => match p.canonicalize() {
+            Ok(canon) => Ok(Some(canon)),
+            Err(e) => Err(format!("--cwd {}: {e}", p.display())),
+        },
+    }
+}
+
 fn parse_args(args: &[String]) -> Result<proto::SubscribeSpec, String> {
     let mut spec = proto::SubscribeSpec::default();
     let mut i = 0;
@@ -264,7 +280,7 @@ fn parse_args(args: &[String]) -> Result<proto::SubscribeSpec, String> {
                             .map_err(|e| format!("cannot resolve shell cwd: {e}"))?,
                     );
                 } else {
-                    spec.cwd = Some(PathBuf::from(val));
+                    spec.cwd = canonicalize_filter(Some(PathBuf::from(val)))?;
                 }
                 i += 2;
             }
@@ -321,9 +337,16 @@ mod tests {
     }
 
     #[test]
-    fn args_with_cwd() {
-        let args = vec!["--cwd".to_string(), "/x".to_string()];
-        assert_eq!(parse_args(&args).unwrap().cwd, Some(PathBuf::from("/x")));
+    fn args_with_cwd_is_canonical() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let args = vec![
+            "--cwd".to_string(),
+            tmp.path().to_string_lossy().into_owned(),
+        ];
+        assert_eq!(
+            parse_args(&args).unwrap().cwd,
+            Some(tmp.path().canonicalize().unwrap())
+        );
     }
 
     #[test]
@@ -336,6 +359,27 @@ mod tests {
     fn args_unknown_flag_errors() {
         let args = vec!["--mystery".to_string()];
         assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn canonicalize_filter_none_passes_through() {
+        assert_eq!(canonicalize_filter(None), Ok(None));
+    }
+
+    #[test]
+    fn canonicalize_filter_resolves_symlinks_and_relative_paths() {
+        // A tempdir path canonicalizes to itself modulo symlinks
+        // (/tmp → /private/tmp on macOS); the filter must be the
+        // canonical form or the daemon's exact-match test never fires.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let got = canonicalize_filter(Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(got, Some(tmp.path().canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn canonicalize_filter_rejects_missing_path() {
+        let err = canonicalize_filter(Some(PathBuf::from("/definitely/not/here"))).unwrap_err();
+        assert!(err.contains("--cwd"), "error should name the flag: {err}");
     }
 
     #[test]

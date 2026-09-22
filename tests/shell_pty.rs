@@ -70,6 +70,14 @@ enum Dsr {
     /// Exercises the precmd-side straggler, which has no sweep point
     /// behind it before ZLE takes the terminal.
     AlternateDelayed(Duration),
+    /// Answer every query with a fixed payload regardless of the true
+    /// cursor position — a lying or malformed report from a broken
+    /// emulator or intermediary.
+    Static(&'static [u8]),
+    /// Prefix the response with an SGR mouse report (`ESC [ < 0;5;6 M`),
+    /// like a terminal with mouse reporting left enabled when the user
+    /// clicks mid-exchange.
+    MouseNoise,
 }
 
 /// Prompt-render mode for the spawned shell.
@@ -126,6 +134,46 @@ fn chevron_glyphs(screen: &vt100::Screen) -> usize {
         .iter()
         .map(|l| l.matches(CHEVRON).count())
         .sum()
+}
+
+/// Column of the last cell on `row` holding a visible glyph.
+fn last_glyph_col(screen: &vt100::Screen, row: u16) -> Option<u16> {
+    let (_, cols) = screen.size();
+    (0..cols).rev().find(|&c| {
+        screen
+            .cell(row, c)
+            .is_some_and(|cell| !cell.contents().is_empty() && cell.contents() != " ")
+    })
+}
+
+/// ` N.Ns`-shaped duration-tag row (digits vary with scheduler
+/// overshoot).
+fn is_duration_tag(l: &str) -> bool {
+    l.strip_prefix(' ')
+        .and_then(|b| b.strip_suffix('s'))
+        .and_then(|b| b.split_once('.'))
+        .is_some_and(|(a, b)| {
+            !a.is_empty()
+                && a.chars().all(|c| c.is_ascii_digit())
+                && !b.is_empty()
+                && b.chars().all(|c| c.is_ascii_digit())
+        })
+}
+
+/// The OSC 133 markers in `raw`, in stream order, one letter each
+/// (`A`/`B` prompt bounds, `C` command start, `D` command end).
+fn osc133_sequence(raw: &[u8]) -> String {
+    let mut marks: Vec<(usize, char)> = Vec::new();
+    for kind in ['A', 'B', 'C', 'D'] {
+        let needle = format!("\x1b]133;{kind}").into_bytes();
+        let mut start = 0;
+        while let Some(pos) = find_subslice(&raw[start..], &needle) {
+            marks.push((start + pos, kind));
+            start += pos + needle.len();
+        }
+    }
+    marks.sort_unstable();
+    marks.into_iter().map(|(_, k)| k).collect()
 }
 
 fn last_nonempty(screen: &vt100::Screen) -> String {
@@ -239,6 +287,14 @@ fn pump_output(
                             Instant::now() + d
                         };
                         let _ = tx.send((due, resp));
+                    }
+                    Dsr::Static(payload) => {
+                        let _ = tx.send((Instant::now(), payload.to_vec()));
+                    }
+                    Dsr::MouseNoise => {
+                        let mut noisy = b"\x1b[<0;5;6M".to_vec();
+                        noisy.extend_from_slice(&resp);
+                        let _ = tx.send((Instant::now(), noisy));
                     }
                 }
             } else {
@@ -489,16 +545,19 @@ impl Term {
         }
     }
 
-    /// Block until a process whose command line matches `cmd` runs as a
+    /// Block until a process whose command line is exactly `cmd` runs as a
     /// direct child of the spawned zsh, i.e. the foreground command has
-    /// been exec'd and owns the terminal. Signals meant for the child
-    /// (^Z) sent before that point are swallowed by zsh itself.
+    /// been exec'd. Signals meant for the child (^Z) sent before that point
+    /// are swallowed by zsh itself. The match must be exact (`-x`): the
+    /// preexec history hook runs `chevron event cmd-start ... "sleep 30"`
+    /// as a direct child too, and a substring match on that short-lived
+    /// process returned before the real child existed, about one run in ten.
     fn wait_for_child(&self, cmd: &str) {
         let zsh_pid = self.child.process_id().expect("zsh pid").to_string();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let found = std::process::Command::new("pgrep")
-                .args(["-P", &zsh_pid, "-f", cmd])
+                .args(["-P", &zsh_pid, "-x", "-f", cmd])
                 .output()
                 .is_ok_and(|o| o.status.success() && !o.stdout.is_empty());
             if found {
@@ -702,7 +761,9 @@ fn external_command_keeps_output_and_single_chevron() {
         return;
     }
     let t = Term::spawn_zsh(Dsr::Immediate);
-    t.run("/bin/echo hello-from-pty");
+    // `env echo` forces an external process (unlike the echo builtin)
+    // without hardcoding /bin/echo, which NixOS doesn't ship.
+    t.run("env echo hello-from-pty");
     t.wait_settled(Duration::from_millis(150));
 
     let all = t.with_screen(lines);
@@ -713,7 +774,7 @@ fn external_command_keeps_output_and_single_chevron() {
     );
     assert_eq!(
         t.with_screen(chevron_rows),
-        vec!["\u{276f} /bin/echo hello-from-pty"],
+        vec!["\u{276f} env echo hello-from-pty"],
         "{}",
         t.dump()
     );
@@ -1104,6 +1165,112 @@ fn resize_during_command_skips_rewrite() {
     );
 }
 
+/// Rows-only resize while a command is RUNNING (cols unchanged): the
+/// other half of the `$COLUMNS:$LINES` geometry guard. Terminals that
+/// bottom-anchor on shrink move every saved row; the guard must treat a
+/// LINES change exactly like a COLUMNS change and skip the rewrite.
+#[test]
+fn rows_only_resize_during_command_skips_rewrite() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    // Sentinel above the transient, as in the cols-resize test.
+    t.run("true");
+    t.send_line("sleep 1");
+    // Same anchor as the cols-resize test: wait for the sleep command's
+    // preexec to have MEASURED its geometry (the DSR query following the
+    // second OSC-133-C), then let the read finish so the old height is
+    // recorded before SIGWINCH flips $LINES.
+    t.wait_for_raw("sleep command's preexec geometry query", |raw| {
+        let osc = b"\x1b]133;C";
+        let Some(first) = find_subslice(raw, osc) else {
+            return false;
+        };
+        let after_first = &raw[first + osc.len()..];
+        let Some(second) = find_subslice(after_first, osc) else {
+            return false;
+        };
+        find_subslice(&after_first[second + osc.len()..], b"\x1b[6n").is_some()
+    });
+    t.wait_settled(Duration::from_millis(250));
+    t.resize(16, COLS);
+    t.wait_for("reprompt after mid-command resize", prompt_ready);
+    t.wait_settled(Duration::from_millis(200));
+
+    assert!(
+        t.with_screen(lines).iter().any(|l| l == "\u{276f} true"),
+        "a rows-only resize must not displace or erase earlier rows\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        2,
+        "one chevron per command, no duplicates\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(1),
+        vt100::Color::Default,
+        "height changed mid-command: rewrite must skip, chevron stays neutral\n{}",
+        t.dump()
+    );
+}
+
+/// A full prompt WIDER than the terminal: deep working directories wrap
+/// the live prompt onto further rows (an everyday case in narrow
+/// splits, which the rest of the suite avoids by construction). The
+/// collapse must erase the whole wrapped prompt, the rewrite must not
+/// disturb rows above, and no prompt fragment (powerline arrows) may
+/// survive above the live prompt.
+#[test]
+fn wrapped_full_prompt_collapses_and_rewrites_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_customized(Dsr::Immediate, ROWS, 40, Render::Sync, |home, _| {
+        std::fs::create_dir_all(
+            home.join("longdirectoryname1/longdirectoryname2/longdirectoryname3"),
+        )
+        .unwrap();
+    });
+    t.run("cd long*1/long*2/long*3");
+    t.run("true");
+    t.run("false");
+    t.wait_settled(Duration::from_millis(200));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec![
+            "\u{276f} cd long*1/long*2/long*3",
+            "\u{276f} true",
+            "\u{276f} false",
+        ],
+        "every cycle must collapse to one row despite the wrapped prompt\n{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 3, "{}", t.dump());
+    assert_eq!(t.chevron_color_on_nth(1), GREEN, "{}", t.dump());
+    assert_eq!(t.chevron_color_on_nth(2), RED, "{}", t.dump());
+    // Powerline arrows may only exist in the live prompt at the bottom:
+    // a stray arrow above the last chevron row is a leftover fragment
+    // of a wrapped prompt the collapse failed to erase.
+    let all = t.with_screen(lines);
+    let last_chevron = all
+        .iter()
+        .rposition(|l| l.contains(CHEVRON))
+        .expect("chevron rows exist");
+    let stray = all
+        .iter()
+        .enumerate()
+        .find(|(i, l)| *i <= last_chevron && l.contains('\u{e0b0}'));
+    assert!(
+        stray.is_none(),
+        "prompt fragment above the live prompt: {stray:?}\n{}",
+        t.dump()
+    );
+}
+
 /// A congested link delivering the DSR response one byte at a time
 /// (~25 ms apart, well inside the 300 ms budget): the exchange must
 /// still complete and the rewrite must happen.
@@ -1165,6 +1332,110 @@ fn focus_event_during_dsr_exchange_is_harmless() {
     );
 }
 
+/// An SGR mouse report (`ESC [ < 0;5;6 M`) lands ahead of the response —
+/// mouse reporting left enabled while the user clicks mid-exchange. The
+/// last-CSI parse must still find the real row (the rewrite fires), and
+/// the ESC-led noise must be dropped, never re-injected as typeahead.
+#[test]
+fn mouse_report_noise_during_dsr_exchange_is_harmless() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::MouseNoise);
+    t.run("false");
+    t.wait_settled(Duration::from_millis(150));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} false"],
+        "{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_row("\u{276f} false"),
+        RED,
+        "the real response follows the mouse noise and must still be used\n{}",
+        t.dump()
+    );
+    assert!(
+        !t.with_screen(lines).iter().any(|l| l.contains("0;5;6")),
+        "mouse-report bytes must never surface as text\n{}",
+        t.dump()
+    );
+}
+
+/// An emulator that reports a wildly wrong cursor row (999 on a 24-row
+/// screen). The range guards must reject the lie on every cycle: the
+/// rewrite skips honestly, nothing lands off-screen, and the shell
+/// stays fully usable.
+#[test]
+fn lying_dsr_row_skips_rewrite_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Static(b"\x1b[999;1R"));
+    t.run("true");
+    t.run("echo after");
+    t.wait_settled(Duration::from_millis(200));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true", "\u{276f} echo after"],
+        "{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 2, "{}", t.dump());
+    assert!(
+        t.with_screen(lines).iter().any(|l| l == "after"),
+        "output must survive\n{}",
+        t.dump()
+    );
+    for n in 0..2 {
+        assert_eq!(
+            t.chevron_color_on_nth(n),
+            vt100::Color::Default,
+            "a lying row must be rejected, chevron stays neutral\n{}",
+            t.dump()
+        );
+    }
+}
+
+/// A malformed DSR response with an empty row field (`ESC [ ; 1 R`).
+/// The numeric validation must reject it — no row learned, rewrite
+/// skipped, no garbage re-injected into the edit buffer.
+#[test]
+fn malformed_dsr_response_degrades_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Static(b"\x1b[;1R"));
+    t.run("true");
+    t.run("echo after");
+    t.wait_settled(Duration::from_millis(200));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true", "\u{276f} echo after"],
+        "{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 2, "{}", t.dump());
+    assert!(
+        t.with_screen(lines).iter().any(|l| l == "after"),
+        "output must survive\n{}",
+        t.dump()
+    );
+    for n in 0..2 {
+        assert_eq!(
+            t.chevron_color_on_nth(n),
+            vt100::Color::Default,
+            "a rowless response must be rejected, chevron stays neutral\n{}",
+            t.dump()
+        );
+    }
+    assert!(t.with_screen(prompt_ready), "{}", t.dump());
+}
+
 /// Wide (CJK) characters count two cells each: the wrap-span math must
 /// measure display cells, not chars or bytes, or the erase loop misses
 /// rows. `❯ : ` (4) + 70 × あ (140) = 144 cells → 2 rows at 120 cols.
@@ -1193,6 +1464,138 @@ fn wide_char_wrapped_input_rewrites_cleanly() {
         t.dump()
     );
     assert_eq!(t.chevron_color_on_nth(0), GREEN, "{}", t.dump());
+}
+
+/// Zero-width characters without `COMBINING_CHARS`: ZLE paints U+0301 as
+/// a visible `<0301>` widget (six cells), so the collapsed line's
+/// on-screen span no longer matches the `${(m)#}` cell math — a rewrite
+/// erased one row of a five-row span and left duplicated chevrons.
+///
+/// Regression test: the rewrite must detect zero-width input and skip
+/// honestly (neutral chevron), leaving ZLE's own painting untouched.
+#[test]
+fn zero_width_input_without_combining_chars_skips_rewrite() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.run("echo guard");
+    // 100 combining pairs: 100 cells composed, but ZLE widgets them at
+    // seven cells a pair here, wrapping the collapsed line to 5+ rows.
+    let cmd = format!(": {}", "e\u{301}".repeat(100));
+    t.run(&cmd);
+    t.wait_settled(Duration::from_millis(200));
+
+    assert!(
+        t.with_screen(lines).iter().any(|l| l == "guard"),
+        "the previous command's output must survive\n{}",
+        t.dump()
+    );
+    let rows = t.with_screen(chevron_rows);
+    assert_eq!(
+        rows.len(),
+        2,
+        "one chevron row per command (wrap continuations carry none)\n{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 2, "{}", t.dump());
+    assert_eq!(
+        t.chevron_color_on_nth(1),
+        vt100::Color::Default,
+        "unknowable span must skip the rewrite, not repaint over it\n{}",
+        t.dump()
+    );
+    assert!(t.with_screen(prompt_ready), "{}", t.dump());
+}
+
+/// ZWJ emoji without `COMBINING_CHARS`: same widget hazard as above
+/// (U+200D paints as `<200d>`), plus emoji widths are where wcwidth
+/// implementations disagree most. Pins the honest skip and what must
+/// hold under EVERY width opinion: one chevron row per command,
+/// neighbor rows intact, no duplicate glyphs.
+#[test]
+fn zwj_emoji_input_keeps_neighbor_rows_intact() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.run("echo guard");
+    let cmd = format!(": {}", "\u{1f469}\u{200d}\u{1f4bb}".repeat(20));
+    t.run(&cmd);
+    t.wait_settled(Duration::from_millis(200));
+
+    assert!(
+        t.with_screen(lines).iter().any(|l| l == "guard"),
+        "the previous command's output must survive\n{}",
+        t.dump()
+    );
+    let rows = t.with_screen(chevron_rows);
+    assert_eq!(
+        rows.len(),
+        2,
+        "one chevron row per command, whatever the width opinion\n{}",
+        t.dump()
+    );
+    assert!(
+        rows[1].contains('\u{1f469}'),
+        "the emoji line's collapsed row must carry the input\n{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 2, "{}", t.dump());
+    assert_eq!(
+        t.chevron_color_on_nth(1),
+        vt100::Color::Default,
+        "zero-width ZWJ makes the span unknowable — skip honestly\n{}",
+        t.dump()
+    );
+    assert!(t.with_screen(prompt_ready), "{}", t.dump());
+}
+
+/// With `setopt combining_chars` (the macOS default), ZLE trusts the
+/// terminal to compose zero-width characters: the painted span matches
+/// the `${(m)#}` cell math and the rewrite proceeds. Composed input
+/// collapses to ONE row and color-corrects without touching neighbors —
+/// this is also the test that bites if the span math regresses from
+/// display cells to characters or bytes (200 chars / 300 bytes here vs
+/// 100 cells: an over-count erases the `guard` row above).
+#[test]
+fn combining_chars_option_composes_and_rewrites_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_customized(Dsr::Immediate, ROWS, COLS, Render::Sync, |home, path| {
+        std::fs::write(
+            home.join(".zshrc"),
+            format!("path=({path} $path)\nsetopt combining_chars\neval \"$(chevron init zsh)\"\n"),
+        )
+        .unwrap();
+    });
+    t.run("echo guard");
+    let cmd = format!(": {}", "e\u{301}".repeat(100));
+    t.run(&cmd);
+    t.wait_settled(Duration::from_millis(200));
+
+    assert!(
+        t.with_screen(lines).iter().any(|l| l == "guard"),
+        "an over-counted span erases the previous output — it must survive\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec![
+            "\u{276f} echo guard".to_string(),
+            format!("\u{276f} : {}", "e\u{301}".repeat(100)),
+        ],
+        "composed input must collapse to a single row\n{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 2, "{}", t.dump());
+    assert_eq!(
+        t.chevron_color_on_nth(1),
+        GREEN,
+        "with matching width models the rewrite must fire\n{}",
+        t.dump()
+    );
 }
 
 /// Ctrl-C on a half-typed line: the accept-line widget never runs, so
@@ -1396,25 +1799,49 @@ fn suspend_resume_cycle_keeps_rows_intact() {
         return;
     }
     let t = Term::spawn_zsh(Dsr::Immediate);
-    t.send_line("sleep 5");
+    t.send_line("sleep 30");
     t.wait_for("command to collapse and start", |s| {
         chevron_rows(s).len() == 1
     });
     // The collapse paints before preexec hands the terminal to the
-    // child; ^Z must hit the CHILD's process group. Too early and zsh
-    // (which ignores TSTP) eats it, the sleep runs to completion, and the
-    // suspend below never happens. A fixed delay lost that race about one
-    // run in five on a loaded machine, so wait for the exec'd child instead.
-    t.wait_for_child("sleep 5");
-    t.send("\x1a"); // Ctrl-Z
-    t.wait_for("suspend message and prompt", |s| {
-        lines(s).iter().any(|l| l.contains("suspended")) && prompt_ready(s)
-    });
+    // child; ^Z must hit the CHILD's process group. Sent during the
+    // preexec->child handoff it reaches zsh, which ignores TSTP, so the
+    // sleep runs on and the suspend never happens; a fixed delay lost that
+    // race about one run in five on a loaded machine. Wait for the exec'd
+    // child, then send once. Detect the stop in the RAW stream, not the
+    // grid (chevron-knh): the transient redraw that follows the stop wipes
+    // "suspended" off the screen within a frame, so a grid match can miss
+    // it entirely.
+    t.wait_for_child("sleep 30");
+    // Second layer: if a ^Z is still eaten by a late handoff, re-send after
+    // a bounded wait. Raw-stream detection lands within a poll of the stop,
+    // so a re-send cannot reach an idle prompt and self-insert.
+    let suspend_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        t.send("\x1a"); // Ctrl-Z
+        let attempt = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < attempt {
+            if find_subslice(&t.raw.lock().unwrap(), b"suspended").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        if find_subslice(&t.raw.lock().unwrap(), b"suspended").is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < suspend_deadline,
+            "sleep never suspended after repeated ^Z\n{}",
+            t.dump()
+        );
+    }
+    t.wait_for("prompt after suspend", prompt_ready);
+    // Resume in the foreground. The "continued"/"running" job-control
+    // notice is just as fleeting as "suspended", so match it in the raw
+    // stream too rather than the grid.
     t.send_line("fg");
-    t.wait_for("job to resume in the foreground", |s| {
-        lines(s)
-            .iter()
-            .any(|l| l.contains("continued") || l.contains("running"))
+    t.wait_for_raw("job to resume in the foreground", |raw| {
+        find_subslice(raw, b"continued").is_some() || find_subslice(raw, b"running").is_some()
     });
     t.send("\x03"); // kill the resumed sleep
     t.wait_for("prompt after killing resumed job", prompt_ready);
@@ -1423,14 +1850,15 @@ fn suspend_resume_cycle_keeps_rows_intact() {
     let rows = t.with_screen(chevron_rows);
     assert_eq!(
         rows,
-        vec!["\u{276f} sleep 5", "\u{276f} fg"],
+        vec!["\u{276f} sleep 30", "\u{276f} fg"],
         "suspend/resume must leave exactly one row per command\n{}",
         t.dump()
     );
     assert!(
-        t.with_screen(lines)
-            .iter()
-            .any(|l| l.contains("continued") || l.contains("running")),
+        {
+            let raw = t.raw.lock().unwrap();
+            find_subslice(&raw, b"continued").is_some() || find_subslice(&raw, b"running").is_some()
+        },
         "fg should have resumed the job\n{}",
         t.dump()
     );
@@ -1527,23 +1955,11 @@ fn duration_tag_renders_for_slow_commands() {
     t.run("sleep 0.2");
     t.wait_settled(Duration::from_millis(200));
 
-    // ` 0.2s`-shaped row (digits may vary with scheduler overshoot).
-    let is_tag = |l: &str| {
-        l.strip_prefix(' ')
-            .and_then(|b| b.strip_suffix('s'))
-            .and_then(|b| b.split_once('.'))
-            .is_some_and(|(a, b)| {
-                !a.is_empty()
-                    && a.chars().all(|c| c.is_ascii_digit())
-                    && !b.is_empty()
-                    && b.chars().all(|c| c.is_ascii_digit())
-            })
-    };
     let all = t.with_screen(lines);
     let tag_rows: Vec<usize> = all
         .iter()
         .enumerate()
-        .filter_map(|(i, l)| is_tag(l).then_some(i))
+        .filter_map(|(i, l)| is_duration_tag(l).then_some(i))
         .collect();
     // Exactly one: the instant `export` above must NOT be tagged — the
     // measurement brackets the command only, not the DSR machinery
@@ -1564,6 +1980,55 @@ fn duration_tag_renders_for_slow_commands() {
     );
     let dim = t.with_screen(|s| {
         s.cell(u16::try_from(tag_row).unwrap(), 1)
+            .is_some_and(vt100::Cell::dim)
+    });
+    assert!(dim, "duration tag must be dim-styled\n{}", t.dump());
+}
+
+/// A slow FAILING command collects both artifacts of one precmd: the
+/// dim duration tag between its output and the next prompt, and a RED
+/// rewrite on its collapsed line. The tag prints AFTER the rewrite has
+/// repositioned the cursor, so it must land below the recolored row
+/// without disturbing it.
+#[test]
+fn duration_tag_and_red_recolor_coexist_in_one_cycle() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.run("export CHEVRON_TRANSIENT_DURATION_MS=100");
+    t.run("sleep 0.2 && false");
+    t.wait_settled(Duration::from_millis(200));
+
+    let all = t.with_screen(lines);
+    let tag_rows: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| is_duration_tag(l).then_some(i))
+        .collect();
+    assert_eq!(
+        tag_rows.len(),
+        1,
+        "exactly the slow command gets a duration tag\n{}",
+        t.dump()
+    );
+    let cmd_row = all
+        .iter()
+        .position(|l| l == "\u{276f} sleep 0.2 && false")
+        .unwrap_or_else(|| panic!("collapsed row missing\n{}", t.dump()));
+    assert!(
+        tag_rows[0] > cmd_row,
+        "tag must sit below the recolored line\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(1),
+        RED,
+        "the rewrite and the tag come from the same precmd — both must land\n{}",
+        t.dump()
+    );
+    let dim = t.with_screen(|s| {
+        s.cell(u16::try_from(tag_rows[0]).unwrap(), 1)
             .is_some_and(vt100::Cell::dim)
     });
     assert!(dim, "duration tag must be dim-styled\n{}", t.dump());
@@ -1710,6 +2175,61 @@ fn async_refresh_at_accept_never_duplicates() {
     );
 }
 
+/// Async mode crossed with tmux-grade DSR latency: the cached-prompt
+/// fast path and the background refresh must not disturb the DSR
+/// rewrite when responses run slow (every async test above answers
+/// immediately).
+#[test]
+fn async_mode_with_tmux_latency_still_recolors() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh_async(Dsr::Delayed(Duration::from_millis(80)), None);
+    t.run("false");
+    t.run("true");
+    t.wait_settled(Duration::from_millis(400));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} false", "\u{276f} true"],
+        "{}",
+        t.dump()
+    );
+    assert_eq!(t.chevron_color_on_nth(0), RED, "{}", t.dump());
+    assert_eq!(t.chevron_color_on_nth(1), GREEN, "{}", t.dump());
+}
+
+/// Async mode on a terminal without DSR: every query burns its budget,
+/// the rewrite skips, and the async repaint machinery must still leave
+/// a consistent screen — neutral chevrons, no duplicates.
+#[test]
+fn async_mode_without_dsr_stays_neutral_and_consistent() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh_async(Dsr::Silent, None);
+    t.run("true");
+    t.run("false");
+    t.wait_settled(Duration::from_millis(400));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true", "\u{276f} false"],
+        "{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 2, "{}", t.dump());
+    for n in 0..2 {
+        assert_eq!(
+            t.chevron_color_on_nth(n),
+            vt100::Color::Default,
+            "no DSR means honest neutral, in async mode too\n{}",
+            t.dump()
+        );
+    }
+    assert!(t.with_screen(prompt_ready), "{}", t.dump());
+}
+
 /// tmux/SSH-grade latency that still fits the 300 ms read budget: the
 /// rewrite must work exactly as in the immediate case.
 #[test]
@@ -1763,6 +2283,204 @@ fn dsr_slower_than_read_budget_degrades_cleanly() {
         "stale DSR response must not leak into the line editor: {prompt:?}\n{}",
         t.dump()
     );
+}
+
+/// Printable input typed DURING the preexec DSR exchange — after the
+/// pending-input probe passed, before the delayed response arrives.
+/// `read -d 'R'` consumes the keystrokes ahead of the response; the
+/// helper must re-inject them (`print -z`) so they reappear in the next
+/// edit buffer instead of vanishing, and must still parse the row from
+/// the LAST CSI in the buffer so the rewrite fires despite the
+/// interleaved typeahead.
+#[test]
+fn typed_input_racing_slow_dsr_is_reinjected_not_eaten() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Delayed(Duration::from_millis(150)));
+    t.send_line("true");
+    // The query on the wire means the probe has already passed and
+    // `read -d 'R'` owns the tty; the response is 150 ms out. Type into
+    // that window. (No capital `R` in the text — the truncation path
+    // has its own test below.)
+    t.wait_for_raw("preexec DSR query", |raw| {
+        count_subslices(raw, DSR_QUERY) >= 1
+    });
+    t.send("echo rescued");
+    // The keystrokes were consumed unechoed; their only legitimate way
+    // back is the re-injection popping into the next edit buffer.
+    t.wait_for("typed-ahead line re-injected into the edit buffer", |s| {
+        last_nonempty(s).ends_with("echo rescued")
+    });
+    t.send("\r");
+    t.wait_for("re-injected command to execute", |s| {
+        lines(s).iter().any(|l| l == "rescued")
+    });
+    // Same slow-runner hazard as the truncation test below: precmd's
+    // delayed exchange can outlast a quiet-window settle, so wait for the
+    // prompt before asserting on the recolored rows.
+    t.wait_for("prompt after the re-injected command", prompt_ready);
+    t.wait_settled(Duration::from_millis(400));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true", "\u{276f} echo rescued"],
+        "typed-ahead input must survive the exchange and collapse cleanly\n{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 2, "{}", t.dump());
+    // Typeahead ahead of the response must not corrupt the row parse:
+    // the rewrite still fires and color-corrects both cycles.
+    assert_eq!(t.chevron_color_on_nth(0), GREEN, "{}", t.dump());
+    assert_eq!(t.chevron_color_on_nth(1), GREEN, "{}", t.dump());
+}
+
+/// A capital `R` typed mid-exchange truncates `read -d 'R'` before the
+/// response exists: the read buffer is pure typeahead with no CSI. The
+/// helper must re-inject the WHOLE buffer with the delimiter-eaten `R`
+/// restored, flag the response as still in flight, and precmd's sweep
+/// must absorb the straggler before ZLE takes the terminal. No row was
+/// learned, so the rewrite skips honestly (neutral chevron).
+#[test]
+fn typed_r_truncating_the_exchange_reinjects_the_line_intact() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Delayed(Duration::from_millis(150)));
+    t.send_line("true");
+    t.wait_for_raw("preexec DSR query", |raw| {
+        count_subslices(raw, DSR_QUERY) >= 1
+    });
+    // Ends in the truncating `R` with nothing after it, so the tty
+    // queue holds only the late response for the sweep to absorb.
+    t.send("echo TAG_R");
+    t.wait_for("truncated typeahead re-injected intact", |s| {
+        last_nonempty(s).ends_with("echo TAG_R")
+    });
+    t.send("\r");
+    t.wait_for("re-injected command to execute", |s| {
+        lines(s).iter().any(|l| l == "TAG_R")
+    });
+    // The second cycle's precmd runs a delayed DSR exchange and the
+    // straggler sweep before it paints; on a slow runner those pauses
+    // outlast a quiet-window settle, so wait for the prompt itself.
+    t.wait_for("prompt after the re-injected command", prompt_ready);
+    t.wait_settled(Duration::from_millis(400));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true", "\u{276f} echo TAG_R"],
+        "typed text must survive truncation with the eaten R restored\n{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 2, "{}", t.dump());
+    assert_eq!(
+        t.chevron_color_on_nth(0),
+        vt100::Color::Default,
+        "truncated exchange must skip the rewrite, not guess a row\n{}",
+        t.dump()
+    );
+    // The straggler was swept in precmd, so the second cycle's exchange
+    // starts clean and color-corrects normally.
+    assert_eq!(t.chevron_color_on_nth(1), GREEN, "{}", t.dump());
+}
+
+/// A typed burst SPLIT by its own capital `R` mid-exchange: `echo BRAVO`
+/// truncates the read at the `R`, leaving `AVO` queued behind it.
+///
+/// Regression test: the head was re-injected onto the buffer stack while
+/// the tail stayed in the tty queue and fed ZLE a prompt EARLIER — the
+/// burst came back as `AVO` (which EXECUTED as its own command: `zsh:
+/// command not found: AVO`) plus a parked `echo BR`. The helper now
+/// absorbs the plain tail inside the raw window and re-injects the whole
+/// burst as one ordered line.
+#[test]
+fn typed_burst_split_by_r_reinjects_in_order() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Delayed(Duration::from_millis(150)));
+    t.send_line("true");
+    t.wait_for_raw("preexec DSR query", |raw| {
+        count_subslices(raw, DSR_QUERY) >= 1
+    });
+    t.send("echo BRAVO");
+    t.wait_for("whole burst re-injected in typing order", |s| {
+        last_nonempty(s).ends_with("echo BRAVO")
+    });
+    t.send("\r");
+    t.wait_for("re-injected command to execute", |s| {
+        lines(s).iter().any(|l| l == "BRAVO")
+    });
+    // Same slow-runner hazard as its two siblings above: wait for the
+    // prompt before asserting on the recolored rows.
+    t.wait_for("prompt after the re-injected command", prompt_ready);
+    t.wait_settled(Duration::from_millis(400));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true", "\u{276f} echo BRAVO"],
+        "the split burst must come back as one line, in order\n{}",
+        t.dump()
+    );
+    assert!(
+        !t.with_screen(lines)
+            .iter()
+            .any(|l| l.contains("command not found")),
+        "no fragment of the burst may execute on its own\n{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 2, "{}", t.dump());
+    assert_eq!(
+        t.chevron_color_on_nth(0),
+        vt100::Color::Default,
+        "truncated exchange must skip the rewrite, not guess a row\n{}",
+        t.dump()
+    );
+    assert_eq!(t.chevron_color_on_nth(1), GREEN, "{}", t.dump());
+}
+
+/// A response fragmented so slowly it cannot complete inside the 300 ms
+/// read budget (6 bytes at 80 ms each ~= 480 ms total). Depending on
+/// zsh's `read -t` semantics the exchange either finishes late (rewrite
+/// fires) or times out with the tail swept in precmd — both are honest;
+/// what must NEVER happen is stray response bytes reaching ZLE as
+/// literal text or a rewrite landing on a row parsed from a half-read
+/// CSI.
+#[test]
+fn fragmented_response_past_read_budget_degrades_cleanly() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Fragmented(Duration::from_millis(80)));
+    t.run("true");
+    t.wait_settled(Duration::from_millis(1200));
+    t.run("echo second");
+    t.wait_settled(Duration::from_millis(1200));
+
+    assert_eq!(
+        t.with_screen(chevron_rows),
+        vec!["\u{276f} true", "\u{276f} echo second"],
+        "slow fragments must not duplicate or displace chevron rows\n{}",
+        t.dump()
+    );
+    assert_eq!(t.with_screen(chevron_glyphs), 2, "{}", t.dump());
+    assert!(
+        t.with_screen(lines).iter().any(|l| l == "second"),
+        "output must survive\n{}",
+        t.dump()
+    );
+    // Late-complete (green) and timeout-skip (neutral) are both honest
+    // outcomes; red would mean a wrong exit status, and any other color
+    // a corrupted rewrite.
+    for n in 0..2 {
+        let c = t.chevron_color_on_nth(n);
+        assert!(
+            c == GREEN || c == vt100::Color::Default,
+            "chevron {n} must be green (late rewrite) or neutral (honest skip), got {c:?}\n{}",
+            t.dump()
+        );
+    }
 }
 
 /// A terminal that never answers DSR: every query burns the full 300 ms
@@ -1827,12 +2545,13 @@ fn reset_command_reinitializes_cleanly() {
         return;
     }
     let t = Term::spawn_zsh(Dsr::Immediate);
-    t.run("/bin/echo before-reset");
+    // `env echo`: external process without hardcoding /bin/echo (NixOS).
+    t.run("env echo before-reset");
     t.send_line("reset");
     t.wait_for("RIS to clear the screen and a fresh prompt", |s| {
         prompt_ready(s) && !lines(s).iter().any(|l| l.contains("before-reset"))
     });
-    t.run("/bin/echo after-reset");
+    t.run("env echo after-reset");
     t.wait_settled(Duration::from_millis(200));
 
     let all = t.with_screen(lines);
@@ -1843,7 +2562,7 @@ fn reset_command_reinitializes_cleanly() {
     );
     assert_eq!(
         t.with_screen(chevron_rows),
-        vec!["\u{276f} /bin/echo after-reset"],
+        vec!["\u{276f} env echo after-reset"],
         "only the post-reset command's collapsed row should remain\n{}",
         t.dump()
     );
@@ -2332,6 +3051,111 @@ fn exact_width_input_skips_rewrite_cleanly() {
     );
 }
 
+/// The prompt's escape bytes (segment colors, OSC 133 markers) are
+/// wrapped in `%{...%}` so zsh's width tracker knows they occupy no
+/// cells. If that accounting drifts, ZLE paints and edits at the wrong
+/// columns — invisible to every content assertion in this suite, which
+/// never reads cursor state. Pinned two ways: the idle cursor must sit
+/// exactly one cell past the prompt's last glyph, and an insertion at
+/// line start (ctrl-a) must repaint at the believed offset without
+/// smearing.
+#[test]
+fn prompt_width_accounting_places_the_cursor_exactly() {
+    if !zsh_available() {
+        return;
+    }
+    // The developer's environment may leak EDITOR=vi into the PTY and
+    // flip the keymap; pin emacs bindings so ctrl-a means line start.
+    let t = Term::spawn_customized(Dsr::Immediate, ROWS, COLS, Render::Sync, |home, path| {
+        std::fs::write(
+            home.join(".zshrc"),
+            format!("path=({path} $path)\neval \"$(chevron init zsh)\"\nbindkey -e\n"),
+        )
+        .unwrap();
+    });
+    let (row, col) = t.with_screen(vt100::Screen::cursor_position);
+    let last_glyph = t
+        .with_screen(|s| last_glyph_col(s, row))
+        .expect("prompt row has glyphs");
+    assert_eq!(
+        col,
+        last_glyph + 2,
+        "idle cursor must sit one cell past the prompt's trailing space \
+         (last glyph at column {last_glyph})\n{}",
+        t.dump()
+    );
+    // ZLE wraps input off its BELIEVED prompt width (single-line
+    // repaints re-print the prompt from CR and are physically
+    // self-correcting, so only the wrap point exposes a drifted
+    // belief). Fill the row to its physical last column: an inflated
+    // belief wraps early and strands empty cells at the row's end.
+    let fill = usize::from(COLS) - col as usize;
+    t.send(&"z".repeat(fill));
+    t.wait_for("input to fill the row to the last column", move |s| {
+        s.cell(row, COLS - 1)
+            .is_some_and(|cell| cell.contents() == "z")
+    });
+    let solid = t.with_screen(|s| {
+        (col..COLS).all(|c| s.cell(row, c).is_some_and(|cell| cell.contents() == "z"))
+    });
+    assert!(
+        solid,
+        "believed and physical wrap points must agree: no gap before the margin\n{}",
+        t.dump()
+    );
+    // Abort the filler line and probe an insertion repaint on a fresh
+    // prompt: same believed width, must not smear. The abandoned line
+    // stays on screen, so wait for a SECOND painted prompt row with the
+    // cursor parked on it — the old row's mark alone races the repaint.
+    t.send("\x03");
+    t.wait_for("fresh prompt after interrupt", move |s| {
+        let marks: Vec<usize> = lines(s)
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(LIVE_PROMPT_MARK))
+            .map(|(i, _)| i)
+            .collect();
+        marks.len() >= 2 && marks.last() == Some(&(s.cursor_position().0 as usize))
+    });
+    // The new prompt carries the ^C exit-status segment, so it is a
+    // DIFFERENT width — re-derive the expected idle column from its own
+    // glyphs, which re-validates the accounting on a second prompt
+    // shape.
+    let (row2, col2) = t.with_screen(vt100::Screen::cursor_position);
+    let last_glyph2 = t
+        .with_screen(|s| last_glyph_col(s, row2))
+        .expect("new prompt row has glyphs");
+    assert_eq!(
+        col2,
+        last_glyph2 + 2,
+        "idle cursor on the exit-status prompt must match its glyphs\n{}",
+        t.dump()
+    );
+    t.send("abc");
+    t.wait_for("typed text to echo", move |s| {
+        lines(s)[row2 as usize].ends_with("abc")
+    });
+    t.send("\x01X");
+    t.wait_for("insertion to repaint the line", move |s| {
+        lines(s)[row2 as usize].ends_with("Xabc")
+    });
+    let (row3, col3) = t.with_screen(vt100::Screen::cursor_position);
+    assert_eq!(row3, row2, "insertion must not move the line\n{}", t.dump());
+    assert_eq!(
+        col3,
+        col2 + 1,
+        "cursor must sit right after the inserted X\n{}",
+        t.dump()
+    );
+    let row_text = &t.with_screen(lines)[row2 as usize];
+    assert_eq!(
+        row_text.matches("abc").count(),
+        1,
+        "insertion must repaint in place, not smear: {row_text:?}\n{}",
+        t.dump()
+    );
+}
+
 /// `CHEVRON_TRANSIENT=0` is the documented escape hatch for terminals
 /// whose DSR handling misbehaves. It must mean what it says: zero
 /// cursor-position queries on the wire and no accept-line collapse.
@@ -2414,6 +3238,34 @@ fn osc133_disabled_emits_no_markers() {
             find_subslice(&raw, b"\x1b]133").is_none()
         },
         "CHEVRON_OSC133=0 must suppress every OSC 133 emission\n{}",
+        t.dump()
+    );
+}
+
+/// The OSC 133 semantic zones across one full rewritten cycle. Modern
+/// terminals use these for prompt-jump and copy-output; a rewrite that
+/// mis-orders them breaks that navigation silently, invisible on the
+/// rendered grid. Expected stream order: the spawn precmd's `D` and
+/// first prompt `A B`, then the cycle — collapse repaint `A B`,
+/// preexec `C`, precmd `D`, the rewrite's own `A B` around the
+/// recolored line, and the next prompt's `A B`.
+#[test]
+fn osc133_zones_stay_ordered_across_a_rewritten_cycle() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_zsh(Dsr::Immediate);
+    t.run("true");
+    t.wait_settled(Duration::from_millis(300));
+
+    let seq = {
+        let raw = t.raw.lock().unwrap();
+        osc133_sequence(&raw)
+    };
+    assert_eq!(
+        seq,
+        "DABABCDABAB",
+        "OSC 133 zones out of order or miscounted\n{}",
         t.dump()
     );
 }
@@ -2598,7 +3450,9 @@ impl LiveFixture {
             state::spawn_no_watcher(state::TTL, db).unwrap()
         };
         let serve_tx = state_tx.clone();
-        std::thread::spawn(move || listener::serve_loop(&listener_sock, &serve_tx));
+        std::thread::spawn(move || {
+            listener::serve_loop(&listener_sock, &serve_tx, &listener::ServeHooks::detached());
+        });
         std::fs::rename(next_socket, dir.join("chevrond.sock")).unwrap();
         (state_tx, join)
     }
@@ -3083,5 +3937,210 @@ fn live_prompt_redraws_on_daemon_event() {
         || fx.fire_home_git_event(),
         "the prompt to redraw to the new branch with an untouched keyboard",
         |s| lines(s).iter().any(|l| l.contains("livebranch")),
+    );
+}
+
+// ── Inc 4: host compose-mode transient (end-to-end) ──────────────────────────
+//
+// These spawn the test-built `chevron host` binary (only present under
+// --features host) running a REAL zsh child in compose mode, and assert
+// against the COMPOSITED grid chevron paints — the loop integration the
+// cross-model host.rs unit tests can't reach: env plumbing (CHEVRON_TRANSIENT=0
+// in the child), the DECSTBM bar, and the collapse/recolor rendered through
+// chevron's own cell→ANSI. Dark until CI runs --features host (chevron-7w3).
+#[cfg(feature = "host")]
+impl Term {
+    /// Spawn `chevron host --status -- zsh -i` in compose mode: chevron owns
+    /// the screen, reserves row 1 for its bar, and does the transient itself
+    /// (the shell's is disabled in the child). The test plays the outer
+    /// terminal; chevron answers the child's DSR from its own grid, so the
+    /// outer side never sees a query (`Dsr::Silent`).
+    fn spawn_host_compose(rows: u16, cols: u16) -> Self {
+        let home = tempfile::TempDir::new().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        let bin = std::path::Path::new(env!("CARGO_BIN_EXE_chevron"));
+        let bin_dir = bin.parent().unwrap();
+
+        std::fs::write(home_path.join(".zshenv"), "setopt no_global_rcs\n").unwrap();
+        std::fs::write(
+            home_path.join(".zshrc"),
+            format!(
+                "path=({} $path)\neval \"$(chevron init zsh)\"\n",
+                bin_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+
+        // The test-built binary carries `chevron host` only under --features
+        // host; it prepends its own dir to the child's PATH so the inner
+        // zsh's `chevron init` resolves the same binary.
+        let mut cmd = CommandBuilder::new(bin);
+        cmd.args(["host", "--status", "--", "zsh", "-i"]);
+        cmd.cwd(&home_path);
+        cmd.env("HOME", &home_path);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("LANG", "en_US.UTF-8");
+        cmd.env("LC_ALL", "en_US.UTF-8");
+        cmd.env("CHEVRON_NO_DAEMON", "1");
+        cmd.env("CHEVRON_LIVE", "0");
+        cmd.env("XDG_RUNTIME_DIR", &home_path);
+        // The whole point: chevron does the transient itself here.
+        cmd.env("CHEVRON_HOST_COMPOSITE", "1");
+        for var in [
+            "TMUX",
+            "TMUX_PANE",
+            "ZDOTDIR",
+            "CHEVRON_TRANSIENT",
+            "CHEVRON_OSC133",
+            "CHEVRON_ASYNC",
+            "CHEVRON_CACHE_FILE",
+            "CHEVRON_TRANSIENT_DURATION_MS",
+            "CHEVRON_HISTORY",
+        ] {
+            cmd.env_remove(var);
+        }
+
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 200)));
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+        let mut reader = pair.master.try_clone_reader().unwrap();
+
+        // Kept for pump_output's signature; compose emits no outer DSR, so the
+        // responder never fires.
+        let (tx, rx) = mpsc::channel::<(Instant, Vec<u8>)>();
+        std::thread::spawn(move || while rx.recv().is_ok() {});
+        let reader_parser = Arc::clone(&parser);
+        let reader_raw = Arc::clone(&raw);
+        std::thread::spawn(move || {
+            pump_output(&mut reader, &reader_parser, &reader_raw, Dsr::Silent, &tx);
+        });
+
+        let term = Term {
+            parser,
+            raw,
+            writer,
+            child,
+            master: pair.master,
+            _home: home,
+        };
+        // Wait for chevron's bar (row 1) AND the composited live prompt.
+        term.wait_for("initial composited prompt", |s| {
+            let ls = lines(s);
+            ls.first().is_some_and(|b| b.contains("chevron host"))
+                && ls.iter().any(|l| l.contains(LIVE_PROMPT_MARK))
+        });
+        term
+    }
+
+    /// Send `cmd`, then wait until it has collapsed to `❯ cmd` as the
+    /// bottom-most glyph row with the next prompt below. Robust once the
+    /// screen scrolls: the collapsed-row COUNT plateaus (old rows scroll off
+    /// as new ones arrive), so `run`'s count test can't be used, but the
+    /// bottom glyph row still flips when the commands alternate.
+    fn collapse_expect(&self, cmd: &str) {
+        self.send_line(cmd);
+        let want = format!("{CHEVRON} {cmd}");
+        self.wait_for(&format!("`{cmd}` collapsed at the bottom"), move |s| {
+            prompt_ready(s) && chevron_rows(s).last().map(String::as_str) == Some(want.as_str())
+        });
+    }
+}
+
+#[cfg(feature = "host")]
+#[test]
+fn host_compose_collapses_and_recolors_by_exit_status() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_host_compose(ROWS, COLS);
+
+    // chevron reserves row 1 for its own bar (the child scrolls below it).
+    let bar = t.with_screen(|s| lines(s).first().cloned().unwrap_or_default());
+    assert!(bar.contains("chevron host"), "status bar on row 1: {bar:?}");
+
+    // A failing command: chevron collapses the prompt to `❯ false` and, on
+    // OSC 133 D;1, recolors the glyph red — no shell DSR transient involved.
+    t.run("false");
+    t.wait_settled(Duration::from_millis(250));
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        1,
+        "exactly one collapsed glyph, no duplicate\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(0),
+        RED,
+        "exit 1 recolors the collapsed glyph red\n{}",
+        t.dump()
+    );
+
+    // A succeeding command: a second collapsed line, glyph green.
+    t.run("true");
+    t.wait_settled(Duration::from_millis(250));
+    assert_eq!(
+        t.with_screen(chevron_glyphs),
+        2,
+        "two collapsed glyphs after two commands\n{}",
+        t.dump()
+    );
+    assert_eq!(
+        t.chevron_color_on_nth(1),
+        GREEN,
+        "exit 0 recolors the collapsed glyph green\n{}",
+        t.dump()
+    );
+}
+
+#[cfg(feature = "host")]
+#[test]
+fn host_compose_recolor_survives_scrolling() {
+    if !zsh_available() {
+        return;
+    }
+    let t = Term::spawn_host_compose(ROWS, COLS);
+    // Enough commands to overflow the 24-row screen so the earliest collapsed
+    // lines scroll off the top. The glyphs still on screen were recolored on
+    // OSC 133 D at rows that had since scrolled — the case the DSR transient's
+    // stale absolute row cannot follow. Exit status alternates so a
+    // mis-tracked recolor would leave a glyph neutral or the wrong color.
+    for i in 0..26 {
+        t.collapse_expect(if i % 2 == 0 { "true" } else { "false" });
+    }
+    t.wait_settled(Duration::from_millis(250));
+
+    let count = t.with_screen(|s| chevron_rows(s).len());
+    let colors: Vec<vt100::Color> = (0..count).map(|n| t.chevron_color_on_nth(n)).collect();
+    assert!(
+        count >= 4,
+        "several collapsed lines survived the scroll\n{}",
+        t.dump()
+    );
+    for c in &colors {
+        assert!(
+            *c == RED || *c == GREEN,
+            "every on-screen glyph keeps a status color (never a neutral stale-recolor), got {c:?}\n{}",
+            t.dump()
+        );
+    }
+    // The last command (i = 25, odd) was `false` → the bottom-most glyph red.
+    assert_eq!(
+        *colors.last().unwrap(),
+        RED,
+        "the most recent command (false) recolored red at its scrolled row\n{}",
+        t.dump()
     );
 }

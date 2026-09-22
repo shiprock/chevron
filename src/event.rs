@@ -63,7 +63,7 @@ pub fn run(args: &[String]) -> i32 {
             // Best-effort: swallow the boolean — the shell already got
             // the id via stdout and the user shouldn't see an error if
             // the daemon happens to be down.
-            let _ = client::try_publish_event(&req);
+            let _ = client::publish_event_or_spool(&req);
             0
         }
         Some("cmd-end") => {
@@ -83,7 +83,7 @@ pub fn run(args: &[String]) -> i32 {
                 output_bytes: None,
                 output_truncated: None,
             });
-            let _ = client::try_publish_event(&req);
+            let _ = client::publish_event_or_spool(&req);
             0
         }
         _ => {

@@ -113,6 +113,8 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        #[cfg(feature = "host")]
+        Some("host") => std::process::exit(chevron::host::run(&args[2..])),
         Some("version" | "--version" | "-V") => {
             println!("chevron {}", env!("CARGO_PKG_VERSION"));
         }
@@ -149,6 +151,8 @@ fn main() {
                 "history",
                 #[cfg(feature = "daemon")]
                 "subscribe",
+                #[cfg(feature = "host")]
+                "host",
                 "version",
                 #[cfg(feature = "banner")]
                 "banner",

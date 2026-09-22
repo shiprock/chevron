@@ -38,6 +38,14 @@ pub fn lock_path() -> PathBuf {
     socket_dir().join(LOCK_FILE)
 }
 
+/// Directory holding spooled lifecycle events awaiting a daemon (see
+/// `daemon::spool`). Lives under the socket dir so tests and multi-user
+/// isolation follow the same override rules as everything else.
+#[must_use]
+pub fn spool_dir() -> PathBuf {
+    socket_dir().join("spool")
+}
+
 #[must_use]
 pub fn pid_path() -> PathBuf {
     socket_dir().join(PID_FILE)

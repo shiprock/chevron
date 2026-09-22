@@ -145,6 +145,7 @@ const BODY_ZSH: &str = r#"_chevron_preexec() {
 _chevron_query_row() {
     REPLY=""
     local fd
+    local _chevron_trunc_tail=""
     # The braces are load-bearing: a bare `exec` makes EVERY redirection
     # on it permanent, so a trailing 2>/dev/null — meant only to silence
     # a failed open — would point the whole shell's stderr at /dev/null
@@ -184,6 +185,29 @@ _chevron_query_row() {
             # text (`1R`). Flag it; precmd sweeps it out before the editor
             # runs.
             _chevron_dsr_inflight=1
+            # Truncation specifically (non-empty, ESC-free buffer = pure
+            # typeahead): the REST of the user's burst is still queued
+            # behind the delimiter-eaten `R`. Left there it pops out of
+            # order — the head lands on the buffer stack while the tail
+            # feeds ZLE a prompt EARLIER, so a typed `echo BRAVO` came
+            # back as `AVO` (which executed as its own command) plus a
+            # parked `echo BR`. Absorb the plain tail now, while the tty
+            # is still raw, so the whole burst re-injects as one ordered
+            # line below. Stop at any ESC: a complete response absorbed
+            # here is drained (and unflagged); a partial one, or a key
+            # sequence, stays flagged for the sweep.
+            if [[ -n "$resp" && "$resp" != *$'\e'* ]]; then
+                local _chevron_tail_b
+                while zselect -t 2 -r $fd 2>/dev/null; do
+                    IFS= read -u $fd -k 1 -s -t 0 _chevron_tail_b 2>/dev/null || break
+                    if [[ "$_chevron_tail_b" == $'\e' ]]; then
+                        IFS= read -u $fd -d 'R' -s -t 0.1 _chevron_tail_b 2>/dev/null \
+                            && _chevron_dsr_inflight=""
+                        break
+                    fi
+                    _chevron_trunc_tail+="$_chevron_tail_b"
+                done
+            fi
         fi
         # Linger mode: this caller has no sweep point behind it, so absorb
         # the straggler now, while -echo still holds. Restoring echo first
@@ -202,9 +226,12 @@ _chevron_query_row() {
         REPLY="${payload%%;*}"
         [[ "$REPLY" == <-> ]] || REPLY=""
         [[ -n "$pre_esc" && "$pre_esc" != *[^[:print:]$'\t\r\n']* ]] && print -z -- "$pre_esc" 2>/dev/null
-    elif [[ -n "$resp" && "$resp" != *[^[:print:]$'\t\r\n']* ]]; then
-        # CSI-less buffer: pure typeahead, truncated at a typed `R`.
-        print -z -- "${resp}R" 2>/dev/null
+    elif [[ -n "$resp" && "$resp$_chevron_trunc_tail" != *[^[:print:]$'\t\r\n']* ]]; then
+        # CSI-less buffer: pure typeahead, truncated at a typed `R`. The
+        # absorbed tail rides along so the burst stays in typing order; a
+        # control byte in either part drops the whole buffer instead of
+        # pushing garbage.
+        print -z -- "${resp}R${_chevron_trunc_tail}" 2>/dev/null
     fi
 }
 # Absorb unsolicited ESC-led reports queued on the tty: duplicate DSR
@@ -259,6 +286,10 @@ _chevron_precmd() {
     # Emitted first so it closes out the previous command region before
     # we print the duration tag and next prompt's A marker.
     [[ "${CHEVRON_OSC133:-1}" != "0" ]] && printf '\e]133;D;%d\a' $exit_status
+    # OSC 7: report the working directory so terminals (new-tab-here) and
+    # `chevron host` can track it across `cd`. Cursor-neutral, like the
+    # 133 reports above. Default on; opt out with CHEVRON_OSC7=0.
+    [[ "${CHEVRON_OSC7:-1}" != "0" ]] && printf '\e]7;file://%s%s\a' "$HOST" "$PWD"
     # Color-correct the transient prompt (chevron-4xq). preexec captured
     # the absolute row of the line below the painted transient (via
     # DSR). Now we query R_current, erase the transient's rows, write
@@ -340,6 +371,26 @@ _chevron_precmd() {
             # Cmd may be multi-line; only its first line is measured and
             # written so we don't run past the rows we erased.
             local _chevron_rewrite_cmd="${_chevron_cmd_title%%$'\n'*}"
+            # ZLE without COMBINING_CHARS paints zero-width characters
+            # as visible `<xxxx>` widgets — U+0301 costs six cells on
+            # screen, not zero — so the painted span of the collapsed
+            # line no longer matches the ${(m)#} cell math below and
+            # the erase eats rows it never painted (combining accents,
+            # ZWJ emoji). Which characters ZLE widgets is unknowable
+            # from here, so skip honestly, like PS2 input and resizes.
+            # With the option set (the macOS default) the terminal
+            # composes them and the math holds. The per-char scan runs
+            # only for commands with bytes outside printable ASCII.
+            local _chevron_zero_width=""
+            if [[ ! -o combining_chars && "$_chevron_rewrite_cmd" == *[^\ -~]* ]]; then
+                local _chevron_ch
+                for _chevron_ch in ${(s::)_chevron_rewrite_cmd}; do
+                    if (( ${(m)#_chevron_ch} == 0 )); then
+                        _chevron_zero_width=1
+                        break
+                    fi
+                done
+            fi
             # Rows the wrapped transient occupies. ${(m)#...} counts
             # display cells (not bytes); `❯ ` adds 2.
             local _chevron_width=$(( ${(m)#_chevron_rewrite_cmd} + 2 ))
@@ -364,7 +415,7 @@ _chevron_precmd() {
             # (one row or two — ble.sh's "xenl" trap). The saved row may
             # be off by one, which paints the duplicated-chevron glitch;
             # unknowable from here, so skip honestly.
-            if (( _chevron_R_top > 0 \
+            if [[ -z "$_chevron_zero_width" ]] && (( _chevron_R_top > 0 \
                 && _chevron_width % _chevron_cols != 0 \
                 && _chevron_R_saved < _chevron_lines \
                 && _chevron_R_current < _chevron_lines \
@@ -1104,6 +1155,21 @@ mod tests {
     }
 
     #[test]
+    fn zsh_precmd_emits_osc7_cwd_by_default() {
+        // OSC 7 lets `chevron host` (and terminals) track the cwd across
+        // `cd`. Default on, gated for opt-out (chevron-dw5.2.1).
+        let out = init_zsh();
+        assert!(
+            out.contains(r"]7;file://"),
+            "zsh init should emit an OSC 7 cwd report"
+        );
+        assert!(
+            out.contains("CHEVRON_OSC7"),
+            "OSC 7 emission must be opt-out-able via CHEVRON_OSC7"
+        );
+    }
+
+    #[test]
     fn init_bash_zero_arg_matches_default_with() {
         assert_eq!(init_bash(), init_bash_with(&ShellConfig::default()));
     }
@@ -1396,10 +1462,12 @@ mod tests {
         assert!(raw < probe, "raw mode must precede the probe");
         // A CSI-less read buffer is typeahead truncated at a typed `R`;
         // it must be re-injected (with the eaten delimiter restored),
-        // never silently dropped.
+        // never silently dropped — and the plain tail absorbed behind
+        // the `R` must ride along so the burst keeps its typing order
+        // (a split re-inject once EXECUTED the tail as its own command).
         assert!(
-            body.contains(r#"print -z -- "${resp}R""#),
-            "truncated typeahead must be re-injected"
+            body.contains(r#"print -z -- "${resp}R${_chevron_trunc_tail}""#),
+            "truncated typeahead must be re-injected whole, in order"
         );
         // precmd's rewrite query must linger on timeout: no sweep runs
         // between it and ZLE, so an unabsorbed straggler kernel-echoes.
@@ -1547,6 +1615,30 @@ mod tests {
         assert!(
             out.contains(r#""$_chevron_cmd_title" != *$'\n'*"#),
             "precmd must skip the rewrite for multi-line input"
+        );
+    }
+
+    #[test]
+    fn zsh_rewrite_skips_zero_width_input_without_combining_chars() {
+        // ZLE without COMBINING_CHARS paints zero-width characters
+        // (combining accents, ZWJ) as visible `<xxxx>` widgets, so the
+        // collapsed line's painted span cannot be reconstructed from
+        // ${(m)#} cell math — the rewrite erased one row of a
+        // five-row span and left duplicated chevrons. The rewrite must
+        // scan for zero-width input and skip unless the option says
+        // the terminal composes.
+        let out = init_zsh();
+        assert!(
+            out.contains("[[ ! -o combining_chars"),
+            "zero-width scan must be gated on the COMBINING_CHARS option"
+        );
+        assert!(
+            out.contains(r"${(s::)_chevron_rewrite_cmd}"),
+            "the guard must scan the rewrite command per character"
+        );
+        assert!(
+            out.contains(r#"[[ -z "$_chevron_zero_width" ]] &&"#),
+            "the rewrite must be gated on the zero-width flag"
         );
     }
 

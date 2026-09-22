@@ -77,7 +77,7 @@
             [
               pkgs.openssl
             ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
               pkgs.apple-sdk_15
               pkgs.libiconv
             ];

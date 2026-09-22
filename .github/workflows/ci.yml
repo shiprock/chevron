@@ -58,7 +58,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        # --all-features so the non-default `host` feature (src/host.rs, the
+        # Stage 2 compositor) is linted too; it is otherwise never checked.
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   # Unit + integration tests on both target platforms.
   test:
@@ -84,6 +86,11 @@ jobs:
             cargo test
             echo "::endgroup::"
           done
+      # The `host` feature (Stage 2 compositor, src/host.rs) is not default, so
+      # the loop above never builds it. Run its unit + cross-model tests here;
+      # these need no zsh — the host e2e tests do, and run in the live-e2e job.
+      - name: Run host-feature unit tests
+        run: cargo test --features host --lib
 
   # Daemon-backed live-prompt e2e (chevron-ffu). These stand up an
   # in-process chevrond and a real interactive zsh in a PTY, asserting
@@ -122,6 +129,19 @@ jobs:
             cargo test --test shell_pty -- --ignored --test-threads=1
             echo "::endgroup::"
           done
+      # Compose-mode host transient e2e (Inc 4, chevron-dw5.3.5): a real zsh
+      # under `chevron host` in a PTY, asserting the composited grid. Behind
+      # --features host (the subcommand exists only there); reuses this job's
+      # installed zsh. Not #[ignore]'d, so selected by name rather than
+      # --ignored.
+      - name: Run host compose e2e (3x for flake detection)
+        run: |
+          set -e
+          for i in 1 2 3; do
+            echo "::group::host compose e2e run $i/3"
+            cargo test --features host --test shell_pty host_compose
+            echo "::endgroup::"
+          done
 
   # Build under the Nix sandbox. Catches environment-specific issues that
   # plain cargo test on a GitHub runner can miss (different scheduling,
@@ -150,13 +170,13 @@ jobs:
       - name: Nix build
         run: nix build --print-build-logs
 
-  # Build release binaries and publish a GitHub Release on version tags.
+  # Build the per-target release binaries and upload them as workflow
+  # artifacts. This runs on every trigger so a broken release build is
+  # caught on PRs/master too; publishing is deferred to `publish` below.
   release:
     name: Release / ${{ matrix.target }}
     needs: [test, nix-build]
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -186,9 +206,27 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
           if-no-files-found: error
+
+  # Single publisher for version tags: gather every per-target binary and
+  # cut ONE GitHub Release with all of them. Only this job touches the
+  # release, so the matrix legs can no longer race to create it and lose
+  # uploads to a `tag_name already_exists` error (chevron-6dw).
+  publish:
+    name: Publish Release
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all release binaries
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
-          files: ${{ matrix.artifact }}
+          files: dist/*
           generate_release_notes: true
+          fail_on_unmatched_files: true
