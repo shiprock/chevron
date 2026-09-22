@@ -545,16 +545,19 @@ impl Term {
         }
     }
 
-    /// Block until a process whose command line matches `cmd` runs as a
+    /// Block until a process whose command line is exactly `cmd` runs as a
     /// direct child of the spawned zsh, i.e. the foreground command has
-    /// been exec'd and owns the terminal. Signals meant for the child
-    /// (^Z) sent before that point are swallowed by zsh itself.
+    /// been exec'd. Signals meant for the child (^Z) sent before that point
+    /// are swallowed by zsh itself. The match must be exact (`-x`): the
+    /// preexec history hook runs `chevron event cmd-start ... "sleep 30"`
+    /// as a direct child too, and a substring match on that short-lived
+    /// process returned before the real child existed, about one run in ten.
     fn wait_for_child(&self, cmd: &str) {
         let zsh_pid = self.child.process_id().expect("zsh pid").to_string();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let found = std::process::Command::new("pgrep")
-                .args(["-P", &zsh_pid, "-f", cmd])
+                .args(["-P", &zsh_pid, "-x", "-f", cmd])
                 .output()
                 .is_ok_and(|o| o.status.success() && !o.stdout.is_empty());
             if found {
@@ -1810,10 +1813,28 @@ fn suspend_resume_cycle_keeps_rows_intact() {
     // "suspended" off the screen within a frame, so a grid match can miss
     // it entirely.
     t.wait_for_child("sleep 30");
-    t.send("\x1a"); // Ctrl-Z
-    t.wait_for_raw("suspend notice", |raw| {
-        find_subslice(raw, b"suspended").is_some()
-    });
+    // Second layer: if a ^Z is still eaten by a late handoff, re-send after
+    // a bounded wait. Raw-stream detection lands within a poll of the stop,
+    // so a re-send cannot reach an idle prompt and self-insert.
+    let suspend_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        t.send("\x1a"); // Ctrl-Z
+        let attempt = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < attempt {
+            if find_subslice(&t.raw.lock().unwrap(), b"suspended").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        if find_subslice(&t.raw.lock().unwrap(), b"suspended").is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < suspend_deadline,
+            "sleep never suspended after repeated ^Z\n{}",
+            t.dump()
+        );
+    }
     t.wait_for("prompt after suspend", prompt_ready);
     // Resume in the foreground. The "continued"/"running" job-control
     // notice is just as fleeting as "suspended", so match it in the raw
