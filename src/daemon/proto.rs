@@ -27,7 +27,7 @@
 //!   NONE
 //!   EVENT type=<topic> [cwd=<path>] [id=<ulid>]
 //!   PING <unix-ms>
-//!   VERSION binary=<x.y.z> proto=<u32> schema=<n>
+//!   VERSION binary=<x.y.z> proto=<u32> schema=<n> [build=<id>]
 //!   ERR <reason>
 //! ```
 //!
@@ -165,6 +165,12 @@ pub struct DaemonVersion {
     /// Distinct from `proto` because schema bumps don't always need
     /// wire bumps and vice versa.
     pub schema: String,
+    /// Build identifier embedded at compile time (git commit, `-dirty`
+    /// suffixed for an uncommitted tree, or `unknown`). Two binaries can
+    /// share `binary` and differ here, which is exactly the stale-daemon
+    /// case after an upgrade. Optional on the wire: a daemon that predates
+    /// the field decodes as `unknown`.
+    pub build: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +266,7 @@ fn encode_version(v: &DaemonVersion) -> String {
     write_kv_str(&mut out, "binary", &v.binary);
     write_kv_num(&mut out, "proto", v.proto);
     write_kv_str(&mut out, "schema", &v.schema);
+    write_kv_str(&mut out, "build", &v.build);
     out
 }
 
@@ -584,6 +591,7 @@ fn decode_version(rest: &str) -> Result<DaemonVersion, ProtoError> {
     let mut binary: Option<String> = None;
     let mut proto: Option<u32> = None;
     let mut schema: Option<String> = None;
+    let mut build: Option<String> = None;
     for tok in rest.split_ascii_whitespace() {
         let (k, v) = tok
             .split_once('=')
@@ -592,6 +600,7 @@ fn decode_version(rest: &str) -> Result<DaemonVersion, ProtoError> {
             "binary" => binary = Some(percent_decode(v)?),
             "proto" => proto = Some(parse_u32(v)?),
             "schema" => schema = Some(percent_decode(v)?),
+            "build" => build = Some(percent_decode(v)?),
             // Forward-compat: future fields (git_rev, build_date, …)
             // can land without breaking older parsers.
             _ => {}
@@ -601,6 +610,7 @@ fn decode_version(rest: &str) -> Result<DaemonVersion, ProtoError> {
         binary: binary.ok_or(ProtoError::Malformed("VERSION missing binary"))?,
         proto: proto.ok_or(ProtoError::Malformed("VERSION missing proto"))?,
         schema: schema.ok_or(ProtoError::Malformed("VERSION missing schema"))?,
+        build: build.unwrap_or_else(|| "unknown".to_string()),
     })
 }
 
@@ -1471,10 +1481,26 @@ mod tests {
             binary: "0.6.0".to_string(),
             proto: 1,
             schema: "2".to_string(),
+            build: "abc123def456-dirty".to_string(),
         });
         let line = encode_response(&resp);
-        assert_eq!(line, "VERSION binary=0.6.0 proto=1 schema=2");
+        assert_eq!(
+            line,
+            "VERSION binary=0.6.0 proto=1 schema=2 build=abc123def456-dirty"
+        );
         assert_eq!(decode_response(&line).unwrap(), resp);
+    }
+
+    #[test]
+    fn decode_version_response_without_build_reads_unknown() {
+        // Daemons that predate the field: the CLI must still parse them
+        // and then report a build mismatch rather than fail.
+        let Response::Version(v) =
+            decode_response("VERSION binary=0.7.0 proto=1 schema=2").unwrap()
+        else {
+            panic!("expected Version");
+        };
+        assert_eq!(v.build, "unknown");
     }
 
     #[test]

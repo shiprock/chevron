@@ -256,7 +256,15 @@ fn glyph_check() -> Check {
 
 fn chevron_section() -> Vec<Check> {
     vec![
-        Check::ok("version", "version", env!("CARGO_PKG_VERSION")),
+        Check::ok(
+            "version",
+            "version",
+            format!(
+                "{} ({})",
+                env!("CARGO_PKG_VERSION"),
+                env!("CHEVRON_BUILD_ID")
+            ),
+        ),
         chevron_path_check(),
         libgit2_check(),
         daemon_feature_check(),
@@ -653,7 +661,12 @@ fn self_test_section() -> Vec<Check> {
 
 fn render_text(sections: &[Section], color: bool) -> String {
     let mut out = String::with_capacity(2048);
-    let _ = writeln!(out, "chevron doctor {}", env!("CARGO_PKG_VERSION"));
+    let _ = writeln!(
+        out,
+        "chevron doctor {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        env!("CHEVRON_BUILD_ID")
+    );
     for (name, checks) in sections {
         render_text_section(&mut out, name, checks, color);
     }
@@ -753,8 +766,9 @@ fn render_json(sections: &[Section]) -> String {
     let mut out = String::with_capacity(1024);
     let _ = write!(
         out,
-        "{{\"version\":\"{}\",\"sections\":[",
-        env!("CARGO_PKG_VERSION")
+        "{{\"version\":\"{}\",\"build\":\"{}\",\"sections\":[",
+        env!("CARGO_PKG_VERSION"),
+        env!("CHEVRON_BUILD_ID")
     );
     let mut first = true;
     for (name, checks) in sections {

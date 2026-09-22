@@ -116,7 +116,11 @@ fn main() {
         #[cfg(feature = "host")]
         Some("host") => std::process::exit(chevron::host::run(&args[2..])),
         Some("version" | "--version" | "-V") => {
-            println!("chevron {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "chevron {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                env!("CHEVRON_BUILD_ID")
+            );
         }
         #[cfg(feature = "banner")]
         Some("banner") => {

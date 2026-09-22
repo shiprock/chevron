@@ -47,41 +47,54 @@
         let
           pkgs = pkgsFor system;
           craneLib = craneLibFor system;
-        in
-        craneLib.buildPackage {
-          pname = "chevron";
-          src =
-            let
-              binFilter = path: _type: builtins.match ".*\\.bin$" path != null;
-              # insta snapshot files end in .snap; the cargo source filter
-              # rejects them by default and tests fail in the sandbox.
-              snapFilter = path: _type: builtins.match ".*\\.snap$" path != null;
-            in
-            pkgs.lib.cleanSourceWith {
-              src = ./.;
-              filter =
-                path: type:
-                (binFilter path type)
-                || (snapFilter path type)
-                || (craneLib.filterCargoSources path type);
-            };
-          strictDeps = true;
-          # Integration tests (tests/cli.rs) spawn subprocesses that hang
-          # in the Nix sandbox, so only run unit tests during the build.
-          cargoTestExtraArgs = "--lib";
-          nativeBuildInputs = [
-            pkgs.pkg-config
-            pkgs.cmake
-          ];
-          buildInputs =
-            [
-              pkgs.openssl
-            ]
-            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
-              pkgs.apple-sdk_15
-              pkgs.libiconv
+          commonArgs = {
+            pname = "chevron";
+            src =
+              let
+                binFilter = path: _type: builtins.match ".*\\.bin$" path != null;
+                # insta snapshot files end in .snap; the cargo source filter
+                # rejects them by default and tests fail in the sandbox.
+                snapFilter = path: _type: builtins.match ".*\\.snap$" path != null;
+              in
+              pkgs.lib.cleanSourceWith {
+                src = ./.;
+                filter =
+                  path: type:
+                  (binFilter path type)
+                  || (snapFilter path type)
+                  || (craneLib.filterCargoSources path type);
+              };
+            strictDeps = true;
+            nativeBuildInputs = [
+              pkgs.pkg-config
+              pkgs.cmake
             ];
-        };
+            buildInputs =
+              [
+                pkgs.openssl
+              ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+                pkgs.apple-sdk_15
+                pkgs.libiconv
+              ];
+          };
+          # Dependencies build once per lockfile, not once per commit: the
+          # build identifier below must not reach this derivation.
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        in
+        craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+            # Integration tests (tests/cli.rs) spawn subprocesses that hang
+            # in the Nix sandbox, so only run unit tests during the build.
+            cargoTestExtraArgs = "--lib";
+            # Read by build.rs into `chevron version`, doctor and the daemon
+            # VERSION reply. The sandbox has no .git, so the flake's own
+            # revision is passed in; a dirty tree carries the -dirty suffix.
+            CHEVRON_BUILD_ID = self.shortRev or self.dirtyShortRev or "unknown";
+          }
+        );
     in
     {
       packages = forAllSystems (system: {
