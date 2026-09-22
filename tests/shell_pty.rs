@@ -2412,6 +2412,9 @@ fn typed_burst_split_by_r_reinjects_in_order() {
     t.wait_for("re-injected command to execute", |s| {
         lines(s).iter().any(|l| l == "BRAVO")
     });
+    // Same slow-runner hazard as its two siblings above: wait for the
+    // prompt before asserting on the recolored rows.
+    t.wait_for("prompt after the re-injected command", prompt_ready);
     t.wait_settled(Duration::from_millis(400));
 
     assert_eq!(
