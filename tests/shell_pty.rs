@@ -2316,6 +2316,10 @@ fn typed_input_racing_slow_dsr_is_reinjected_not_eaten() {
     t.wait_for("re-injected command to execute", |s| {
         lines(s).iter().any(|l| l == "rescued")
     });
+    // Same slow-runner hazard as the truncation test below: precmd's
+    // delayed exchange can outlast a quiet-window settle, so wait for the
+    // prompt before asserting on the recolored rows.
+    t.wait_for("prompt after the re-injected command", prompt_ready);
     t.wait_settled(Duration::from_millis(400));
 
     assert_eq!(
@@ -2357,6 +2361,10 @@ fn typed_r_truncating_the_exchange_reinjects_the_line_intact() {
     t.wait_for("re-injected command to execute", |s| {
         lines(s).iter().any(|l| l == "TAG_R")
     });
+    // The second cycle's precmd runs a delayed DSR exchange and the
+    // straggler sweep before it paints; on a slow runner those pauses
+    // outlast a quiet-window settle, so wait for the prompt itself.
+    t.wait_for("prompt after the re-injected command", prompt_ready);
     t.wait_settled(Duration::from_millis(400));
 
     assert_eq!(
