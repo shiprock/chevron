@@ -19,8 +19,11 @@
 //! eliminate the cold path, so we don't optimise this here.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -47,6 +50,52 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_mins(1);
 /// well past any sane filesystem path length.
 const MAX_LINE_BYTES: usize = 8 * 1024;
 
+/// Shared observability the accept loop and handlers feed for the
+/// lifecycle layer: the shutdown flag breaks the accept loop after its
+/// wake-up connection, activity stamps feed the idle watchdog, and the
+/// live relay count keeps the daemon up while shells hold subscriber
+/// connections.
+pub struct ServeHooks {
+    pub shutting_down: Arc<AtomicBool>,
+    /// Milliseconds since `started` at the last accepted connection.
+    pub last_activity_ms: Arc<AtomicU64>,
+    pub started: Instant,
+    /// Live subscriber-relay connections (see [`RelayGuard`]).
+    pub relay_count: Arc<AtomicUsize>,
+}
+
+impl ServeHooks {
+    /// Hooks wired to fresh state — for tests and embedders that don't
+    /// use the lifecycle layer (the PTY suite's in-process fixture).
+    #[must_use]
+    pub fn detached() -> Self {
+        Self {
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            last_activity_ms: Arc::new(AtomicU64::new(0)),
+            started: Instant::now(),
+            relay_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+/// Counts a live relay connection for the idle watchdog; Drop-based so
+/// a panicking handler can't leak a phantom subscriber that pins the
+/// daemon alive forever.
+struct RelayGuard(Arc<AtomicUsize>);
+
+impl RelayGuard {
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for RelayGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Handle a single connection. Reads `HELLO`, then loops on `STATUS`/`QUIT`.
 /// Returns silently on any error — the client will see the connection close
 /// and fall back to inline compute.
@@ -55,7 +104,11 @@ const MAX_LINE_BYTES: usize = 8 * 1024;
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 // Long but linear: one arm per opcode, no nested control flow. Splitting
 // it would hide the simple "match request, send response" shape.
-pub fn handle_connection(conn: UnixStream, state_tx: &Sender<StateMsg>) {
+pub fn handle_connection(
+    conn: UnixStream,
+    state_tx: &Sender<StateMsg>,
+    relay_count: &Arc<AtomicUsize>,
+) {
     let _ = conn.set_read_timeout(Some(CONN_TIMEOUT));
     let _ = conn.set_write_timeout(Some(CONN_TIMEOUT));
 
@@ -173,6 +226,7 @@ pub fn handle_connection(conn: UnixStream, state_tx: &Sender<StateMsg>) {
                 // timeout stays so a wedged peer can't pin us forever
                 // mid-PING.
                 let _ = conn.set_read_timeout(None);
+                let _relay = RelayGuard::new(Arc::clone(relay_count));
                 relay_loop(&event_rx, &conn, HEARTBEAT_INTERVAL);
                 let _ = state_tx.send(StateMsg::Unsubscribe(id));
                 return;
@@ -183,23 +237,39 @@ pub fn handle_connection(conn: UnixStream, state_tx: &Sender<StateMsg>) {
 
 /// Subscriber-relay loop. Owns the receiver end of a bounded mailbox
 /// fed by the state actor's `broadcast`. Drains it to the socket as
-/// `EVENT` lines; emits `PING` heartbeats on timeout so a dead peer
-/// surfaces via write failure within `heartbeat` time. Returns on
-/// socket write failure or sender-disconnect (actor shutdown).
+/// `EVENT` lines; emits `PING` heartbeats every `heartbeat` of idle
+/// time so a wedged peer surfaces via write failure. Returns on socket
+/// write failure, peer EOF, or sender-disconnect (actor shutdown).
+///
+/// The loop wakes at least once a second (bounded by `heartbeat` for
+/// tests that shrink it) to peek for peer EOF: a subscriber never
+/// writes after SUBSCRIBE, so a closed shell is otherwise invisible
+/// until the next heartbeat write fails — and the idle watchdog must
+/// not count a dead shell as an attached subscriber for the rest of a
+/// 60 s window.
 pub fn relay_loop(rx: &Receiver<EventPayload>, conn: &UnixStream, heartbeat: Duration) {
+    let poll = heartbeat.min(Duration::from_secs(1));
+    let mut last_ping = Instant::now();
     loop {
-        match rx.recv_timeout(heartbeat) {
+        match rx.recv_timeout(poll) {
             Ok(event) => {
                 if send_resp(conn, &Response::Event(event)).is_err() {
                     return;
                 }
+                last_ping = Instant::now();
             }
             Err(RecvTimeoutError::Timeout) => {
-                let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-                if send_resp(conn, &Response::Ping(ts)).is_err() {
+                if peer_closed(conn) {
                     return;
+                }
+                if last_ping.elapsed() >= heartbeat {
+                    let ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+                    if send_resp(conn, &Response::Ping(ts)).is_err() {
+                        return;
+                    }
+                    last_ping = Instant::now();
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -210,6 +280,24 @@ pub fn relay_loop(rx: &Receiver<EventPayload>, conn: &UnixStream, heartbeat: Dur
             }
         }
     }
+}
+
+/// True when the peer end of `conn` is closed. A nonblocking `MSG_PEEK`
+/// reads nothing destructively: 0 means EOF, -1/EAGAIN means alive with
+/// no data.
+fn peer_closed(conn: &UnixStream) -> bool {
+    let mut byte = 0u8;
+    // SAFETY: the fd is live for the lifetime of `conn`; a one-byte
+    // buffer is a valid recv target; MSG_DONTWAIT guarantees no block.
+    let n = unsafe {
+        libc::recv(
+            conn.as_raw_fd(),
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    n == 0
 }
 
 fn read_line(reader: &mut BufReader<&UnixStream>, buf: &mut String) -> std::io::Result<usize> {
@@ -302,16 +390,25 @@ pub fn handle_status(cwd: &Path, state_tx: &Sender<StateMsg>) -> Response {
 }
 
 /// Accept loop. Blocks for the lifetime of the daemon, spawning a fresh
-/// thread per connection. Returns when the listener is closed or accept
-/// fails fatally.
-pub fn serve_loop(listener: &UnixListener, state_tx: &Sender<StateMsg>) {
+/// thread per connection. Returns when the shutdown flag is raised (the
+/// coordinator wakes the blocking accept with a throwaway connection),
+/// the listener is closed, or accept fails fatally.
+pub fn serve_loop(listener: &UnixListener, state_tx: &Sender<StateMsg>, hooks: &ServeHooks) {
     for conn in listener.incoming() {
+        if hooks.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        hooks.last_activity_ms.store(
+            u64::try_from(hooks.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
         match conn {
             Ok(conn) => {
                 let tx = state_tx.clone();
+                let relay_count = Arc::clone(&hooks.relay_count);
                 let spawn_result = std::thread::Builder::new()
                     .name("chevrond-conn".into())
-                    .spawn(move || handle_connection(conn, &tx));
+                    .spawn(move || handle_connection(conn, &tx, &relay_count));
                 if let Err(e) = spawn_result {
                     eprintln!("chevrond: failed to spawn handler thread: {e}");
                 }
@@ -339,7 +436,8 @@ mod tests {
         let db = state::open_memory_db().unwrap();
         let (state_tx, _state_join) = state::spawn(state::TTL, db).unwrap();
         let tx_for_handler = state_tx.clone();
-        let join = std::thread::spawn(move || handle_connection(b, &tx_for_handler));
+        let relay_count = Arc::new(AtomicUsize::new(0));
+        let join = std::thread::spawn(move || handle_connection(b, &tx_for_handler, &relay_count));
         (Client::new(a), state_tx, join)
     }
 

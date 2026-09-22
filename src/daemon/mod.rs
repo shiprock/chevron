@@ -47,6 +47,8 @@ pub mod paths;
 #[cfg(feature = "daemon")]
 pub mod proto;
 #[cfg(feature = "daemon")]
+pub mod spool;
+#[cfg(feature = "daemon")]
 pub mod state;
 
 use std::path::Path;

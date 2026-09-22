@@ -736,31 +736,46 @@ struct DaemonGuard {
 }
 
 impl DaemonGuard {
+    fn start() -> Self {
+        Self::start_customized(TempDir::new().unwrap(), &[])
+    }
+
+    /// Start the daemon over an existing socket dir — for tests that
+    /// pre-seed state (a spool) the daemon must pick up at startup.
+    fn start_in(dir: TempDir) -> Self {
+        Self::start_customized(dir, &[])
+    }
+
+    fn start_with_env(env: &[(&str, &str)]) -> Self {
+        Self::start_customized(TempDir::new().unwrap(), env)
+    }
+
     // clippy doesn't trace that the Child is stashed on `self` and the
     // Drop impl below `try_wait` + `kill` + `wait`s it. Suppress the
     // false positive locally rather than restructuring the guard.
     #[allow(clippy::zombie_processes)]
-    fn start() -> Self {
+    fn start_customized(dir: TempDir, env: &[(&str, &str)]) -> Self {
         // A test that panics while holding the ticket poisons the
         // mutex; the serialization it provides is unaffected, so
         // recover the guard rather than cascading the failure.
         let serial = DAEMON_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = TempDir::new().unwrap();
         // Background `chevron daemon serve` with the socket dir override.
         // We can't use spawn() + a Drop that calls kill() because the daemon
         // serve never returns from its accept loop — instead we let it run
         // and shoot it down via the daemon stop subcommand on drop.
-        let mut child = std::process::Command::cargo_bin("chevron")
-            .unwrap()
+        let mut daemon_cmd = std::process::Command::cargo_bin("chevron").unwrap();
+        daemon_cmd
             .args(["daemon", "serve"])
             .env("CHEVRON_SOCKET_DIR", dir.path())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(std::process::Stdio::null());
+        for (k, v) in env {
+            daemon_cmd.env(k, v);
+        }
+        let mut child = daemon_cmd.spawn().unwrap();
         // A bound socket precedes database initialization. Wait for a real
         // protocol response so callers cannot publish before the schema
         // exists or mistake an inline CLI fallback for daemon readiness.
@@ -937,6 +952,175 @@ fn event_lifecycle_publishes_to_daemon_and_persists_row() {
     assert_eq!(cmd_text, "cargo test");
     assert_eq!(exit_status, 0);
     assert_eq!(duration_ms, 250);
+}
+
+/// SIGTERM now runs an orderly shutdown: the state actor drains its
+/// queue and the daemon removes its own socket and pidfile before
+/// exiting — no stale files for the next startup to tolerate.
+#[test]
+fn daemon_sigterm_shuts_down_cleanly_and_removes_files() {
+    let daemon = DaemonGuard::start();
+    let pid_path = daemon.socket_dir().join("chevrond.pid");
+    let sock_path = daemon.socket_dir().join("chevrond.sock");
+    let pid = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    std::process::Command::new("kill")
+        .arg(&pid)
+        .status()
+        .expect("spawn kill");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if !pid_path.exists() && !sock_path.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!(
+        "daemon left files behind after SIGTERM: pid={} sock={}",
+        pid_path.exists(),
+        sock_path.exists()
+    );
+}
+
+/// With an idle timeout configured and no client activity, the daemon
+/// retires itself and cleans up — orphaned daemons no longer accumulate
+/// (one from a deleted checkout was found 35 days old).
+#[test]
+fn daemon_idle_exit_retires_an_unused_daemon() {
+    let daemon = DaemonGuard::start_with_env(&[("CHEVRON_DAEMON_IDLE_TIMEOUT_MS", "200")]);
+    let pid_path = daemon.socket_dir().join("chevrond.pid");
+
+    // Tick = timeout/4 = 50 ms; exit should land well inside 5 s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !pid_path.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("idle daemon did not retire itself within 5s");
+}
+
+/// An attached subscriber means a live shell is waiting for events: the
+/// idle watchdog must not retire the daemon under it, however long it
+/// sits idle — and must retire it once the subscriber disconnects.
+#[test]
+fn daemon_idle_exit_waits_for_attached_subscribers() {
+    // The subscriber must attach before the daemon can decide it's
+    // idle: 1 s of margin holds up even on a loaded runner where the
+    // subscribe process takes hundreds of ms to spawn and connect.
+    let daemon = DaemonGuard::start_with_env(&[("CHEVRON_DAEMON_IDLE_TIMEOUT_MS", "1000")]);
+    let pid_path = daemon.socket_dir().join("chevrond.pid");
+    let sub = KillOnDrop(
+        daemon
+            .cmd()
+            .arg("subscribe")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+
+    // Well past the idle timeout: the relay connection must pin the
+    // daemon alive.
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert!(
+        pid_path.exists(),
+        "daemon retired itself while a subscriber was attached"
+    );
+
+    drop(sub);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !pid_path.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("daemon did not retire after the last subscriber left");
+}
+
+/// The durability net end to end: events published with NO daemon
+/// running land in the spool, and the next daemon startup drains them
+/// into commands.db — history no longer has holes across outages.
+#[test]
+fn events_spool_without_a_daemon_and_ingest_on_startup() {
+    let dir = TempDir::new().unwrap();
+
+    let start = cmd()
+        .args([
+            "event",
+            "cmd-start",
+            "sess-spool",
+            "/tmp/spool-cwd",
+            "cargo",
+            "build",
+        ])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("CHEVRON_NO_DAEMON")
+        .output()
+        .unwrap();
+    assert!(start.status.success());
+    let id = String::from_utf8(start.stdout).unwrap().trim().to_string();
+    assert_eq!(id.len(), 26);
+
+    cmd()
+        .args(["event", "cmd-end", &id, "0", "42"])
+        .env("CHEVRON_SOCKET_DIR", dir.path())
+        .env_remove("CHEVRON_NO_DAEMON")
+        .assert()
+        .success();
+
+    let spool = dir.path().join("spool");
+    assert_eq!(
+        std::fs::read_dir(&spool).unwrap().count(),
+        2,
+        "start and end must both be queued while no daemon runs"
+    );
+
+    // Startup ingests the spool before serving.
+    let daemon = DaemonGuard::start_in(dir);
+    let db = rusqlite::Connection::open(daemon.socket_dir().join("commands.db")).unwrap();
+    // The guard returns on socket bind; schema application follows.
+    // "no such table" is a hard error the row-poll below doesn't
+    // retry, so wait for the table first.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while db
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='commands'",
+            [],
+            |_| Ok(()),
+        )
+        .is_err()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon never applied the commands schema"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (session_id, cmd_text, exit_status, duration_ms): (String, String, i64, i64) =
+        query_row_eventually("spooled commands row", || {
+            db.query_row(
+                "SELECT session_id, cmd, exit_status, duration_ms \
+                 FROM commands WHERE id = ?1 AND finished_at IS NOT NULL",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+        });
+    assert_eq!(session_id, "sess-spool");
+    assert_eq!(cmd_text, "cargo build");
+    assert_eq!(exit_status, 0);
+    assert_eq!(duration_ms, 42);
+    assert_eq!(
+        std::fs::read_dir(&spool).unwrap().count(),
+        0,
+        "drained entries must be unlinked\n"
+    );
 }
 
 // ── history (chevron-1yn.2) ─────────────────────────────────────────────────

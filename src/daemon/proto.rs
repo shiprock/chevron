@@ -3,7 +3,12 @@
 //! ## Grammar
 //!
 //! Each message is one line terminated by `\n`. The parser accepts an optional
-//! trailing `\r` for resilience.
+//! trailing `\r` for resilience. The daemon reads at most 8 KiB per line
+//! (`MAX_LINE_BYTES` in the listener); a longer request is treated as a
+//! protocol violation and the connection is closed without a response. Only
+//! `CMD_START` can realistically hit the cap (a very long pasted `cmd`) —
+//! such an event still reaches the daemon via the client-side spool
+//! (`daemon::spool`), which replays from files and has no line cap.
 //!
 //! ```text
 //! Requests (client → server):
@@ -50,16 +55,18 @@
 //! omitted entirely. String fields (`repo_name`, `branch`, `cmd`, …) and the
 //! `STATUS` path arg are **percent-encoded**:
 //!
-//! - `%` (0x25) → `%25`
-//! - any byte at or below 0x20 (control + space) → `%XX` (uppercase hex)
-//! - DEL (0x7F) → `%7F`
+//! - printable ASCII except `%` (`[0x21, 0x7E]` minus 0x25) passes through
+//!   literally
+//! - every other byte — `%`, control bytes including space, DEL, and any
+//!   byte >= 0x80 (so all of multi-byte UTF-8) — is written as `%XX`
+//!   (uppercase hex)
 //!
-//! Everything else (printable ASCII and any byte >= 0x80) is passed through
-//! literally. The decoder accepts any well-formed `%XX` pair, so future
-//! encoder changes that escape more bytes remain wire-compatible. This is
+//! The decoder accepts any well-formed `%XX` pair (a superset of what the
+//! encoder emits), so future encoder changes that escape more bytes remain
+//! wire-compatible; the decoded byte sequence must be valid UTF-8. This is
 //! deliberately a small subset of RFC 3986 — just enough to keep the
 //! line-oriented kv format unambiguous even when `cmd` contains tabs,
-//! newlines, or other whitespace.
+//! newlines, or non-ASCII text.
 //!
 //! ## Field order
 //!
@@ -115,6 +122,12 @@ pub struct CmdEndEvent {
 /// lines to as state changes. `cwd` matches an exact directory;
 /// `shell_cwd` matches events from that directory or an ancestor. With
 /// neither filter, the subscriber receives all events the daemon emits.
+///
+/// `cwd` is compared by exact path equality — no prefix or subdirectory
+/// matching. `git` events carry the repo's canonicalized workdir root, so
+/// to follow a repo with `cwd` the filter must be that canonical root
+/// (not a subdirectory inside it); `cmd` events carry the directory the
+/// command ran in. An event without a cwd never matches a filter.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SubscribeSpec {
     pub cwd: Option<PathBuf>,
