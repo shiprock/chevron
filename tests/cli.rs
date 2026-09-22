@@ -371,6 +371,37 @@ fn init_zsh_instant_prompt_is_comment_only() {
     );
 }
 
+// ── version ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn version_prints_crate_version_and_build_id() {
+    // `chevron 0.7.0 (a1b2c3d4e5f6)`, `(a1b2c3d4e5f6-dirty)` or `(unknown)`:
+    // the id is what distinguishes two builds of the same crate version.
+    let out = cmd()
+        .arg("version")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    let line = text.trim_end();
+    let prefix = format!("chevron {} (", env!("CARGO_PKG_VERSION"));
+    assert!(line.starts_with(&prefix), "{line}");
+    assert!(line.ends_with(')'), "{line}");
+    let id = &line[prefix.len()..line.len() - 1];
+    let core = id.strip_suffix("-dirty").unwrap_or(id);
+    assert!(
+        core == "unknown" || (core.len() >= 7 && core.chars().all(|c| c.is_ascii_hexdigit())),
+        "unexpected build id {id:?}"
+    );
+    assert_eq!(
+        id,
+        env!("CHEVRON_BUILD_ID"),
+        "tests and binary come from one build"
+    );
+}
+
 // ── tmux-title ───────────────────────────────────────────────────────────────
 
 #[test]

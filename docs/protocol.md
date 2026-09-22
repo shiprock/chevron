@@ -17,6 +17,9 @@ Keep these properties for the life of the project.
 - Client-generated ULIDs and idempotent history writes, so a replayed or duplicated
   event lands once.
 - A `VERSION` reply with three independent dimensions: binary, protocol, schema.
+  A fourth, `build`, the compile-time commit identifier, was added as an optional
+  key ahead of version 2; a reply without it decodes as `unknown`, which the client
+  reports as a stale daemon.
 - A line-length cap, per-connection timeouts and a bounded subscriber mailbox.
 - A subscriber that reconnects with exponential backoff and a failure budget.
 

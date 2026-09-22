@@ -138,20 +138,30 @@ pub fn try_version() -> Option<proto::DaemonVersion> {
 #[must_use]
 pub fn print_version() -> i32 {
     let cli_binary = env!("CARGO_PKG_VERSION");
+    let cli_build = env!("CHEVRON_BUILD_ID");
     let cli_proto = proto::PROTO_VERSION;
 
-    println!("chevron cli:    {cli_binary} (proto={cli_proto})");
+    println!("chevron cli:    {cli_binary} ({cli_build}, proto={cli_proto})");
 
     let Some(v) = try_version() else {
         println!("chevron daemon: not running");
         return 0;
     };
     println!(
-        "chevron daemon: {} (proto={}, schema={})",
-        v.binary, v.proto, v.schema
+        "chevron daemon: {} ({}, proto={}, schema={})",
+        v.binary, v.build, v.proto, v.schema
     );
 
     let mut mismatch = false;
+    if v.build != cli_build {
+        eprintln!();
+        eprintln!(
+            "WARNING: daemon build ({}) differs from CLI ({}): the running daemon is a different binary.",
+            v.build, cli_build
+        );
+        eprintln!("Run `chevron daemon stop`; the next prompt starts the current binary.");
+        mismatch = true;
+    }
     if v.binary != cli_binary {
         eprintln!();
         eprintln!(
@@ -494,6 +504,7 @@ mod tests {
         let _dir = spawn_daemon();
         let v = try_version_patient().expect("expected a VERSION response");
         assert_eq!(v.binary, env!("CARGO_PKG_VERSION"));
+        assert_eq!(v.build, env!("CHEVRON_BUILD_ID"));
         assert_eq!(v.proto, proto::PROTO_VERSION);
         // Schema is a string; just assert it parses as a positive
         // integer rather than hardcoding "2" (which would have to

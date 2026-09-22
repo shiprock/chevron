@@ -187,6 +187,7 @@ pub fn handle_connection(
                     binary: env!("CARGO_PKG_VERSION").to_string(),
                     proto: proto::PROTO_VERSION,
                     schema: crate::daemon::state::CURRENT_SCHEMA_VERSION.to_string(),
+                    build: env!("CHEVRON_BUILD_ID").to_string(),
                 });
                 if send_resp(&conn, &resp).is_err() {
                     return;
