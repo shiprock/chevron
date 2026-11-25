@@ -2108,3 +2108,44 @@ fn subscribe_filters_out_ping_heartbeats() {
 
     drop(sub_child);
 }
+
+/// `banner text` draws the card as text, as wide as the terminal says up to
+/// 80: here no terminal, so `$COLUMNS`.
+#[cfg(feature = "banner")]
+#[test]
+fn banner_text_draws_the_card_at_the_terminal_width() {
+    let out = cmd()
+        .args(["banner", "text"])
+        .env("COLUMNS", "60")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    // The text on screen: every escape sequence ends at its `m`.
+    let shown: Vec<String> = text
+        .lines()
+        .map(|line| {
+            let mut plain = String::new();
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    chars.by_ref().find(|&c| c == 'm');
+                } else {
+                    plain.push(c);
+                }
+            }
+            plain
+        })
+        .collect();
+    assert!(
+        shown
+            .first()
+            .is_some_and(|l| l.starts_with("╭─ TERMINAL UNDERGROUND DIVISION")),
+        "{shown:#?}"
+    );
+    assert!(
+        shown.last().is_some_and(|l| l.starts_with("╰─")),
+        "{shown:#?}"
+    );
+    assert!(shown.iter().all(|l| l.chars().count() == 60), "{shown:#?}");
+}

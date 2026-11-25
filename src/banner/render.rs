@@ -590,14 +590,9 @@ fn draw_system_info(
     }
 }
 
-fn draw_tagline_box(
-    img: &mut RgbaImage,
-    start_row: u32,
-    info: &SystemInfo,
-    pal: &Palette,
-    scale: u32,
-) {
-    let taglines = [
+/// The tagline for today: the banners rotate through these by day of year.
+pub(super) fn tagline_of_the_day() -> &'static str {
+    const TAGLINES: [&str; 8] = [
         "proudly serving the scene since 1993",
         "where the elstrEEt meet",
         "another fine release from the underground",
@@ -607,8 +602,17 @@ fn draw_tagline_box(
         "greets to all groups worldwide",
         "the underground never sleeps",
     ];
-    let tag_idx = day_of_year() as usize % taglines.len();
-    let tagline = taglines[tag_idx];
+    TAGLINES[day_of_year() as usize % TAGLINES.len()]
+}
+
+fn draw_tagline_box(
+    img: &mut RgbaImage,
+    start_row: u32,
+    info: &SystemInfo,
+    pal: &Palette,
+    scale: u32,
+) {
+    let tagline = tagline_of_the_day();
 
     let top_label = "Terminal Underground Division";
     let node_label = format!("NODE: {}", info.hostname.to_uppercase());
@@ -907,7 +911,7 @@ fn format_bytes_short(bytes: u64) -> String {
     }
 }
 
-fn format_uptime(secs: u64) -> String {
+pub(super) fn format_uptime(secs: u64) -> String {
     let days = secs / 86400;
     let hours = (secs % 86400) / 3600;
     if days > 0 {

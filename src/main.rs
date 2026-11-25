@@ -124,11 +124,17 @@ fn main() {
         }
         #[cfg(feature = "banner")]
         Some("banner") => {
-            let scale = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2u32);
-            let palette = args.get(3).map_or("cyber", String::as_str);
-            let banner_type = args.get(4).map(String::as_str);
-            let title = args.get(5).map(String::as_str);
-            banner::generate(scale, palette, banner_type, title);
+            // `banner text`: the card drawn as text; otherwise the image,
+            // as `banner [scale] [palette] [type] [title]`.
+            if args.get(2).map(String::as_str) == Some("text") {
+                banner::print_text();
+            } else {
+                let scale = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2u32);
+                let palette = args.get(3).map_or("cyber", String::as_str);
+                let banner_type = args.get(4).map(String::as_str);
+                let title = args.get(5).map(String::as_str);
+                banner::generate(scale, palette, banner_type, title);
+            }
         }
         #[cfg(feature = "weather")]
         Some("weather") => weather::run(&args[2..]),
