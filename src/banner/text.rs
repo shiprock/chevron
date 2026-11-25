@@ -1,4 +1,4 @@
-//! The banner as text: a card drawn with box characters in the 256 colours of
+//! The banner as text: a card drawn with box characters in the colours of
 //! the tmux theme it sits under (badwolf's greys, accent colour 39). Unlike
 //! the image banner it needs no graphics protocol: it is drawn in the
 //! terminal's own font, passes through tmux untouched, and fits any terminal
@@ -37,9 +37,13 @@ const FAINT: u8 = 238;
 const DIM: u8 = 245;
 const HI: u8 = 254;
 const ACCENT: u8 = 39;
-/// A gauge's empty cells, and its fill from deep to bright blue.
+/// A gauge's empty cells.
 const TRACK: u8 = 236;
-const FILL: [u8; 4] = [31, 32, 38, 39];
+/// Its fill, blended cell by cell from deep blue (colour 31) at its start
+/// to the accent (colour 39) at its end. A blend in 24-bit colour: the
+/// 256-colour blues between them step visibly, in bands.
+const FILL_FROM: [u8; 3] = [0x00, 0x87, 0xaf];
+const FILL_TO: [u8; 3] = [0x00, 0xaf, 0xff];
 /// A gauge past 70% turns yellow, past 90% red.
 const WARN: u8 = 221;
 const CRIT: u8 = 196;
@@ -343,19 +347,18 @@ fn stacked(width: usize, f: &Figures) -> Vec<Line> {
 }
 
 /// `CPU  ██▎         19%`: a bar of `cells` on a dark track, filled to
-/// the eighth of a cell, blue deepening toward its start (yellow past 70%,
-/// red past 90%), then the percentage.
+/// the eighth of a cell, its blue deepening toward its start (yellow past
+/// 70%, red past 90%), then the percentage.
 fn gauge(line: &mut Line, label: &str, pct: u8, cells: usize) {
     line.style(fg(DIM)).put(label).put("  ").style(bg(TRACK));
     let eighths = (usize::from(pct) * cells * 8 + 50) / 100;
     let (full, part) = (eighths / 8, eighths % 8);
     for i in 0..cells {
-        let colour = match pct {
-            91.. => CRIT,
-            71..=90 => WARN,
-            _ => FILL[i * FILL.len() / cells],
+        match pct {
+            91.. => line.style(fg(CRIT)),
+            71..=90 => line.style(fg(WARN)),
+            _ => line.style(&fill(i, cells)),
         };
-        line.style(fg(colour));
         if i < full {
             line.put("█");
         } else if i == full && part > 0 {
@@ -368,6 +371,27 @@ fn gauge(line: &mut Line, label: &str, pct: u8, cells: usize) {
         .put(" ")
         .style(fg(HI))
         .put(&format!("{pct:>3}%"));
+}
+
+/// The foreground escape for cell `i` of a gauge `cells` long: its share
+/// of the way from `FILL_FROM` to `FILL_TO`.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn fill(i: usize, cells: usize) -> String {
+    let share = if cells > 1 {
+        i as f32 / (cells - 1) as f32
+    } else {
+        1.0
+    };
+    let [red, green, blue] = [0, 1, 2].map(|channel| {
+        let from = f32::from(FILL_FROM[channel]);
+        let to = f32::from(FILL_TO[channel]);
+        (from + (to - from) * share).round() as u8
+    });
+    format!("\x1b[38;2;{red};{green};{blue}m")
 }
 
 /// `UPT  14d 21h`: a label and its value.
@@ -533,6 +557,19 @@ mod tests {
         let mut line = Line::default();
         gauge(&mut line, "CPU", 0, 12);
         assert_eq!(plain(&line.text), format!("CPU  {}   0%", " ".repeat(12)));
+    }
+
+    #[test]
+    fn the_fill_blends_from_deep_blue_to_the_accent() {
+        let mut line = Line::default();
+        gauge(&mut line, "CPU", 50, 12);
+        assert!(
+            line.text.contains("\x1b[38;2;0;135;175m█"),
+            "{:?}",
+            line.text
+        );
+        assert_eq!(fill(11, 12), "\x1b[38;2;0;175;255m");
+        assert_eq!(fill(0, 1), "\x1b[38;2;0;175;255m");
     }
 
     #[test]
