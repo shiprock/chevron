@@ -166,3 +166,53 @@ print STOPPED
     );
     assert_eq!(zsh(&script, tmp.path()), "STOPPED\n");
 }
+
+#[test]
+fn regression_bash_prompt_text_is_literal() {
+    use std::io::Write;
+    use std::process::Stdio;
+    for promptvars in ["-s", "-u"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let rc = tmp.path().join("bashrc");
+        std::fs::write(
+            &rc,
+            format!(
+                "shopt {promptvars} promptvars\nchevron() {{ printf '%s' \"$TEST_PROMPT\"; }}\n{}",
+                super::init_bash()
+            ),
+        )
+        .unwrap();
+        let literal = "$(touch MARKER) `touch BACKTICK` $HOME \\u";
+        let mut child = Command::new("bash")
+            .args(["--noprofile", "--rcfile"])
+            .arg(&rc)
+            .arg("-i")
+            .current_dir(tmp.path())
+            .env("TEST_PROMPT", literal)
+            .env("CHEVRON_HISTORY", "0")
+            .env("CHEVRON_TRANSIENT", "0")
+            .env("CHEVRON_OSC133", "0")
+            .env_remove("TMUX")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"exit\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert!(
+            !tmp.path().join("MARKER").exists(),
+            "prompt executed command substitution"
+        );
+        assert!(
+            !tmp.path().join("BACKTICK").exists(),
+            "prompt executed backticks"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(literal),
+            "literal prompt was expanded: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
